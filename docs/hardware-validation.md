@@ -8,11 +8,13 @@
 
 ### 当前源码与软件包验证
 
-- 当前应用源码提交：`1d4889eec7071672555b6419febce6676b556433`。本次加入 150% 缩放、1280×720 窗口的布局回归检查；长运行回归也覆盖 110,000 个模拟读数，确认绘图缓存只保留最近 100,000 点，同时全程统计仍计入全部样本。
-- [GitHub Actions 运行 38646706325](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38646706325) 在 Windows 上通过完整 pytest：Python 3.11 为 226 项、18.02 秒；Python 3.12 为 226 项、12.80 秒。两个 pytest 步骤各自设置 60 秒超时。源码 ZIP 构建与校验、GHCR Package 发布和 GitHub Release 发布也均成功。
-- [提交对应的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-1d4889eec707) 附有 `Fluke8845A_Source_Project.zip`，GitHub 记录的 ZIP SHA-256 为 `10a4eae0a2512920dc6baa60524ad25488df9241404b2589c1d5bf648eba15b8`，另附 `SHA256SUMS.txt`。
-- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-1d4889eec707`，推送摘要为 `sha256:f809c256d158bae61da327811b00ecaa5636cd1b4e356c0f7ffdefa12ac3dd10`。
-- Actions 的源码包构建/校验成功不等于在新 Windows 环境完成解压冷启动。本记录不把早期提交的启动验证外推到这个提交。
+- 最后一次应用代码变更在 `1d4889eec7071672555b6419febce6676b556433`；本地便携候选包以源码树 `bc51e64a0a8ab33fcaf4d1757c08364dc78d6827` 构建，此后的改动只更新验证记录，不改变应用代码。
+- [GitHub Actions 运行 38647820886](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38647820886) 在 Windows 上通过完整 pytest：Python 3.11 为 226 项、12.61 秒；Python 3.12 为 226 项、10.10 秒。两个 pytest 步骤各自设置 60 秒上限。源码 ZIP 构建与校验、GHCR Package 和 GitHub Release 发布也均成功。
+- [当前提交的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-bc51e64a0a8a) 附有 `Fluke8845A_Source_Project.zip`，GitHub 记录的 ZIP SHA-256 为 `68a7f1eb5f13dac8d148e090b5c5baf0670189cda2e2a19a39109cb639103204`，另附 `SHA256SUMS.txt`。
+- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-bc51e64a0a8a`，manifest 摘要为 `sha256:faefd1129c2f01ac7ea92c7f6626f1e4ff6a487bd8040043f0037317a7fa8a43`。
+- 当前源码在 Windows 11 x64、CPython 3.12.10、Nuitka 4.1.1 环境下通过 `build_windows.ps1` 构建。完整 226 项本地 pytest 用时 11.88 秒；桌面 EXE 与 localhost EXE 均生成。冻结版 Mock 启动、串口枚举、六模式模拟采集、解压后桌面启动和 localhost `/api/health` 检查均通过。六模式报告明确标记为模拟数据。
+- 本地便携候选 ZIP 共 277 个文件，SHA-256 为 `a637dc1b92f19132e7342ae4266ff17e8fbd66116ecf4af4c69ce15442b9a374`；桌面 EXE SHA-256 为 `3e51f8c78410290655756ead70cf9d841531f76de20349a9717758a45c4d4002`。候选包留在本地 `dist`，尚未加入公开 Release，因为下文列出的许可证与来源审查门槛仍未关闭。
+- 这次本地构建补足了当前源码的 Windows 冷启动证据；它不代表公开发布了便携程序，也不构成真实仪表验证。
 
 ### 真机验证与发布限制
 
@@ -28,11 +30,13 @@ This record reports only evidence that was obtained. It does not publish worksta
 
 ### Current source and package checks
 
-- Current application source commit: `1d4889eec7071672555b6419febce6676b556433`. This change adds a high-DPI layout regression check at 150% scaling and a 1280×720 window; the long-run regression also feeds 110,000 simulated readings and verifies that the plot cache retains only the latest 100,000 while full-run statistics include every sample.
-- [GitHub Actions run 38646706325](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38646706325) passed the full pytest suite on Windows: 226 cases in 18.02 seconds on Python 3.11 and 226 cases in 12.80 seconds on Python 3.12. Each pytest step has a 60-second timeout. Source ZIP build and verification, GHCR Package publication, and GitHub Release publication also succeeded.
-- The [commit-specific Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-1d4889eec707) contains `Fluke8845A_Source_Project.zip`. GitHub reports its SHA-256 as `10a4eae0a2512920dc6baa60524ad25488df9241404b2589c1d5bf648eba15b8`; `SHA256SUMS.txt` is attached as well.
-- The public GHCR package for the same commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-1d4889eec707`, with push digest `sha256:f809c256d158bae61da327811b00ecaa5636cd1b4e356c0f7ffdefa12ac3dd10`.
-- Successful source-package build and verification in Actions do not establish a fresh Windows extraction/startup check. This record does not extend an earlier commit's startup evidence to this commit.
+- The last application-code change is `1d4889eec7071672555b6419febce6676b556433`. The local portable candidate was built from source tree `bc51e64a0a8ab33fcaf4d1757c08364dc78d6827`; subsequent changes only update verification notes and do not change application code.
+- [GitHub Actions run 38647820886](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38647820886) passed the full pytest suite on Windows: 226 cases in 12.61 seconds on Python 3.11 and 226 cases in 10.10 seconds on Python 3.12. Each pytest step has a 60-second limit. Source ZIP build and verification, GHCR Package publication, and GitHub Release publication also succeeded.
+- The [current commit-specific Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-bc51e64a0a8a) contains `Fluke8845A_Source_Project.zip`. GitHub reports its SHA-256 as `68a7f1eb5f13dac8d148e090b5c5baf0670189cda2e2a19a39109cb639103204`; `SHA256SUMS.txt` is attached as well.
+- The public GHCR package for the same commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-bc51e64a0a8a`, with manifest digest `sha256:faefd1129c2f01ac7ea92c7f6626f1e4ff6a487bd8040043f0037317a7fa8a43`.
+- The current source tree was built locally on Windows 11 x64 with CPython 3.12.10 and Nuitka 4.1.1 using `build_windows.ps1`. All 226 pytest cases passed in 11.88 seconds. Both the desktop and localhost executables were created. Frozen Mock startup, serial enumeration, six-mode simulated acquisition, extracted-ZIP desktop startup, and localhost `/api/health` checks passed. The six-mode report explicitly identifies simulated data.
+- The local portable candidate contains 277 files. Its ZIP SHA-256 is `a637dc1b92f19132e7342ae4266ff17e8fbd66116ecf4af4c69ce15442b9a374`; the desktop EXE SHA-256 is `3e51f8c78410290655756ead70cf9d841531f76de20349a9717758a45c4d4002`. The candidate remains in local `dist` and is not attached to a public Release because the license and source-delivery review gates below remain open.
+- This local build supplies current-source Windows cold-start evidence. It does not mean a portable application has been published or that the instrument has been validated.
 
 ### Hardware validation and release limits
 
