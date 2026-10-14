@@ -4,18 +4,22 @@
 
 ## 简体中文
 
-- 每次推送到 `main`，GitHub Actions 分别在 Windows / Python 3.11 和 3.12 环境安装锁定依赖，并为每个 pytest 步骤设置 **60 秒上限**。两套测试都通过后，才为该提交创建独立预发布版本，附带 `Fluke8845A_Source_Project.zip` 和 `SHA256SUMS.txt`。
-- 推送 `v*` 版本标签会创建对应的正式 GitHub Release，并附带同样的源码包和校验文件。
-- 重跑同一提交的工作流会更新该 Release 中的附件，不会重复创建同名 Release。
-- Release 附件是下载包；本项目没有向 GitHub Packages 注册表发布 Python 包。
+- 每次推送到 `main`，GitHub Actions 分别在 Windows / Python 3.11 和 3.12 环境安装锁定依赖，并为每个 pytest 步骤设置 **60 秒上限**。两套测试都通过后，才为该提交创建独立预发布版本，并同时发布 `Fluke8845A_Source_Project.zip`、`SHA256SUMS.txt` 和 GHCR OCI 文件包。
+- 推送 `v*` 版本标签会创建对应的正式 GitHub Release，并将同一源码 ZIP 和校验文件发布到 GHCR。
+- Release 与 GHCR 使用相同的版本标签。GHCR 包名为 `ghcr.io/chickensooup/fluke8845a-lab-source`；例如 `main` 提交 `0123456789ab` 对应 `main-build-0123456789ab`。
+- GitHub Packages 没有原生 Python 包注册表；这里把源码 ZIP 和校验文件作为 OCI 文件包发布，不是可用 `pip install` 安装的 Python wheel。可用 [ORAS](https://oras.land/) 下载：`oras pull ghcr.io/chickensooup/fluke8845a-lab-source:main-build-0123456789ab --output ./dist`。
+- GHCR 新包默认私有。若要让其他人无需登录即可从 Packages 下载，首次发布后需在 GitHub 包设置中将包改为 Public；GitHub 表示公开后不能改回私有。Release 附件仍可直接公开下载。
+- 重跑同一提交的工作流会更新该 Release 的附件和 GHCR 版本，不会重复创建同名 Release。
 - **暂不发布 Windows 便携 EXE。** Qt/PySide 对应源码、完整第三方声明和最终包上的库替换验证仍未闭环，详见 [Qt 许可审查](licenses/windows-portable-review-2026-10-14.md)。源码 ZIP 会保留可复现的 Windows 构建脚本。
-- 自动发布使用仓库的 `GITHUB_TOKEN`，不需要个人访问令牌。测试与 Mock 验证不能视为真实 8845A 硬件验证。
+- 自动发布使用仓库的 `GITHUB_TOKEN`（授予 `packages: write`），不需要个人访问令牌。测试与 Mock 验证不能视为真实 8845A 硬件验证。
 
 ## English
 
-- Every push to `main` runs pytest on Windows with locked Python 3.11 and 3.12 environments; each pytest step has a **60-second limit**. Both suites must pass before the workflow creates a commit-specific prerelease with `Fluke8845A_Source_Project.zip` and `SHA256SUMS.txt`.
-- Pushing a `v*` version tag creates the corresponding stable GitHub Release with the same source package and checksum file.
-- Rerunning a workflow for the same commit updates the existing Release assets instead of creating a duplicate Release.
-- Release attachments are downloadable project packages; this project does not publish a Python package to the GitHub Packages registry.
+- Every push to `main` runs pytest on Windows with locked Python 3.11 and 3.12 environments; each pytest step has a **60-second limit**. Both suites must pass before the workflow creates a commit-specific prerelease and publishes `Fluke8845A_Source_Project.zip`, `SHA256SUMS.txt`, and a GHCR OCI file package.
+- Pushing a `v*` version tag creates the corresponding stable GitHub Release and publishes the same source ZIP and checksum to GHCR.
+- The Release and GHCR use the same version tag. The package is `ghcr.io/chickensooup/fluke8845a-lab-source`; for example, commit `0123456789ab` on `main` uses `main-build-0123456789ab`.
+- GitHub Packages does not provide a native Python package registry. The source ZIP and checksum are published as an OCI file package, not as a Python wheel installable with `pip`. Download with [ORAS](https://oras.land/): `oras pull ghcr.io/chickensooup/fluke8845a-lab-source:main-build-0123456789ab --output ./dist`.
+- New GHCR packages are private by default. To allow anonymous downloads from Packages, change the package to Public once after its first publication in GitHub package settings. GitHub does not allow changing a public package back to private. Release attachments remain directly downloadable.
+- Rerunning a workflow for the same commit updates the existing Release assets and GHCR tag instead of creating a duplicate Release.
 - **The Windows portable EXE is not published yet.** The Qt/PySide corresponding-source set, complete third-party notices, and library replacement verification against the final archive remain open. See the [Qt licensing review](licenses/windows-portable-review-2026-10-14.md). The source ZIP retains the reproducible Windows build script.
-- Publishing uses the repository's `GITHUB_TOKEN`; no personal access token is required. Tests and Mock checks do not constitute validation on a real 8845A.
+- Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`; no personal access token is required. Tests and Mock checks do not constitute validation on a real 8845A.

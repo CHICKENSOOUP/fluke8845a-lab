@@ -96,7 +96,7 @@ python -m pytest
 
 Build a local standalone package after installing `python -m pip install -e ".[build]"`. By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
 
-Pushes to `main` automatically run pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds); both suites must pass before the workflow publishes a commit-specific prerelease with the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes a stable release. See the [release guide](docs/releasing.md).
+Pushes to `main` automatically run pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds); both suites must pass before the workflow publishes a commit-specific GitHub prerelease and a matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes both a stable release and package. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
 
 ## Hardware and verification status
 

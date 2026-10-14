@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   test-python311:
@@ -74,6 +75,43 @@ jobs:
           $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  Fluke8845A_Source_Project.zip" | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
+        shell: pwsh
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.2.2
+
+      - name: Publish source package to GitHub Packages (GHCR)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repoPath = $env:GITHUB_REPOSITORY.ToLowerInvariant()
+          $package = "ghcr.io/$repoPath-source"
+
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $packageTag = $env:GITHUB_REF_NAME.ToLowerInvariant()
+          } else {
+            $packageTag = "main-build-$($env:GITHUB_SHA.Substring(0, 12))"
+          }
+
+          $packageReference = "${package}:$packageTag"
+          $env:GHCR_TOKEN | oras login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw "GHCR login failed (exit $LASTEXITCODE)." }
+
+          $orasArguments = @(
+            "push",
+            "--artifact-type", "application/vnd.fluke8845a.source-bundle.v1",
+            "--annotation", "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY",
+            "--annotation", "org.opencontainers.image.description=Fluke 8845A source ZIP and SHA-256 checksum",
+            $packageReference,
+            "dist/Fluke8845A_Source_Project.zip:application/zip",
+            "dist/SHA256SUMS.txt:text/plain"
+          )
+          & oras @orasArguments
+          if ($LASTEXITCODE -ne 0) { throw "GHCR package publication failed (exit $LASTEXITCODE)." }
+
+          Write-Host "Published OCI source package $packageReference"
         shell: pwsh
 
       - name: Publish commit-specific GitHub Release
