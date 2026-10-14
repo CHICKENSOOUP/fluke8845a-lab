@@ -4,38 +4,41 @@
 
 ## 简体中文
 
-本说明概述已记录的验证范围，不发布工作站标识、串口日志、原始测量数据或仪器序列号。
+本说明只记录已取得证据的范围。不会发布工作站标识、串口日志、原始真机测量数据或仪器序列号。
 
-### 最近已验证的应用代码版本
+### 当前源码与软件包验证
 
-- 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 当前源码提交为 `721b7c49a748ffce48d8984636181f6b47111605`。该版本为 SCPI 界面日志增加了有界缓冲（最多 5000 行）和合并通知；界面落后时会提示较早显示日志被丢弃，测量 CSV 和全程统计仍完整保存。
-- [Actions 运行 38640315091](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38640315091) 在 Windows 上通过 224 项 pytest：Python 3.11 用时 14.30 秒，Python 3.12 用时 14.79 秒；两个测试步骤均设有 60 秒超时。该运行随后成功生成源码 ZIP、SHA-256 清单并发布 Release 与 GHCR 包。本机 Python 3.11 全量 pytest 也通过 224 项，用时约 12 秒；本机源码打包校验通过，共 111 个文件。
-- 源码 [Release `main-build-721b7c49a748`](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-721b7c49a748) 提供 `Fluke8845A_Source_Project.zip` 和 `SHA256SUMS.txt`。同标签的公开 GHCR OCI 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-721b7c49a748`；匿名拉取令牌读取其 manifest 返回 HTTP 200，digest 为 `sha256:b74996eddb017cea1020ab259f8f603293d4c05deca96225038c792283297498`。
-- 对最新源码 [Release `main-build-70b60a096d99`](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-70b60a096d99) 的 ZIP 做了独立冷启动验证：下载后 SHA-256 与发布校验文件一致（`915282C3D28A44FD331263EB5EE84CD66A1E7C3C235D8D6DEB77E482EFD1EBCC`），解压到新目录并用 `run_windows.bat --mock-e2e` 完成桌面 Mock 流程。报告状态为 `ok`，DCV/ACV/DCI/ACI/2W/4W 分别保存 9/9/8/9/9/9 个模拟样本；每种模式均验证 `measurements.csv`、`config.json`、`events.csv` 和 `run.log`。首次启动联网安装依赖成功。此项仅证明发布源码包可冷启动运行并完成模拟采集，不是 8845A 真机验证。
-- 本次没有操作真机。当前源码尚未完成六种模式的逐项真机验收；Mock 数据和软件包检查不能证明真实仪器通信或测量准确度。GitHub Release 目前只发布源码 ZIP；Windows 二进制的 Qt/PySide 与 Microsoft Visual C++ 分发审查仍未关闭。
+- 当前源码提交：`4b5144490bb5f1125b82e840ea1fdbc8941abb1c`。新增的长运行回归测试向 GUI 输入 110,000 个模拟读数，确认绘图缓存只保留最近 100,000 点，同时全程统计仍计入全部样本。
+- [GitHub Actions 运行 38644381286](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38644381286) 在 Windows 上通过完整 pytest：Python 3.11 为 225 项、12.01 秒；Python 3.12 为 225 项、12.60 秒。两个 pytest 步骤各自设置 60 秒超时。源码 ZIP 构建与校验、GHCR Package 发布和 GitHub Release 发布也均成功。
+- [提交对应的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-4b5144490bb5) 附有 `Fluke8845A_Source_Project.zip`，GitHub 记录的 ZIP SHA-256 为 `4683a358412b17986e53368fc9971ad8cfacbf315ca3a850c569ac347feb6e4c`，另附 `SHA256SUMS.txt`。
+- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-4b5144490bb5`，推送摘要为 `sha256:5eeb84d490f2715c9af04b1a83b1f3808eb53bc1b08aa017c0e996b98d589b9d`。
+- Actions 的源码包构建/校验成功不等于在新 Windows 环境完成解压冷启动。本记录不把早期提交的启动验证外推到这个提交。
 
-### 限制
+### 真机验证与发布限制
 
-当前版本不宣称经过校准的测量准确度、六种模式均已完成真机验证、当前构建具有长期稳定性，或已通过安全认证。Mock 数据是模拟数据。连接仪表前，请核对测量模式、端子、接线、串口设置和适用的安全注意事项。
+- 本次没有连接或操作 Fluke 8845A。六种模式的真机逐项通信、接线和读数验证，以及测量准确度验证，仍未完成。Mock 结果不能替代这些验证。
+- 当前公开 Release 仅含源码 ZIP。Windows 便携程序尚未发布；Qt/PySide LGPL 替换与重新链接验证、完整第三方声明核对，以及 Microsoft Visual C++ 运行库的再分发来源/条款审查仍未关闭。相关审查记录见 [Windows 便携包许可证审查](licenses/windows-portable-review-2026-10-15.md)。
+- 本项目不宣称已经校准、通过安全认证、完成六种模式真机验收，或证明当前构建可在真机上连续稳定运行数小时/数天。
 
-详细操作流程见[使用指南](user-guide.md)。本软件不能替代仪器手册或安全测量规范。
+连接仪表前，请核对仪表模式、输入端子、接线、串口参数和适用的安全注意事项。详细操作见[使用指南](user-guide.md)；软件不能替代仪器手册或安全测量规范。
 
 ## English
 
-This file summarizes the scope of verification without publishing workstation identifiers, serial-port logs, raw measurements, or instrument serial numbers.
+This record reports only evidence that was obtained. It does not publish workstation identifiers, serial logs, raw hardware measurements, or the instrument serial number.
 
-## Latest verified application code
+### Current source and package checks
 
-- The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- The current source commit is `721b7c49a748ffce48d8984636181f6b47111605`. It adds a bounded SCPI GUI log mailbox (maximum 5,000 lines) with coalesced notifications. When the GUI falls behind, it reports dropped older display logs; measurement CSV and full-run statistics remain complete.
-- [Actions run 38640315091](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38640315091) passed 224 pytest cases on Windows: Python 3.11 in 14.30 seconds and Python 3.12 in 14.79 seconds; each pytest step has a 60-second timeout. The run then built the source ZIP and checksum and published both the Release and GHCR package. The complete local Python 3.11 suite also passed 224 cases in about 12 seconds, and local source-package verification passed with 111 files.
-- The source [Release `main-build-721b7c49a748`](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-721b7c49a748) contains `Fluke8845A_Source_Project.zip` and `SHA256SUMS.txt`. Its public GHCR OCI package is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-721b7c49a748`; an anonymous pull-token request fetched the manifest successfully (HTTP 200), with digest `sha256:b74996eddb017cea1020ab259f8f603293d4c05deca96225038c792283297498`.
-- The latest source [Release `main-build-70b60a096d99`](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-70b60a096d99) passed a fresh-extraction cold-start check. Its ZIP SHA-256 matched the published checksum (`915282C3D28A44FD331263EB5EE84CD66A1E7C3C235D8D6DEB77E482EFD1EBCC`); `run_windows.bat --mock-e2e` completed with status `ok`. DCV/ACV/DCI/ACI/2W/4W saved 9/9/8/9/9/9 simulated readings, and each mode's `measurements.csv`, `config.json`, `events.csv`, and `run.log` was verified. First-launch dependency installation succeeded with network access. This establishes source-package startup and simulated acquisition only, not real-meter validation.
-- No real instrument was operated in this verification. The current source has not completed real-hardware validation mode by mode. Mock data and package checks do not establish real-meter communication or measurement accuracy. GitHub Releases currently contain only the source ZIP because the Qt/PySide and Microsoft Visual C++ distribution review for a Windows binary remains open.
+- Current source commit: `4b5144490bb5f1125b82e840ea1fdbc8941abb1c`. The long-run regression test feeds 110,000 simulated readings into the GUI and verifies that the plot cache retains only the newest 100,000 points while full-run statistics still include every sample.
+- [GitHub Actions run 38644381286](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38644381286) passed the full pytest suite on Windows: 225 cases in 12.01 seconds on Python 3.11 and 225 cases in 12.60 seconds on Python 3.12. Each pytest step has a 60-second timeout. Source ZIP build and verification, GHCR Package publication, and GitHub Release publication also succeeded.
+- The [commit-specific Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-4b5144490bb5) contains `Fluke8845A_Source_Project.zip`. GitHub reports its SHA-256 as `4683a358412b17986e53368fc9971ad8cfacbf315ca3a850c569ac347feb6e4c`; `SHA256SUMS.txt` is attached as well.
+- The public GHCR package for the same commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-4b5144490bb5`, with push digest `sha256:5eeb84d490f2715c9af04b1a83b1f3808eb53bc1b08aa017c0e996b98d589b9d`.
+- Successful source-package build and verification in Actions do not establish a fresh Windows extraction/startup check. This record does not extend an earlier commit's startup evidence to this commit.
 
-## Limits
+### Hardware validation and release limits
 
-The current release does not claim calibrated accuracy, validation of all six modes on hardware, long-duration stability of this exact build, or safety certification. Mock data is simulated. Before connecting a meter, verify its mode, terminals, wiring, serial settings, and applicable safety precautions.
+- The Fluke 8845A was not connected or operated for this verification. Mode-by-mode hardware communication, wiring, and reading checks across all six modes, as well as measurement-accuracy validation, remain incomplete. Mock results do not replace those checks.
+- The current public Release contains only the source ZIP. A Windows portable application has not been released. Qt/PySide LGPL replacement and relinking verification, full third-party attribution review, and review of Microsoft Visual C++ runtime redistribution sources and terms remain open. See the [Windows portable package license review](licenses/windows-portable-review-2026-10-15.md).
+- The project does not claim calibration, safety certification, six-mode hardware acceptance, or hours-to-days stability of the current build on a real meter.
 
-For the detailed operating workflow, see the [user guide](user-guide.md). Do not use the app as a substitute for the instrument manual or safe measurement practice.
+Before connecting the meter, verify its mode, input terminals, wiring, serial settings, and applicable safety precautions. See the [user guide](user-guide.md). The software is not a substitute for the instrument manual or safe measurement practice.
+
