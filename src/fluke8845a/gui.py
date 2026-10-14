@@ -444,7 +444,6 @@ class MainWindow(QMainWindow):
         self._baseline: float | None = None
         self._plot_x: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
         self._plot_y: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
-        self._plot_rows: deque[dict] = deque(maxlen=MAX_PLOT_POINTS)
         self._experiment_csv_path: Path | None = None
         self._region_stats_request_id = 0
         self._region_stats_tasks: dict[int, _RegionStatisticsTask] = {}
@@ -861,15 +860,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        self._chart_panel_layout = layout
 
         reading_card = QFrame()
         reading_card.setObjectName("readingCard")
+        self._reading_card = reading_card
         reading_layout = QHBoxLayout(reading_card)
         reading_layout.setContentsMargins(18, 14, 18, 14)
         reading_layout.setSpacing(16)
         reading_text = QVBoxLayout()
+        self._reading_text_layout = reading_text
         reading_text.setSpacing(3)
         reading_kicker = QLabel("实时读数")
+        self._reading_kicker = reading_kicker
         reading_kicker.setObjectName("eyebrow")
         self.reading_mode_label = QLabel("直流电压 DCV · 自动量程 · 1 NPLC")
         self.reading_mode_label.setObjectName("readingMode")
@@ -936,12 +939,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(reading_card)
         self._reading_layout = reading_layout
         self._metrics_layout = metrics_row
-        self._reading_card = reading_card
         self._reading_layout_mode = None
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
         action_layout = QHBoxLayout(action_bar)
+        self._action_layout = action_layout
         action_layout.setContentsMargins(10, 7, 10, 7)
         action_layout.setSpacing(8)
         self.start_button.setMinimumWidth(124)
@@ -999,6 +1002,7 @@ class MainWindow(QMainWindow):
 
         plot_frame = QFrame()
         plot_frame.setObjectName("plotCard")
+        self._plot_frame = plot_frame
         plot_layout = QStackedLayout(plot_frame)
         plot_layout.setContentsMargins(4, 4, 4, 4)
         plot_layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
@@ -1165,8 +1169,28 @@ class MainWindow(QMainWindow):
         self._rate_caption.setText("频率" if narrow else "实测频率")
         self._elapsed_caption.setText("历时" if narrow else "实验历时")
         self._reading_card.setProperty("compact", narrow)
+        stacked = mode == "stacked"
+        self._reading_card.setProperty("stacked", stacked)
+        self._reading_kicker.setVisible(not stacked)
+        self._reading_layout.setSpacing(6 if stacked else 12 if narrow else 20)
+        if stacked:
+            self._reading_layout.setContentsMargins(12, 6, 12, 6)
+        else:
+            self._reading_layout.setContentsMargins(18, 14, 18, 14)
+        self._reading_text_layout.setSpacing(1 if stacked else 3)
+        self._chart_panel_layout.setSpacing(4 if stacked else 10)
+        if stacked:
+            self._action_layout.setContentsMargins(10, 4, 10, 4)
+        else:
+            self._action_layout.setContentsMargins(10, 7, 10, 7)
+        self.plot_widget.setMinimumHeight(175 if stacked else 230)
+        self._plot_frame.setMinimumHeight(177 if stacked else 232)
+        self.analysis_tabs.setMinimumHeight(96 if stacked else 122)
+        self.analysis_tabs.setMaximumHeight(136 if stacked else 168)
         self._reading_card.style().unpolish(self._reading_card)
         self._reading_card.style().polish(self._reading_card)
+        self._reading_card.updateGeometry()
+        self.measurement_workspace.updateGeometry()
         self._reading_layout.setDirection(
             QBoxLayout.Direction.TopToBottom if mode == "stacked" else QBoxLayout.Direction.LeftToRight
         )
@@ -1295,6 +1319,8 @@ class MainWindow(QMainWindow):
             QLabel#readingMode { color: #c2d2df; font-size: 12px; font-weight: 600; }
             QLabel#readingValue { font-family: Consolas, 'Cascadia Mono'; font-size: 38px; font-weight: 700; color: #8ce7e4; }
             QFrame#readingCard[compact="true"] QLabel#readingValue { font-size: 30px; }
+            QFrame#readingCard[stacked="true"] QLabel#readingValue { font-size: 22px; }
+            QFrame#readingCard[stacked="true"] QLabel#readingMode { font-size: 11px; }
             QFrame#metricCell {
                 background: #1b2b3a; border: 1px solid #2a4052; border-radius: 9px;
             }
@@ -2020,7 +2046,6 @@ class MainWindow(QMainWindow):
                 self._last_elapsed = elapsed
                 self._plot_x.append(elapsed)
                 self._plot_y.append(value)
-                self._plot_rows.append(row)
             valid_rows = [r for r in rows if r.get("status") == "ok" and r.get("value_si") not in (None, "")]
             if valid_rows:
                 self.plot_empty_overlay.hide()
@@ -2374,7 +2399,6 @@ class MainWindow(QMainWindow):
         self._experiment_csv_path = None
         self._plot_x.clear()
         self._plot_y.clear()
-        self._plot_rows.clear()
         self._clear_event_markers()
         self._last_value = None
         self._last_elapsed = 0.0

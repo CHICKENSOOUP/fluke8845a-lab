@@ -9,9 +9,9 @@
 ### 当前源码版本
 
 - 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 上一份已验证并公开发布的源码提交为 `e64a63e81c0856f9d83e3fd3790e8130366b2958`。GitHub Actions [运行 38621816795](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38621816795) 在 Windows / Python 3.11 下 213 项 pytest 用时 11.21 秒，在 Python 3.12 下 213 项用时 11.01 秒；两个 pytest 步骤各自有 60 秒上限。该提交成功发布了 commit 专属 GitHub Release 和 GHCR OCI 源码包。
-- 当前候选工作树基于该提交，Windows 冻结程序为 `Fluke8845A_Essentials_6_12_7`。本地 pytest 为 217 项通过，用时 9.10 秒；冻结 GUI Mock 检查、串口枚举检查、解压后启动检查、localhost 健康检查均通过。当前便携 ZIP 有 277 个文件，运行时许可清单的 25 个文件记录均与包内大小及 SHA-256 相符。六种 Mock 模式的端到端报告为 `status=ok`，每种模式保存 9 条模拟读数及 `measurements.csv`、`config.json`、`events.csv` 和 `run.log`。这些结果只验证软件包和模拟流程，不证明真实仪器通信或测量准确度。
-- 当前 Windows 候选包没有附加到 GitHub Release。当前代码快照仍未连接真实仪器逐模式验证；早期版本的真机检查不能作为当前源码快照的验证证据。Qt/PySide 与 Microsoft Visual C++ 分发审查尚未关闭，因此工作流目前只发布源码 Release 和 GHCR 包。
+- 最近已验证并公开发布的源码基线为 `b173c29265287d95a9b990103b0aecd6b1d8e279`，对应 [GitHub Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-b173c2926528) 和 [Actions 运行 38624606820](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38624606820)。该提交在 Windows / Python 3.11、3.12 下各通过 217 项 pytest；源码 ZIP SHA-256 为 `D9426691C1D017E41A04C0211755678F4B0EB2276D9752E46B5389D44503D130`，下载包校验一致，解压后的 Mock 启动检查通过。
+- 基于该基线的当前工作树本地通过 219 项 pytest，用时 9.26 秒；本次本地运行设了 55 秒超时，发布工作流中的每个 pytest 步骤有 60 秒上限。改动包括小窗口 GUI 布局、删除重复的绘图行缓存，以及让样本和事件的本地/UTC 时间戳来自同一时刻。每次推送到 `main` 都先运行测试；通过后，同一工作流会为该提交发布专属 GitHub 预发布版和对应 GHCR 源码包。推送 `v*` 标签会发布正式版和匹配的 GHCR 包。
+- 当前源码快照没有完成六种模式的真实仪器逐项验证。Mock 数据和软件包检查不能证明真实仪器通信或测量准确度。GitHub Release 目前只发布源码 ZIP；Windows 二进制的 Qt/PySide 与 Microsoft Visual C++ 分发审查仍未关闭。
 
 ### 限制
 
@@ -26,9 +26,9 @@ This file summarizes the scope of verification without publishing workstation id
 ## Current source release
 
 - The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- The previous verified and publicly published source commit is `e64a63e81c0856f9d83e3fd3790e8130366b2958`. GitHub Actions [run 38621816795](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38621816795) passed 213 pytest tests on Windows / Python 3.11 in 11.21 seconds and Python 3.12 in 11.01 seconds; each pytest step has a 60-second limit. That commit successfully published a commit-specific GitHub Release and GHCR OCI source package.
-- The current candidate worktree is based on that commit and built the `Fluke8845A_Essentials_6_12_7` frozen Windows application. Local pytest passed 217 tests in 9.10 seconds. Frozen GUI Mock startup, serial enumeration, extracted-package startup, and localhost health checks passed. The portable ZIP has 277 files; all 25 runtime-license manifest records match the archived file sizes and SHA-256 values. The six-mode frozen Mock end-to-end report is `status=ok`; each mode saved 9 simulated readings plus `measurements.csv`, `config.json`, `events.csv`, and `run.log`. These results validate the software package and simulated workflows, not real-meter communication or measurement accuracy.
-- The current Windows candidate is not attached to a GitHub Release. The current code snapshot has not been checked mode-by-mode against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot. Qt/PySide and Microsoft Visual C++ distribution reviews remain open, so the workflow publishes the source ZIP only.
+- The most recently verified and published source baseline is `b173c29265287d95a9b990103b0aecd6b1d8e279`, with its [GitHub Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-b173c2926528) and [Actions run 38624606820](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38624606820). Windows / Python 3.11 and 3.12 each passed 217 pytest tests. The source ZIP SHA-256 is `D9426691C1D017E41A04C0211755678F4B0EB2276D9752E46B5389D44503D130`; the downloaded asset matched, and its extracted Mock startup check passed.
+- The current worktree, based on that commit, passes 219 local pytest tests in 9.26 seconds; this local run had a 55-second timeout, and each release-workflow pytest step has a 60-second limit. Changes cover compact-window GUI layout, removal of a duplicate full-row plotting cache, and paired sample/event local and UTC timestamps. Every push to `main` runs tests first; on success, that workflow publishes a commit-specific GitHub prerelease and matching GHCR source package. Pushing a `v*` tag publishes a stable release and matching GHCR package.
+- The current source snapshot has not been checked mode-by-mode against a real instrument. Mock data and package checks do not establish real-meter communication or measurement accuracy. GitHub Releases currently contain the source ZIP only because the Qt/PySide and Microsoft Visual C++ distribution review for a Windows binary remains open.
 
 ## Limits
 

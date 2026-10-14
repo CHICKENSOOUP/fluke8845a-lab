@@ -71,6 +71,20 @@ def test_failed_attempt_stays_blank_and_event_is_saved(tmp_path):
     recorder.finish("test")
 
 
+def test_generated_local_and_utc_timestamps_share_the_same_instant(tmp_path):
+    recorder = ExperimentRecorder.create(tmp_path, "timestamp pair", {"simulation": True}, ModeSettings(Mode.DCV))
+    sample = recorder.append_reading(None, mode=Mode.DCV, status="invalid", error="no reading")
+    event = recorder.append_event("timestamp check")
+
+    sample_local = datetime.fromisoformat(sample["timestamp_local"])
+    sample_utc = datetime.fromisoformat(sample["timestamp_utc"])
+    event_local = datetime.fromisoformat(event["timestamp_local"])
+    event_utc = datetime.fromisoformat(event["timestamp_utc"])
+    assert sample_local.astimezone(timezone.utc) == sample_utc
+    assert event_local.astimezone(timezone.utc) == event_utc
+    recorder.finish("stopped")
+
+
 def test_constructor_closes_earlier_streams_if_a_later_open_fails(tmp_path, monkeypatch):
     opened_streams = []
     original_open = Path.open

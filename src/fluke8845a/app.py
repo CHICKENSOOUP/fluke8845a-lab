@@ -451,7 +451,7 @@ def run_real_gui_speed_probe(
             if not displayed_actual_rate.endswith(" Hz"):
                 raise RuntimeError(f"GUI未显示有效的实测采样频率：{displayed_actual_rate}")
             report["displayed_actual_rate"] = displayed_actual_rate
-            report["displayed_sample_count"] = len(window._plot_rows)
+            report["displayed_sample_count"] = int(window._global_stats.get("count", 0))
             window._stop()
             pump_until(lambda: bool(experiment_directories), 10.0, "实验停止并保存文件")
             pump_until(lambda: not window._acquiring, 5.0, "采集线程进入停止状态")
@@ -773,7 +773,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                         start_current_mode()
                     except Exception as exc:
                         finish(str(exc))
-                elif state["phase"] == "acquiring" and len(window._plot_rows) >= 3:
+                elif state["phase"] == "acquiring" and int(window._global_stats.get("count", 0)) >= 3:
                     state["phase"] = "awaiting_finish"
                     state["deadline"] = time.monotonic() + 10.0
                     window._stop()

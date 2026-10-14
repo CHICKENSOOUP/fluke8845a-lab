@@ -51,6 +51,34 @@ def test_gui_uses_separate_setup_tabs_and_keeps_the_plot_workspace_clear(
         qt_app.processEvents()
 
 
+def test_minimum_window_size_does_not_clip_the_readout_or_analysis(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.resize(1040, 700)
+        window.show()
+        qt_app.processEvents()
+        qt_app.processEvents()
+
+        assert window._reading_layout_mode == "stacked"
+        assert window.measurement_workspace.height() >= window.measurement_workspace.minimumSizeHint().height()
+        assert window.latest_value_label.height() >= window.latest_value_label.minimumSizeHint().height()
+        assert not window.reading_mode_label.geometry().intersects(window.latest_value_label.geometry())
+        assert window.plot_widget.height() >= window.plot_widget.minimumHeight()
+        assert window.analysis_tabs.height() >= window.analysis_tabs.minimumHeight()
+        panel_items = [
+            window._chart_panel_layout.itemAt(index).widget().geometry()
+            for index in range(window._chart_panel_layout.count())
+        ]
+        assert all(
+            current.y() + current.height() <= following.y()
+            for current, following in zip(panel_items, panel_items[1:])
+        )
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_help_menu_exposes_qt_license_notice(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
@@ -162,7 +190,8 @@ def test_live_plot_cache_stays_bounded_while_global_stats_keep_all_samples(
         plot_x, plot_y = window.curve.getData()
         assert list(plot_x) == [2.0, 3.0, 4.0]
         assert list(plot_y) == [103.0, 104.0, 105.0]
-        assert [row["sample_index"] for row in window._plot_rows] == [3, 4, 5]
+        assert list(window._plot_x) == [2.0, 3.0, 4.0]
+        assert list(window._plot_y) == [103.0, 104.0, 105.0]
         assert window._global_stats["count"] == 5
         assert "n=5" in window.stats_label.text()
     finally:
@@ -262,10 +291,10 @@ def test_mock_gui_continuous_acquisition_plots_and_persists_each_mode(
 
         window._start_continuous()
         deadline = time.monotonic() + 3.0
-        while len(window._plot_rows) < 3 and time.monotonic() < deadline:
+        while int(window._global_stats.get("count", 0)) < 3 and time.monotonic() < deadline:
             qt_app.processEvents()
             time.sleep(0.005)
-        assert len(window._plot_rows) >= 3
+        assert int(window._global_stats["count"]) >= 3
         window._stop()
 
         deadline = time.monotonic() + 3.0
@@ -284,8 +313,8 @@ def test_mock_gui_continuous_acquisition_plots_and_persists_each_mode(
             original_count = 0 if original_x is None else len(original_x)
             if (
                 not window._experiment_active
-                and len(window._plot_rows) == len(rows)
-                and original_count == len(window._plot_rows)
+                and int(window._global_stats.get("count", 0)) == len(rows)
+                and original_count == len(window._plot_x)
             ):
                 break
             time.sleep(0.005)
@@ -294,16 +323,16 @@ def test_mock_gui_continuous_acquisition_plots_and_persists_each_mode(
         original_x, original_y = window.curve.getOriginalDataset()
         assert plot_x is not None and plot_y is not None and len(plot_x) > 0
         assert original_x is not None and original_y is not None
-        assert len(original_x) == len(original_y) == len(window._plot_rows)
+        assert len(original_x) == len(original_y) == len(window._plot_x) == len(window._plot_y)
         assert list(original_x) == list(window._plot_x)
         assert list(original_y) == list(window._plot_y)
-        assert len(rows) == len(window._plot_rows)
-        assert all(row["mode"] == mode.value for row in window._plot_rows)
+        assert len(rows) == window._global_stats["count"]
+        assert all(row["mode"] == mode.value for row in rows)
         assert DESCRIPTORS[mode].label in window.reading_mode_label.text()
-        assert f"n={len(window._plot_rows)}" in window.stats_label.text()
+        assert f"n={window._global_stats['count']}" in window.stats_label.text()
 
         metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
-        assert len(rows) == len(window._plot_rows)
+        assert len(rows) == window._global_stats["count"]
         assert metadata["simulation"] is True
         assert metadata["mode"] == mode.value
         assert all(row["status"] == "ok" and row["raw_reading"] for row in rows)

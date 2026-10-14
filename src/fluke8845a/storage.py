@@ -157,6 +157,19 @@ class ExperimentRecorder:
         if started_monotonic_ns is None:
             import time
             started_monotonic_ns = time.monotonic_ns()
+        if not timestamp_local or not timestamp_utc:
+            if timestamp_utc:
+                sample_time = datetime.fromisoformat(timestamp_utc)
+                if sample_time.tzinfo is None:
+                    sample_time = sample_time.replace(tzinfo=timezone.utc)
+            elif timestamp_local:
+                sample_time = datetime.fromisoformat(timestamp_local)
+                if sample_time.tzinfo is None:
+                    sample_time = sample_time.astimezone()
+            else:
+                sample_time = datetime.now(timezone.utc)
+            timestamp_local = timestamp_local or sample_time.astimezone().isoformat(timespec="microseconds")
+            timestamp_utc = timestamp_utc or sample_time.astimezone(timezone.utc).isoformat(timespec="microseconds")
         if self.started_monotonic_ns is None:
             self.started_monotonic_ns = started_monotonic_ns
         elapsed = max(0.0, (started_monotonic_ns - self.started_monotonic_ns) / 1e9)
@@ -179,8 +192,8 @@ class ExperimentRecorder:
                 resistance = value
         row = {
             "sample_index": self.sample_count,
-            "timestamp_local": timestamp_local or datetime.now().astimezone().isoformat(timespec="microseconds"),
-            "timestamp_utc": timestamp_utc or datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+            "timestamp_local": timestamp_local,
+            "timestamp_utc": timestamp_utc,
             "elapsed_s": repr(elapsed),
             "read_duration_s": "" if read_duration_s is None else repr(read_duration_s),
             "actual_interval_s": "" if interval is None else repr(interval),
@@ -218,10 +231,12 @@ class ExperimentRecorder:
         now_ns = time.monotonic_ns()
         if self.started_monotonic_ns is None:
             self.started_monotonic_ns = now_ns
+        event_time_utc = datetime.now(timezone.utc)
+        event_time_local = event_time_utc.astimezone()
         row = {
             "event_index": self.event_count + 1,
-            "timestamp_local": datetime.now().astimezone().isoformat(timespec="microseconds"),
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+            "timestamp_local": event_time_local.isoformat(timespec="microseconds"),
+            "timestamp_utc": event_time_utc.isoformat(timespec="microseconds"),
             "elapsed_s": repr(max(0.0, (now_ns - self.started_monotonic_ns) / 1e9)),
             "sample_index": self.sample_count,
             "mode": self.mode.value,
