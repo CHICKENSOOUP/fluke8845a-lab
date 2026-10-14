@@ -168,7 +168,7 @@ def test_worker_coalesces_notifications_and_bounds_gui_mailbox():
     assert worker._ui_notification_pending is True
 
     rows, rate, stats = worker.take_sample_update()
-    assert [row["sample_index"] for row in rows] == list(range(10_000, 15_000))
+    assert [row["sample_index"] for row in rows] == list(range(5_000, 15_000))
     assert rate == 0.0
     assert stats["count"] == 1
     assert worker._ui_notification_pending is False
