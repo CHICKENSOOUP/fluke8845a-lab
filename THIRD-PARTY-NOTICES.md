@@ -6,7 +6,7 @@ This source repository does not bundle third-party runtime binaries. Dependencie
 
 The application uses PySide6 (Qt for Python) for its graphical interface. The project intends to use the community LGPLv3 licensing path for the LGPL-eligible Qt/PySide6 components. PySide6/Qt also offers GPL and commercial licensing options, and individual modules or bundled third-party components can have different terms. The exact license must be checked against the components in each binary build.
 
-When a Windows binary is published, its release package must include the applicable license texts and notices, exact component inventory, a source delivery method for the Qt/PySide libraries, and instructions that let recipients replace/relink those libraries and run the application. This source-only release does not claim that a binary distribution is LGPL-compliant.
+When a Windows binary is published, its release package must include the applicable license texts and notices, an exact component inventory, corresponding Qt/PySide source, and instructions that let recipients replace/relink those libraries and run the application. The current review materials are drafts for one build snapshot; see [Qt licensing review](docs/licenses/windows-portable-review-2026-10-14.md), [component inventory](docs/licenses/windows-qt-runtime-inventory-2026-10-14.csv), [source offer register](docs/licenses/windows-source-offer.md), and [replacement guide](docs/licenses/windows-replace-qt.md). The source-only release does not claim that a binary distribution is LGPL-compliant.
 
 - [Qt for Python licensing](https://doc.qt.io/qtforpython-6/)
 - [Qt open-source LGPL/GPL obligations](https://www.qt.io/development/open-source-lgpl-obligations)
