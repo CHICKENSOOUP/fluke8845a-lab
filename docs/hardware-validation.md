@@ -9,10 +9,10 @@
 ### 当前源码与软件包验证
 
 - 当前源码提交为 [`61560824b8944b548f75e44b8a55e468356f2fc2`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/61560824b8944b548f75e44b8a55e468356f2fc2)。源码 ZIP 启动器现在只接受有对应锁文件的 64 位 Python 3.11/3.12，并按版本选择锁定依赖。
-- 本机完整 pytest 套件在 45 秒硬停止限制内通过。源码打包器随后创建并校验了 111 个文件，且确认两份依赖锁均在归档内。这些检查验证锁文件选择逻辑和发布归档内容，不等同于全新 Windows 用户目录中的首次联网安装。
-- [GitHub Actions 运行 38650054326](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38650054326) 成功完成 Python 3.11 和 3.12 测试、源码 ZIP 构建、GHCR 发布与 GitHub Release 发布；每个 pytest 步骤的上限为 60 秒。
-- [当前 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-61560824b894) 附有 `Fluke8845A_Source_Project.zip` 和 `SHA256SUMS.txt`。源码 ZIP SHA-256 为 `6f8c152495e0202bfd4fae820b1fe275b2c3984355d32b00857aa5d921df4d7b`。
-- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-61560824b894`；匿名 manifest 请求返回 HTTP 200，摘要为 `sha256:36c4084a00629a8303d9978cfc5f6148616d683762f378d0fd3a5da2f110b635`。
+- 本机完整 pytest 套件在 45 秒硬停止限制内通过。源码打包器创建并校验了 111 个文件，两份依赖锁均在归档内。
+- [GitHub Actions 运行 38651276730](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38651276730) 成功完成 Python 3.11/3.12 测试，并从新解压的源码 ZIP 首次创建 `.venv`、安装锁定依赖、启动 Mock 桌面界面。源码启动冒烟步骤和每个 pytest 步骤都设有 60 秒上限；同一运行还成功发布了 GHCR 包和 GitHub Release。
+- [该次验证对应的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-ec4cc6556294) 附有 `Fluke8845A_Source_Project.zip` 和 `SHA256SUMS.txt`。源码 ZIP SHA-256 为 `d64fca9592b3aa4f3ecebf51308a9e44f2d1ee6b46dce36943e754e739af8e63`。
+- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-ec4cc6556294`；匿名 manifest 请求返回 HTTP 200，摘要为 `sha256:b57a51ca7b0ef3497e5e9720abe5f97fddfc43696644403e04041d14417b439e`。
 - 较早的本地便携候选包由源码树 `bc51e64a0a8ab33fcaf4d1757c08364dc78d6827` 构建，包含 277 个文件；其 ZIP SHA-256 为 `a637dc1b92f19132e7342ae4266ff17e8fbd66116ecf4af4c69ce15442b9a374`。它不是当前公开 Release 的资产。Qt/PySide 和其他运行库审查门槛仍未关闭，因此当前 Release 仅发布源码。
 
 ### 真机验证与发布限制
@@ -30,10 +30,10 @@ This record reports only evidence that was obtained. It does not publish worksta
 ### Current source and package checks
 
 - The current source commit is [`61560824b8944b548f75e44b8a55e468356f2fc2`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/61560824b8944b548f75e44b8a55e468356f2fc2). The source ZIP launcher now accepts only 64-bit Python 3.11/3.12 with a matching dependency lock.
-- The complete local pytest suite passed with a 45-second hard-stop limit. The source packager then created and verified a 111-file archive and confirmed that both dependency locks are included. These checks cover lock selection and archive contents; they do not establish a fresh first network install in a clean Windows user directory.
-- [GitHub Actions run 38650054326](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38650054326) successfully completed the Python 3.11 and 3.12 test jobs, source ZIP build, GHCR publication, and GitHub Release publication. Each pytest step is capped at 60 seconds.
-- The [current Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-61560824b894) contains `Fluke8845A_Source_Project.zip` and `SHA256SUMS.txt`. The source ZIP SHA-256 is `6f8c152495e0202bfd4fae820b1fe275b2c3984355d32b00857aa5d921df4d7b`.
-- The public GHCR package for the same commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-61560824b894`. An anonymous manifest request returned HTTP 200 with digest `sha256:36c4084a00629a8303d9978cfc5f6148616d683762f378d0fd3a5da2f110b635`.
+- The complete local pytest suite passed with a 45-second hard-stop limit. The source packager verified a 111-file archive containing both dependency locks.
+- [GitHub Actions run 38651276730](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38651276730) passed on Python 3.11/3.12, then created a new `.venv` from the freshly extracted source ZIP, installed its locked dependencies, and launched the Mock desktop UI. The extracted-source startup step and each pytest step have a 60-second limit. The same run published both the GHCR package and GitHub Release.
+- The [Release for that verified run](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-ec4cc6556294) contains `Fluke8845A_Source_Project.zip` and `SHA256SUMS.txt`. The source ZIP SHA-256 is `d64fca9592b3aa4f3ecebf51308a9e44f2d1ee6b46dce36943e754e739af8e63`.
+- The public GHCR package for that commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-ec4cc6556294`. An anonymous manifest request returned HTTP 200 with digest `sha256:b57a51ca7b0ef3497e5e9720abe5f97fddfc43696644403e04041d14417b439e`.
 - An earlier local portable candidate was built from source tree `bc51e64a0a8ab33fcaf4d1757c08364dc78d6827` and contains 277 files. Its ZIP SHA-256 is `a637dc1b92f19132e7342ae4266ff17e8fbd66116ecf4af4c69ce15442b9a374`. It is not an asset of the current public Release. Qt/PySide and other runtime redistribution review gates remain open, so the current Release contains source only.
 
 ### Hardware validation and release limits

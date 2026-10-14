@@ -47,7 +47,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
 
-每次推送到 `main` 都会在 Python 3.11 和 3.12 Windows 环境分别运行 pytest（每个测试步骤最多 60 秒）；全部通过后，同一工作流会为该提交创建 GitHub 预发布版本，并同时发布源码 ZIP、SHA-256 校验文件和 GHCR Packages 源码包。推送 `v*` 标签也会同时发布正式 GitHub Release 和 Packages。自动发布流程见[发布说明](docs/releasing.md)。
+每次推送到 `main` 都会在 Python 3.11 和 3.12 Windows 环境分别运行 pytest（每个测试步骤最多 60 秒），并从新解压的源码 ZIP 首次创建环境、安装锁定依赖和启动 Mock 桌面界面（最多 60 秒）；全部通过后，同一工作流会为该提交创建 GitHub 预发布版本，并同时发布源码 ZIP、SHA-256 校验文件和 GHCR Packages 源码包。推送 `v*` 标签也会同时发布正式 GitHub Release 和 Packages。自动发布流程见[发布说明](docs/releasing.md)。
 
 ### 仪器与验证状态
 
@@ -118,7 +118,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
 
-Every push to `main` automatically runs pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds); both suites must pass before the same workflow publishes a commit-specific GitHub prerelease and matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes both a stable release and package. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
+Every push to `main` runs pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds), then extracts the source ZIP into a fresh directory, installs the locked environment, and launches the Mock desktop UI (60-second limit). After all checks pass, the workflow publishes a commit-specific GitHub prerelease and matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes both a stable release and package. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
 
 ## Hardware and verification status
 
