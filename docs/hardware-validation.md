@@ -9,8 +9,8 @@
 ### 当前源码版本
 
 - 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 源码提交 `88d40d8` 的 207 项 pytest 在本机 8.79 秒通过；对应 GitHub Actions 发布工作流也通过，且 pytest 步骤设置了 60 秒上限。这些是软件自动化/Mock 检查，不是仪器准确度或真机兼容性验证。
-- Qt 许可审查候选程序尚未连接真实仪器验证。早期版本的真机检查不能作为当前源码快照的验证证据。
+- 源码提交 `cb0893c` 的 209 项 pytest 已在 Windows / Python 3.11（10.57 秒）和 Python 3.12（10.93 秒）通过；对应 GitHub Actions 发布也成功，每个 pytest 步骤设有 60 秒上限。另有 Python 3.11 Mock GUI 启停检查通过。这些是软件自动化/Mock 检查，不是仪器准确度或真机兼容性验证。
+- 提交 `cb0893c` 尚未连接真实仪器逐模式验证。早期版本的真机检查不能作为当前源码快照的验证证据。
 
 ### 限制
 
@@ -25,8 +25,8 @@ This file summarizes the scope of verification without publishing workstation id
 ## Current source release
 
 - The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- Source commit `88d40d8` passed 207 pytest tests locally in 8.79 seconds, and the corresponding GitHub Actions release workflow passed with a 60-second test-step limit. These are software automation/Mock checks, not meter-accuracy or real-hardware validation.
-- The Qt licensing candidate has not been verified against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot.
+- Source commit `cb0893c` passed 209 pytest tests on Windows / Python 3.11 (10.57 seconds) and Python 3.12 (10.93 seconds); the corresponding GitHub Actions release also succeeded, with a 60-second limit on each pytest step. A Python 3.11 Mock GUI startup/shutdown check also passed. These are software automation/Mock checks, not meter-accuracy or real-hardware validation.
+- Commit `cb0893c` has not been checked mode-by-mode against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot.
 
 ## Limits
 
