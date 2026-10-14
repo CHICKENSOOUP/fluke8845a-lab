@@ -30,6 +30,7 @@ INCLUDED_TREES = (
     "scripts",
     "examples/mock_experiments",
     "assets",
+    ".github/workflows",
 )
 REQUIRED_ARCHIVE_PATHS = (
     "README.md",
@@ -47,8 +48,10 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/licenses/LGPL-3.0.txt",
     "docs/hardware-validation.md",
     "docs/release-notes-v1.0.1.md",
+    "docs/releasing.md",
     "tests/test_worker.py",
     "assets/fluke8845a_app_icon_v3.png",
+    ".github/workflows/publish-release.yml",
 )
 EXCLUDED_PATH_PARTS = {
     ".git",

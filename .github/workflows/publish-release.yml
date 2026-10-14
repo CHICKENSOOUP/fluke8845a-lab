@@ -1,0 +1,86 @@
+name: Publish source packages
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Install locked test environment
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-lock.txt
+          python -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
+        shell: pwsh
+
+      - name: Run tests (60-second limit)
+        run: |
+          New-Item -ItemType Directory -Path "build" -Force | Out-Null
+          python -m pytest -p no:cacheprovider --maxfail=1 --basetemp "build\pytest-release"
+        shell: pwsh
+        timeout-minutes: 1
+
+      - name: Build and verify source package
+        run: |
+          python scripts/package_source.py --output dist/Fluke8845A_Source_Project.zip
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Fluke8845A_Source_Project.zip" | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
+        shell: pwsh
+
+      - name: Publish commit-specific GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
+          $checksums = Join-Path $env:GITHUB_WORKSPACE "dist\SHA256SUMS.txt"
+          $sha = $env:GITHUB_SHA
+
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+            $title = "Fluke 8845A Lab $tag"
+            $prerelease = $false
+          } else {
+            $tag = "main-build-$($sha.Substring(0, 12))"
+            $title = "Fluke 8845A Lab main build $($sha.Substring(0, 7))"
+            $prerelease = $true
+          }
+
+          $notes = @"
+          Automated source-only package for commit $sha.
+
+          Assets: Fluke8845A_Source_Project.zip and SHA256SUMS.txt.
+          The test step is capped at 60 seconds. This release does not claim validation on a real Fluke 8845A.
+          A Windows binary is omitted while the documented Qt/PySide licensing review remains open.
+          "@
+
+          gh release view $tag --repo $repo *> $null
+          $exists = $LASTEXITCODE -eq 0
+          if ($exists) {
+            gh release upload $tag $archive $checksums --repo $repo --clobber
+          } else {
+            $ghArguments = @("release", "create", $tag, $archive, $checksums, "--repo", $repo, "--title", $title, "--notes", $notes, "--target", $sha)
+            if ($prerelease) { $ghArguments += "--prerelease" } else { $ghArguments += "--verify-tag" }
+            gh @ghArguments
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed (exit $LASTEXITCODE)." }
+        shell: pwsh

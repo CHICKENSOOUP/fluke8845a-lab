@@ -37,6 +37,11 @@ def test_source_archive_includes_first_run_windows_launchers():
     } <= set(REQUIRED_ARCHIVE_PATHS)
 
 
+def test_source_archive_includes_automated_release_workflow_and_guide():
+    assert ".github/workflows/publish-release.yml" in REQUIRED_ARCHIVE_PATHS
+    assert "docs/releasing.md" in REQUIRED_ARCHIVE_PATHS
+
+
 def valid_report(executable_sha256="ABCD"):
     modes = ("DCV", "ACV", "DCI", "ACI", "RES2", "RES4")
     return {
