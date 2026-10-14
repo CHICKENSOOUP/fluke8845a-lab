@@ -95,6 +95,40 @@ def test_help_menu_exposes_qt_license_notice(qt_app, monkeypatch, tmp_path):
         qt_app.processEvents()
 
 
+def test_window_close_waits_for_worker_thread_to_finish_cleanup(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        assert not window.close()
+        assert window.isVisible()
+        assert window._shutdown_started
+        assert not window.isEnabled()
+
+        deadline = time.monotonic() + 2.0
+        while window.isVisible() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.01)
+
+        assert window._shutdown_finished
+        assert not window._worker_thread.isRunning()
+        assert not window.isVisible()
+    finally:
+        if window._worker_thread.isRunning():
+            window._worker.request_stop()
+            window._bridge.close_app.emit()
+            deadline = time.monotonic() + 2.0
+            while window._worker_thread.isRunning() and time.monotonic() < deadline:
+                qt_app.processEvents()
+                time.sleep(0.01)
+        if window.isVisible():
+            window._shutdown_finished = True
+            window.close()
+        qt_app.processEvents()
+
+
 def test_real_reading_updates_gui_curve_and_stats_without_plotting_failed_value(
     qt_app, monkeypatch, tmp_path
 ):

@@ -458,8 +458,11 @@ class MainWindow(QMainWindow):
         self._global_stats = {"count": 0, "minimum": None, "maximum": None, "mean": None, "sample_stddev": None}
         self._crosshair_x = None
         self._crosshair_y = None
+        self._shutdown_started = False
+        self._shutdown_finished = False
 
         self._worker_thread = QThread(self)
+        self._worker_thread.finished.connect(self._on_worker_thread_finished)
         self._worker = MeasurementWorker()
         self._worker.moveToThread(self._worker_thread)
         self._bridge = WorkerBridge(self)
@@ -2595,13 +2598,28 @@ class MainWindow(QMainWindow):
         self._append_log(f"! {message}")
         QMessageBox.warning(self, "操作未完成", message)
 
+    @Slot()
+    def _on_worker_thread_finished(self) -> None:
+        self._shutdown_finished = True
+        if self._shutdown_started:
+            self.close()
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._shutdown_finished or not self._worker_thread.isRunning():
+            event.accept()
+            return
+
+        event.ignore()
+        if self._shutdown_started:
+            return
+
+        self._shutdown_started = True
         self._clock_timer.stop()
         for task in self._region_stats_tasks.values():
             task.cancel()
+        self.setEnabled(False)
+        self.setWindowTitle("正在安全关闭 · Fluke 8845A 科研测量与长期记录")
+        self._append_log("正在等待当前读数结束、保存数据并关闭仪器连接…")
         self._worker.request_stop()
         self._bridge.close_app.emit()
-        if not self._worker_thread.wait(5000):
-            self._append_log("! 仪器线程退出超时；当前测量读取的串口响应尚未返回")
-        event.accept()
 
