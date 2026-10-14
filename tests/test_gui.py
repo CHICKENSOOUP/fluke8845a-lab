@@ -82,6 +82,43 @@ def test_minimum_window_size_does_not_clip_the_readout_or_analysis(qt_app, monke
         qt_app.processEvents()
 
 
+def test_long_run_plot_cache_is_bounded_without_truncating_global_stats(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    total_samples = gui_module.MAX_PLOT_POINTS + MAX_PENDING_GUI_ROWS
+    try:
+        for start in range(0, total_samples, MAX_PENDING_GUI_ROWS):
+            stop = min(total_samples, start + MAX_PENDING_GUI_ROWS)
+            rows = [
+                {
+                    "sample_index": index + 1,
+                    "status": "ok",
+                    "value_si": 1.0 + index / 1_000_000,
+                    "elapsed_s": float(index + 1),
+                    "mode": Mode.DCV.value,
+                    "error": "",
+                }
+                for index in range(start, stop)
+            ]
+            window._on_sample(rows, 0.0, {
+                "count": stop,
+                "minimum": 1.0,
+                "maximum": 1.0 + (stop - 1) / 1_000_000,
+                "mean": 1.0 + (stop - 1) / 2_000_000,
+                "sample_stddev": ((stop * (stop + 1) / 12) ** 0.5) / 1_000_000,
+            })
+
+        assert len(window._plot_x) == gui_module.MAX_PLOT_POINTS
+        assert len(window._plot_y) == gui_module.MAX_PLOT_POINTS
+        assert window._plot_x[0] == total_samples - gui_module.MAX_PLOT_POINTS + 1
+        assert window._plot_x[-1] == total_samples
+        assert window._global_stats["count"] == total_samples
+        assert f"全程有效点 n={total_samples}" in window.stats_label.text()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_help_menu_exposes_qt_license_notice(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
