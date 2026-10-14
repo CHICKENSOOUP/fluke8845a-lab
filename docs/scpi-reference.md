@@ -1,4 +1,8 @@
-# SCPI命令与8845A限制依据
+# SCPI 命令与 8845A 限制依据 | SCPI Reference
+
+[简体中文](#简体中文) | [English](#english)
+
+## 简体中文
 
 下表列明本程序采用的命令与显示条件及其依据。页码同时区分PDF页与印刷页。Fluke 手册在研发过程中作为参考；出于版权与发布范围考虑，本仓库不再分发手册 PDF。
 
@@ -31,4 +35,37 @@
 - 400 mA的DCI/ACI分别检查资料所列固件门槛；未识别固件时禁用固定档及可能跨入该档的电流自动量程。
 - 1/3/10 A档按规格仅在前面板端子显示可用；后端子下固定档被禁用且电流自动量程被阻止。
 - `READ?`的时间戳是PC写命令前时间，仪器转换并无逐样本硬件时间戳。读数周期与range-query耗时一并保存在`read_duration_s`。并未使用资料中有额外条件的典型高速度作为保证。
+
+## English
+
+This reference maps application behavior to the Fluke 8845A documentation consulted during development. Page numbers distinguish PDF pages from printed pages. The manuals are not redistributed with this repository.
+
+### Documentation basis
+
+| Topic | Fluke reference |
+|---|---|
+| RS-232 defaults and configurable serial parameters | *8845A/8846A Programmers Manual*, Rev. 3, PDF pp. 16–17 (printed pp. 6–7) |
+| COMPUTER/TERMINAL modes, `SYST:REM`, `SYST:LOC`, `*IDN?`, and terminators | Same manual, PDF pp. 18–19, 28 (printed pp. 8–9, 18) |
+| `MEASure?`, `CONFigure`, `READ?`, `INIT/FETCh`, and trigger behavior | Same manual, PDF pp. 48–52 (printed pp. 38–42) |
+| Six measurement functions, range, NPLC, filter, bandwidth, auto-zero, terminal and error queries | Same manual, PDF pp. 41–47 (printed pp. 31–37) |
+| 8845A/8846A differences; voltage and resistance ranges | *Extended Specifications*, PDF pp. 1–6 (printed pp. 2–5) |
+| Current ranges, 400 mA firmware conditions, front-terminal 1/3/10 A ranges, burden voltage and fuses | Same specifications, PDF pp. 7–9; Chinese *Users Manual*, PDF pp. 73–74 |
+| Typical rate conditions, NPLC and AC bandwidth | Same specifications, PDF p. 12; programmers manual, PDF pp. 42–43 |
+| Current-series wiring, jacks, fuses, and 2-/4-wire resistance wiring | Chinese *Users Manual*, PDF pp. 73–76 (printed pp. 4-9–4-12), and its supplement, PDF p. 2 |
+| RMS readings, AC coupling, AC ranges and filter bands | *Extended Specifications*, PDF pp. 4–5, 8–9, and user-manual supplement, PDF pp. 3–4 |
+| Internal memory and TrendPlot behavior | *Extended Specifications*, PDF p. 2; *Data Logging and TrendPlot Application Note*, pp. 2–3 |
+
+### Commands sent by the application
+
+After `*IDN?` identification, connection sends `SYST:REM` and checks the instrument error queue. Normal disconnect sends `SYST:LOC`. Function setup uses `CONF:VOLT:DC`, `CONF:VOLT:AC`, `CONF:CURR:DC`, `CONF:CURR:AC`, `CONF:RES`, or `CONF:FRES`. Autorange uses `SENS:<function>:RANG:AUTO ON`; fixed range uses `...:RANG:AUTO OFF` followed by `...:RANG <SI>`. Only DCV, DCI, RES, and FRES use `...:NPLC`. ACV/ACI set `SENS:DET:BAND <3|20|200>`. Supported DC modes set `SENS:<function>:FILT:STAT ON|OFF`; auto-zero uses `ZERO:AUTO ON|OFF`. Each point uses `READ?`, followed by a query of the actual range and complete response parsing.
+
+The application does not configure capacitance, RTD temperature, source output, or synchronous dual voltage/current channels. A response identifying an 8846A, another model, or malformed identity is rejected. Tests and Mock mode do not establish real-meter accuracy.
+
+### Conservative implementation boundaries
+
+- Parameters are validated against documented discrete values. A non-zero instrument error queue aborts configuration and acquisition.
+- The 400 mA DCI/ACI ranges check documented firmware thresholds. If firmware cannot be identified, the fixed range and potentially crossing autorange are disabled.
+- 1/3/10 A ranges are exposed only when front-panel terminals are confirmed; rear-terminal operation blocks these fixed ranges and current autorange.
+- `READ?` timestamps are host timestamps taken before sending the command. The meter supplies no hardware timestamp per sample; `read_duration_s` records the read and range-query interval. Published typical maximum speeds are not treated as guarantees.
+- The manual shows separate mA/400 mA and 10 A jacks. `ROUT:TERM?` reports only FRONT/REAR, and range readback cannot identify the physical red jack. The operator must verify the lead and front-panel input selection.
 

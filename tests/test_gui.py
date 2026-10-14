@@ -60,7 +60,7 @@ def test_help_menu_exposes_qt_license_notice(qt_app, monkeypatch, tmp_path):
             if action.text() == "帮助"
         )
         assert any(action.text() == "Qt 与第三方许可…" for action in help_menu.actions())
-        assert gui_module.MainWindow._find_document("Qt_许可与第三方声明.md").is_file()
+        assert gui_module.MainWindow._find_document("qt-licensing-and-third-party-notices.md").is_file()
     finally:
         window.close()
         qt_app.processEvents()

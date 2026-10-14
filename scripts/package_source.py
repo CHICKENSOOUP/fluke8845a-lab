@@ -34,9 +34,9 @@ REQUIRED_ARCHIVE_PATHS = (
     "LICENSE",
     "THIRD-PARTY-NOTICES.md",
     "src/fluke8845a/gui.py",
-    "docs/Qt_许可与第三方声明.md",
+    "docs/qt-licensing-and-third-party-notices.md",
     "docs/licenses/LGPL-3.0.txt",
-    "docs/硬件验证清单.md",
+    "docs/hardware-validation.md",
     "tests/test_worker.py",
     "assets/fluke8845a_app_icon_v3.png",
 )

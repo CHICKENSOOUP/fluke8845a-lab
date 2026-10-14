@@ -1,5 +1,9 @@
 # Qt/PySide source delivery register (draft)
 
+[简体中文](#简体中文) | [English](#english)
+
+## English
+
 This register is for the 2026-10-14 Windows portable build review. It is not yet a complete source offer for distribution because the Qt PDF binary in the candidate has not been matched to an exact stable source revision.
 
 ## Source packages identified
@@ -31,3 +35,21 @@ No large upstream source archive has been copied into this repository. For the f
 - [PySide6 6.12.0 source archive index](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/)
 - [Qt PDF source/build notes](https://wiki.qt.io/QtPDF_Build_Instructions)
 - [QtWebEngine repository](https://code.qt.io/cgit/qt/qtwebengine.git/)
+
+## 简体中文
+
+### Qt/PySide 源码交付登记表（草稿）
+
+本登记表针对 2026-10-14 Windows 便携构建审查。候选包中的 Qt PDF 二进制尚未匹配到精确稳定版源码，因此本登记表还不是完整的源码交付方案。
+
+| 随包组件 | 候选版本 | 官方源码位置 | 状态 |
+|---|---:|---|---|
+| Qt 框架模块 | 6.12.0 | [Qt 6.12.0 源码包](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/) | 已识别版本；最终构建仍须记录校验和及构建补丁。 |
+| PySide6/Shiboken 绑定 | 6.12.0 | [PySide6 6.12.0 源码包](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/) | 已识别版本；须确认补丁及 wheel 来源。 |
+| Qt PDF / PDFium | 文件版本 6.140.0.0 | [QtWebEngine 源码仓库](https://code.qt.io/cgit/qt/qtwebengine.git/) | **未解决：**审查时找到的公开 ref 只有 `v6.140.0-rc`，不能把它宣称为稳定版二进制的对应源码。 |
+
+Qt PDF 的对应源码集还须覆盖匹配的 QtWebEngine/PDFium 源码及随包第三方组件的许可证/归属材料。Qt 6.12 通用源码包本身不能证明该覆盖完整。
+
+文档中的书面要约措辞只有在源码完整归档、发布 ZIP 完成替换验证后才能使用。届时需提供稳定下载地址、SHA-256、所有补丁，并确保源码在承诺期限内持续可取。当前 Qt PDF 源码缺失，故不得将要约表述为已完备。
+
+本仓库没有复制大型上游源码包。最终便携版需将实际 Qt、QtWebEngine/PDF 和 PySide 源码包保存在 Git 之外，发布稳定链接及校验值；不能以不匹配的其他版本替代。

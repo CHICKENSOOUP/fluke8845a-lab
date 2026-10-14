@@ -1,5 +1,27 @@
 # Third-party notices
 
+[简体中文](#简体中文) | [English](#english)
+
+## 简体中文
+
+本源码仓库不包含第三方运行时二进制文件。依赖按 `pyproject.toml` 和 `requirements.txt` 单独安装，各依赖继续适用其自身许可证。
+
+### Qt for Python（PySide6）与 Qt
+
+应用使用 PySide6（Qt for Python）构建图形界面。项目计划对具备该选项的 Qt/PySide6 组件采用社区版 LGPLv3 路径。PySide6/Qt 也提供 GPL 和商业许可选项，个别模块或捆绑的第三方组件可能适用不同条款。每次二进制构建都必须按实际组件核实许可证。
+
+发布 Windows 二进制程序时，安装包需包含适用的许可证文本和声明、精确组件清单、对应 Qt/PySide 源码，以及允许接收者替换/重新链接这些库并运行程序的说明。当前审查材料针对单一构建快照且仍是草稿，见[Qt 许可审查](docs/licenses/windows-portable-review-2026-10-14.md)、[组件清单](docs/licenses/windows-qt-runtime-inventory-2026-10-14.csv)、[源码登记表](docs/licenses/windows-source-offer.md)和[替换指南](docs/licenses/windows-replace-qt.md)。本源码版本不声称二进制分发已符合 LGPL 要求。
+
+- [Qt for Python 许可](https://doc.qt.io/qtforpython-6/)
+- [Qt 开源 LGPL/GPL 义务](https://www.qt.io/development/open-source-lgpl-obligations)
+- [GNU LGPLv3 文本](https://www.gnu.org/licenses/lgpl-3.0.html)
+
+### 其他依赖
+
+项目直接依赖 NumPy、PySide6、pyserial 和 pyqtgraph。请核对构建所安装的精确版本随附的许可证元数据和文件。完整的二进制构建清单还必须包括传递依赖和本机库，不能只列出直接 Python 依赖。
+
+## English
+
 This source repository does not bundle third-party runtime binaries. Dependencies are installed separately as declared in `pyproject.toml` and `requirements.txt`; each dependency remains under its own license.
 
 ## Qt for Python (PySide6) and Qt

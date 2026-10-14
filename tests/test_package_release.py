@@ -6,7 +6,7 @@ from scripts.package_windows_release import REQUIRED_ENTRIES, validate_mock_e2e_
 
 def test_source_and_portable_manifests_require_qt_license_text_and_notice():
     expected = {
-        "docs/Qt_许可与第三方声明.md",
+        "docs/qt-licensing-and-third-party-notices.md",
         "docs/licenses/LGPL-3.0.txt",
     }
     assert expected <= set(REQUIRED_ARCHIVE_PATHS)
