@@ -4,6 +4,7 @@ import os
 import csv
 import json
 import time
+from threading import Event
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,7 +15,9 @@ from PySide6.QtWidgets import QApplication, QDialog, QFrame
 
 from fluke8845a import gui as gui_module
 from fluke8845a.gui import MainWindow
+from fluke8845a.mock import MockScenario
 from fluke8845a.modes import DESCRIPTORS, Mode
+from fluke8845a.scpi import ModeSettings
 from fluke8845a.worker import MAX_PENDING_GUI_ROWS
 
 
@@ -123,6 +126,64 @@ def test_window_close_waits_for_worker_thread_to_finish_cleanup(qt_app, monkeypa
             while window._worker_thread.isRunning() and time.monotonic() < deadline:
                 qt_app.processEvents()
                 time.sleep(0.01)
+        if window.isVisible():
+            window._shutdown_finished = True
+            window.close()
+        qt_app.processEvents()
+
+
+def test_window_close_waits_for_active_read_and_persists_its_result(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    read_started = Event()
+
+    def pump_until(predicate, timeout_s=3.0):
+        deadline = time.monotonic() + timeout_s
+        while not predicate() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.005)
+        qt_app.processEvents()
+        return predicate()
+
+    try:
+        window.show()
+        settings = ModeSettings(Mode.DCV, autorange=False, range_si=10, nplc=1)
+        window._bridge.connect_mock.emit(settings, MockScenario(
+            name="exit during active read", noise_fraction=0, drift_fraction_per_minute=0,
+            read_latency_s=0.5, step_at_s=1e9, recovery_at_s=None,
+        ))
+        assert pump_until(lambda: window._connected)
+
+        instrument = window._worker.instrument
+        original_read = instrument.read
+
+        def observed_read():
+            read_started.set()
+            return original_read()
+
+        instrument.read = observed_read
+        window._bridge.start_experiment.emit(
+            settings, "exit during active read", str(tmp_path / "experiments"), 0, False
+        )
+        assert pump_until(read_started.is_set)
+        assert window._experiment_csv_path is not None
+        csv_path = window._experiment_csv_path
+
+        assert not window.close()
+        assert window.isVisible()
+
+        assert pump_until(lambda: not window.isVisible())
+        assert window._shutdown_finished
+        assert not window._worker_thread.isRunning()
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        assert len(rows) == 1
+        assert rows[0]["status"] == "ok"
+        assert rows[0]["value_si"] != ""
+    finally:
+        if window._worker_thread.isRunning():
+            window.close()
+            pump_until(lambda: not window._worker_thread.isRunning())
         if window.isVisible():
             window._shutdown_finished = True
             window.close()
