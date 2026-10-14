@@ -9,8 +9,9 @@
 ### 当前源码版本
 
 - 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 最近验证的应用提交 `600a793` 有 209 项 pytest 在 Windows / Python 3.11（14.12 秒）和 Python 3.12（9.91 秒）通过；每个 pytest 步骤设有 60 秒上限。该提交的 GitHub Actions Release 和 GHCR OCI 源码包发布均成功。这些是软件自动化/Mock 与发布流程检查，不是仪器准确度或真机兼容性验证。
-- 提交 `600a793` 尚未连接真实仪器逐模式验证。早期版本的真机检查不能作为当前源码快照的验证证据。
+- 当前已推送提交为 `853e8c6f072eb60beeb3c25a2e9f1572b4647f7d`。GitHub Actions 在 Windows / Python 3.11 下 209 项 pytest 用时 10.29 秒，在 Python 3.12 下 209 项用时 13.81 秒；两个 pytest 步骤各自有 60 秒上限。该提交的源码 ZIP、SHA-256 文件、GitHub Release 和 GHCR OCI 源码包发布均成功。
+- 此提交的本地 Windows 冻结程序构建及便携 ZIP 校验通过。构建修复显式打包 pyqtgraph 需要的 `PySide6.QtOpenGL` 和 `PySide6.QtOpenGLWidgets`。冻结 GUI Mock 检查、串口枚举检查、解压后启动检查、localhost 健康检查均通过；六种 Mock 模式的端到端报告为 `status=ok`，每种模式保存 9 条模拟读数及 `measurements.csv`、`config.json`、`events.csv` 和 `run.log`。这些结果验证软件包和模拟流程，不证明真实仪器通信或测量准确度。
+- 提交 `853e8c6` 尚未连接真实仪器逐模式验证。早期版本的真机检查不能作为当前源码快照的验证证据；Windows EXE 也尚未公开发布，Qt/PySide 二进制分发审查仍未关闭。
 
 ### 限制
 
@@ -25,8 +26,9 @@ This file summarizes the scope of verification without publishing workstation id
 ## Current source release
 
 - The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- Most recently verified application commit `600a793` passed 209 pytest tests on Windows / Python 3.11 (14.12 seconds) and Python 3.12 (9.91 seconds); each pytest step has a 60-second limit. The GitHub Actions Release and GHCR OCI source package also published successfully for this commit. These are software automation/Mock and publishing checks, not meter-accuracy or real-hardware validation.
-- Commit `600a793` has not been checked mode-by-mode against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot.
+- The current pushed commit is `853e8c6f072eb60beeb3c25a2e9f1572b4647f7d`. GitHub Actions passed 209 pytest tests on Windows / Python 3.11 in 10.29 seconds and Python 3.12 in 13.81 seconds; each pytest step has a 60-second limit. The source ZIP, SHA-256 file, GitHub Release, and GHCR OCI source package were published successfully.
+- The local frozen Windows build and portable ZIP verification passed. The build explicitly includes `PySide6.QtOpenGL` and `PySide6.QtOpenGLWidgets`, which pyqtgraph loads dynamically. Frozen GUI Mock startup, serial enumeration, extracted-package startup, and localhost health checks passed. The six-mode frozen Mock end-to-end report is `status=ok`; each mode saved 9 simulated readings plus `measurements.csv`, `config.json`, `events.csv`, and `run.log`. These results validate the software package and simulated workflows, not real-meter communication or measurement accuracy.
+- Commit `853e8c6` has not been checked mode-by-mode against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot. The Windows EXE has not been publicly released because the Qt/PySide binary-distribution review remains open.
 
 ## Limits
 
