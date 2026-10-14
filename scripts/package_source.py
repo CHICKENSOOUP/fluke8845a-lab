@@ -36,7 +36,9 @@ REQUIRED_ARCHIVE_PATHS = (
     "LICENSE",
     "THIRD-PARTY-NOTICES.md",
     "Fluke8845A_Web.py",
+    "run_windows.bat",
     "run_web.bat",
+    "scripts/launch_windows.py",
     "src/fluke8845a/gui.py",
     "src/fluke8845a/webapp.py",
     "src/fluke8845a/webservice.py",
@@ -44,6 +46,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/qt-licensing-and-third-party-notices.md",
     "docs/licenses/LGPL-3.0.txt",
     "docs/hardware-validation.md",
+    "docs/release-notes-v1.0.1.md",
     "tests/test_worker.py",
     "assets/fluke8845a_app_icon_v3.png",
 )

@@ -28,6 +28,15 @@ def test_source_and_portable_manifests_include_the_localhost_interface():
     } <= REQUIRED_ENTRIES
 
 
+def test_source_archive_includes_first_run_windows_launchers():
+    assert {
+        "run_windows.bat",
+        "run_web.bat",
+        "scripts/launch_windows.py",
+        "docs/release-notes-v1.0.1.md",
+    } <= set(REQUIRED_ARCHIVE_PATHS)
+
+
 def valid_report(executable_sha256="ABCD"):
     modes = ("DCV", "ACV", "DCI", "ACI", "RES2", "RES4")
     return {

@@ -20,19 +20,21 @@
 
 ### 源码安装
 
-需要 Windows 和 Python 3.12 或更高版本。在 PowerShell 中运行：
+从 GitHub 下载源码 ZIP 后先解压。最简单的启动方法是双击 `run_windows.bat`。需要安装 64 位 Python 3.11 或更高版本；首次启动需要联网，启动器会自动创建项目专用的 `.venv` 并安装运行依赖，之后启动会复用环境。启动本机网页界面请双击 `run_web.bat`。源码 ZIP 不含预编译 EXE。
+
+也可以手动在 PowerShell 中安装：
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m pip install -e ".[dev,build]"
+python -m pip install -e .
 python -m fluke8845a
 ```
 
 启动本机网页界面：运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
-运行已有测试：`python -m pytest`。本地独立目录构建使用 `build_windows.ps1`。当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
+开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；运行测试：`python -m pytest`。本地独立目录构建使用 `build_windows.ps1`，还需安装 `.[build]`。当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
 
 ### 仪器与验证状态
 
@@ -47,6 +49,7 @@ python -m fluke8845a
 - [SCPI 命令与技术依据](docs/scpi-reference.md)
 - [使用指南](docs/user-guide.md)
 - [已知限制](docs/known-limitations.md)
+- [v1.0.1 发布说明](docs/release-notes-v1.0.1.md)
 - [v1.0.0 发布说明](docs/release-notes-v1.0.0.md)
 - [Qt 与第三方许可说明](docs/qt-licensing-and-third-party-notices.md)
 - [参考项目调研](docs/open-source-project-research.md)
@@ -69,25 +72,27 @@ Qt/PySide6 supplies the graphical interface; pyserial and the project's SCPI dri
 
 ## Source setup
 
-Requires Python 3.12 or later on Windows. From PowerShell:
+Extract the GitHub source ZIP, then double-click `run_windows.bat`. It requires 64-bit Python 3.11 or later and an internet connection on first launch. The launcher creates a project-local `.venv`, installs runtime dependencies, and reuses that environment on later starts. Double-click `run_web.bat` to start the localhost browser interface. The source ZIP does not contain a prebuilt EXE.
+
+For a manual PowerShell setup:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m pip install -e ".[dev,build]"
+python -m pip install -e .
 python -m fluke8845a
 ```
 
 Start the local browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
 
-To run the test suite:
+Install developer dependencies with `python -m pip install -e ".[dev]"`. To run the test suite:
 
 ```powershell
 python -m pytest
 ```
 
-Build a local standalone package with `build_windows.ps1`. By default the script uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
+Build a local standalone package after installing `python -m pip install -e ".[build]"`. By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
 
 ## Hardware and verification status
 
@@ -104,5 +109,6 @@ This source release does not bundle Qt libraries. Do not treat the project MIT l
 - [SCPI commands and technical basis](docs/scpi-reference.md)
 - [Usage guide](docs/user-guide.md)
 - [Known limitations](docs/known-limitations.md)
+- [v1.0.1 release notes](docs/release-notes-v1.0.1.md)
 - [v1.0.0 release notes](docs/release-notes-v1.0.0.md)
 - [Qt and third-party licensing notes](docs/qt-licensing-and-third-party-notices.md)
