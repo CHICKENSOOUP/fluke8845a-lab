@@ -15,7 +15,7 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 程序启动时扫描串口，也可在端口框直接输入 COM 号。默认值为 9600 baud、8 data bits、无校验、1 stop bit、无流控、CRLF 结束符、2秒响应超时。手册中 RS-232 出厂参数包含 9600、8位、无校验、1停止位和无流控；EOL需按仪器面板设置。可配置选项包括手册列出的全部波特率、7/8数据位、无/奇/偶校验、1/2停止位、无/XON-XOFF/RTS-CTS流控以及CR/LF/CRLF结束符。
 
-首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。确认仪器在 COMPUTER 模式及 SCPI 指令集。仪表显示`LOCAL`时，前面板键盘获得控制权，远程SCPI操作会被仪器拒绝；采集期间不要按仪表的LOCAL键。若仪器返回`+550,"Command not allowed in local"`，软件会将其记为`instrument_local`异常行，保留原始响应、不写入测量数值、停止本次采集，并关闭串口会话；重新连接即可恢复远程控制。连接后可在“仪器 → SCPI诊断”检查型号、模式、输入端子及仪器错误队列。断线会记录为失败状态并停止本次实验；检查接线后点击连接即可重连。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
+首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。确认仪器在 COMPUTER 模式及 SCPI 指令集。仪表处于 `REMOTE` 远程控制时，除 `LOCAL` 键外，其他前面板按键会被禁用。若需用面板改挡，先按 `LOCAL`，确认仪表显示本地状态后再按所需功能键；确认模式后重新连接，软件会再次进入远程控制。仪表显示`LOCAL`时，前面板键盘获得控制权，远程SCPI操作会被仪器拒绝；采集期间不要按仪表的LOCAL键。若仪器返回`+550,"Command not allowed in local"`，软件会将其记为`instrument_local`异常行，保留原始响应、不写入测量数值、停止本次采集，并关闭串口会话；重新连接即可恢复远程控制。连接后可在“仪器 → SCPI诊断”检查型号、模式、输入端子及仪器错误队列。断线会记录为失败状态并停止本次实验；检查接线后点击连接即可重连。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
 
 ## 2. 测量模式与安全接线
 
@@ -112,7 +112,7 @@ Version 1.0.0 is a source release and does not include a prebuilt Windows execut
 
 For a real meter, set the rear interface to RS-232 and select COMPUTER mode with the 8845A/8846A command set. The application queries `*IDN?`, accepts only a Fluke model identified as `8845A`, and does not reset the instrument. Mock mode exercises simulated workflows; its readings are not instrument measurements and must not be used as calibration or experimental evidence.
 
-The application scans serial ports at startup and also accepts a manually entered COM port. Defaults are 9600 baud, 8 data bits, no parity, one stop bit, no flow control, CRLF termination, and a two-second response timeout. Confirm the instrument's settings. Restore remote/COMPUTER control if the meter is in LOCAL mode. A normal disconnect attempts `SYST:LOC`.
+The application scans serial ports at startup and also accepts a manually entered COM port. Defaults are 9600 baud, 8 data bits, no parity, one stop bit, no flow control, CRLF termination, and a two-second response timeout. Confirm the instrument's settings. In REMOTE mode, the front-panel keys are disabled except for LOCAL. To change a mode from the panel, press LOCAL, verify local control, select the function, confirm the display, and reconnect when ready. A normal disconnect attempts `SYST:LOC`.
 
 ### 2. Measurement modes and safe wiring
 
