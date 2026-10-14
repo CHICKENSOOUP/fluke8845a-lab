@@ -19,7 +19,7 @@ goto finish
 :check_python_command
 where python >nul 2>&1
 if errorlevel 1 goto python_missing
-python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+python -c "import struct,sys; raise SystemExit(0 if sys.version_info[:2] in ((3,11),(3,12)) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
 if errorlevel 1 goto python_missing
 python "scripts\launch_windows.py" desktop %*
 goto finish
@@ -32,7 +32,7 @@ set "APP_EXIT=%ERRORLEVEL%"
 exit /b %APP_EXIT%
 
 :python_missing
-echo Python 3.11 or newer is required to run this source package.
+echo 64-bit Python 3.11 or 3.12 is required to run this source package.
 echo Install 64-bit Python, then double-click this file again.
 pause
 exit /b 1

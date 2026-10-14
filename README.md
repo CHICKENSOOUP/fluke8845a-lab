@@ -20,15 +20,15 @@
 
 ### 源码安装
 
-从 GitHub 下载源码 ZIP 后先解压。最简单的启动方法是双击 `run_windows.bat`。需要安装 64 位 Python 3.11 或更高版本；首次启动需要联网，启动器会自动创建项目专用的 `.venv` 并安装运行依赖，之后启动会复用环境。启动本机网页界面请双击 `run_web.bat`。源码 ZIP 不含预编译 EXE。
+从 GitHub 下载源码 ZIP 后先解压。最简单的启动方法是双击 `run_windows.bat`。需要安装 64 位 Python 3.11 或 3.12；首次启动需要联网，启动器会按 Python 版本使用随包提供的锁定依赖文件，自动创建项目专用的 `.venv`，之后启动会复用环境。启动本机网页界面请双击 `run_web.bat`。源码 ZIP 不含预编译 EXE。
 
 也可以手动在 PowerShell 中安装：
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m pip install -e .
+python -m pip install -r requirements-lock.txt
+python -m pip install --no-deps --no-build-isolation -e .
 python -m fluke8845a
 ```
 
@@ -85,15 +85,15 @@ Qt/PySide6 supplies the graphical interface; pyserial and the project's SCPI dri
 
 ## Source setup
 
-Extract the GitHub source ZIP, then double-click `run_windows.bat`. It requires 64-bit Python 3.11 or later and an internet connection on first launch. The launcher creates a project-local `.venv`, installs runtime dependencies, and reuses that environment on later starts. Double-click `run_web.bat` to start the localhost browser interface. The source ZIP does not contain a prebuilt EXE.
+Extract the GitHub source ZIP, then double-click `run_windows.bat`. It requires 64-bit Python 3.11 or 3.12 and an internet connection on first launch. The launcher selects the matching included dependency lock, creates a project-local `.venv`, and reuses that environment on later starts. Double-click `run_web.bat` to start the localhost browser interface. The source ZIP does not contain a prebuilt EXE.
 
 For a manual PowerShell setup:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m pip install -e .
+python -m pip install -r requirements-lock.txt
+python -m pip install --no-deps --no-build-isolation -e .
 python -m fluke8845a
 ```
 

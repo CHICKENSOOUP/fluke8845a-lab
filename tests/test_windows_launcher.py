@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import subprocess
 
+import pytest
+
 from scripts import launch_windows
 
 
@@ -18,7 +20,16 @@ def test_runtime_environment_uses_project_source_and_isolates_external_qt(tmp_pa
     assert "QT_PLUGIN_PATH" not in environment
 
 
-def test_first_launch_creates_venv_and_installs_runtime_dependencies(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("python_version", "lockfile"),
+    [
+        ("3.11", "requirements-lock-python311.txt"),
+        ("3.12", "requirements-lock.txt"),
+    ],
+)
+def test_first_launch_creates_venv_and_installs_matching_locked_dependencies(
+    tmp_path, monkeypatch, python_version, lockfile
+):
     monkeypatch.setattr(launch_windows, "ROOT", tmp_path)
     monkeypatch.setattr(launch_windows, "VENV", tmp_path / ".venv")
     venv_python = tmp_path / ".venv" / "Scripts" / "python.exe"
@@ -36,6 +47,8 @@ def test_first_launch_creates_venv_and_installs_runtime_dependencies(tmp_path, m
         if command[1:2] == ["-c"] and command[2] == launch_windows.RUNTIME_IMPORT_CHECK:
             import_checks += 1
             return SimpleNamespace(returncode=1 if import_checks == 1 else 0)
+        if command[1:2] == ["-c"]:
+            return SimpleNamespace(returncode=0, stdout=f"{python_version}:64\n")
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(launch_windows.sys, "executable", "python-base.exe")
@@ -49,9 +62,23 @@ def test_first_launch_creates_venv_and_installs_runtime_dependencies(tmp_path, m
     assert ["python-base.exe", "-m", "venv", str(tmp_path / ".venv")] in calls
     assert any(
         command[:4] == [str(venv_python), "-m", "pip", "install"]
-        and command[-1] == str(tmp_path / "requirements.txt")
+        and command[-1] == str(tmp_path / lockfile)
         for command in calls
     )
+
+
+@pytest.mark.parametrize("python_details", ["3.10:64", "3.13:64", "3.12:32"])
+def test_launcher_rejects_python_without_a_matching_64_bit_lock(
+    tmp_path, monkeypatch, python_details
+):
+    monkeypatch.setattr(launch_windows, "ROOT", tmp_path)
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=f"{python_details}\n")
+
+    monkeypatch.setattr(launch_windows.subprocess, "run", fake_run)
+
+    assert launch_windows._python_lockfile(Path("python.exe"), {}) is None
 
 
 def test_launcher_selects_desktop_or_web_and_forwards_arguments(monkeypatch, tmp_path):

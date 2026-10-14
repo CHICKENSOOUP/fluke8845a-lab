@@ -19,6 +19,10 @@ APP_MODULES = {
     "desktop": "fluke8845a",
     "web": "fluke8845a.webapp",
 }
+PYTHON_LOCKFILES = {
+    "3.11": "requirements-lock-python311.txt",
+    "3.12": "requirements-lock.txt",
+}
 
 
 def _runtime_environment() -> dict[str, str]:
@@ -34,27 +38,40 @@ def _run(command: list[str], environment: dict[str, str]) -> subprocess.Complete
     return subprocess.run(command, cwd=ROOT, env=environment, check=False)
 
 
-def _python_is_supported(python: Path, environment: dict[str, str]) -> bool:
+def _python_lockfile(python: Path, environment: dict[str, str]) -> Path | None:
+    """Return the exact dependency lock matching a supported 64-bit Python."""
+    version_probe = (
+        "import struct, sys; "
+        "print('.'.join(map(str, sys.version_info[:2])) + ':' + "
+        "str(struct.calcsize('P') * 8))"
+    )
     result = subprocess.run(
-        [
-            str(python), "-c",
-            "import sys; raise SystemExit(sys.version_info < (3, 11) or sys.maxsize <= 2**32)",
-        ],
+        [str(python), "-c", version_probe],
         cwd=ROOT,
         env=environment,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
         check=False,
     )
-    return result.returncode == 0
+    if result.returncode != 0:
+        return None
+    try:
+        version, bits = (result.stdout or "").strip().split(":", maxsplit=1)
+    except ValueError:
+        return None
+    lockfile = PYTHON_LOCKFILES.get(version)
+    if lockfile is None or bits != "64":
+        return None
+    return ROOT / lockfile
 
 
 def prepare_runtime() -> tuple[Path, dict[str, str]] | None:
     """Create a private venv and install app dependencies on first launch."""
     environment = _runtime_environment()
+    host_lockfile = _python_lockfile(Path(sys.executable), environment)
     if not VENV_PYTHON.is_file():
-        if sys.version_info < (3, 11) or sys.maxsize <= 2**32:
-            print("64-bit Python 3.11 or newer is required to create the app environment.")
+        if host_lockfile is None:
+            print("64-bit Python 3.11 or 3.12 is required to create the app environment.")
             return None
         print("Creating the private Python environment (.venv)...")
         created = _run(
@@ -65,8 +82,9 @@ def prepare_runtime() -> tuple[Path, dict[str, str]] | None:
             print("Could not create .venv. Check that this Python installation includes venv support.")
             return None
 
-    if not _python_is_supported(VENV_PYTHON, environment):
-        print("The existing .venv uses an unsupported Python version. Rename .venv and retry.")
+    lockfile = _python_lockfile(VENV_PYTHON, environment)
+    if lockfile is None:
+        print("The existing .venv must use 64-bit Python 3.11 or 3.12. Rename .venv and retry.")
         return None
 
     check = subprocess.run(
@@ -82,7 +100,7 @@ def prepare_runtime() -> tuple[Path, dict[str, str]] | None:
         installed = _run(
             [
                 str(VENV_PYTHON), "-m", "pip", "install",
-                "--disable-pip-version-check", "-r", str(ROOT / "requirements.txt"),
+                "--disable-pip-version-check", "-r", str(lockfile),
             ],
             environment,
         )

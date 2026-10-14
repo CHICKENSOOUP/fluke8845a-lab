@@ -7,7 +7,7 @@ name = "fluke8845a-lab"
 version = "1.0.1"
 description = "Fluke 8845A RS-232 scientific measurement and logging application"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
   "numpy>=1.26",
   "PySide6-Essentials>=6.7",

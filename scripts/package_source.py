@@ -56,6 +56,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/hardware-validation.md",
     "docs/release-notes-v1.0.1.md",
     "docs/releasing.md",
+    "requirements-lock.txt",
     "requirements-lock-python311.txt",
     "tests/test_worker.py",
     "scripts/collect_windows_runtime_licenses.py",
