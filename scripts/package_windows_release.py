@@ -45,6 +45,8 @@ EXCLUDED_PATH_PARTS = {
     "__pycache__",
     "hardware_validation",
     "Fluke8845A_Agent_Reference_Pack",
+    # Nuitka names its intermediate web output after the underscore entry-point.
+    "Fluke8845A_Web.dist",
 }
 
 
