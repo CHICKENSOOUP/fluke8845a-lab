@@ -23,6 +23,7 @@ APP_DIST = DIST / "Fluke8845A.dist"
 ARCHIVE = DIST / "Fluke8845A_Windows_x64.zip"
 MOCK_E2E_REPORT = "output/mock_validation/latest_frozen_exe_six_mode_e2e.json"
 MOCK_E2E_MODES = {"DCV", "ACV", "DCI", "ACI", "RES2", "RES4"}
+UNSUPPORTED_QT_PDF_BASENAMES = {"qpdf.dll", "qt6pdf.dll", "qtpdf.pyd"}
 REQUIRED_ENTRIES = {
     "Fluke8845A.exe",
     "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
@@ -36,6 +37,9 @@ REQUIRED_ENTRIES = {
     "docs/hardware-validation.md",
     "docs/qt-licensing-and-third-party-notices.md",
     "docs/licenses/LGPL-3.0.txt",
+    "docs/licenses/windows-portable-review-2026-10-15.md",
+    "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
+    "docs/licenses/windows-source-offer.md",
     "assets/fluke8845a_app_icon_v3.png",
     MOCK_E2E_REPORT,
 }
@@ -83,6 +87,16 @@ def validate_mock_e2e_report(report: dict, executable_sha256: str) -> None:
         found_modes.add(mode)
     if found_modes != MOCK_E2E_MODES:
         raise ValueError("Frozen Mock E2E report omits a measurement mode")
+
+
+def validate_portable_runtime_components(entries: set[str]) -> None:
+    """Reject Qt PDF binaries; the app does not use PDF rendering or image loading."""
+    unexpected = sorted(
+        entry for entry in entries
+        if Path(entry).name.casefold() in UNSUPPORTED_QT_PDF_BASENAMES
+    )
+    if unexpected:
+        raise ValueError("Portable package contains unused Qt PDF components: " + ", ".join(unexpected))
 
 
 def verify_extracted_portable_release(archive_path: Path, executable_sha256: str) -> None:
@@ -238,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             damaged = archive.testzip()
             if missing:
                 raise RuntimeError("Portable package is missing required files: " + ", ".join(missing))
+            validate_portable_runtime_components(names)
             if unsafe:
                 raise RuntimeError("Portable package contains excluded paths or identifiers: " + ", ".join(unsafe))
             if damaged:

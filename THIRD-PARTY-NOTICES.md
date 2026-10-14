@@ -10,7 +10,7 @@
 
 应用使用 PySide6（Qt for Python）构建图形界面。项目计划对具备该选项的 Qt/PySide6 组件采用社区版 LGPLv3 路径。PySide6/Qt 也提供 GPL 和商业许可选项，个别模块或捆绑的第三方组件可能适用不同条款。每次二进制构建都必须按实际组件核实许可证。
 
-发布 Windows 二进制程序时，安装包需包含适用的许可证文本和声明、精确组件清单、对应 Qt/PySide 源码，以及允许接收者替换/重新链接这些库并运行程序的说明。当前审查材料针对单一构建快照且仍是草稿，见[Qt 许可审查](docs/licenses/windows-portable-review-2026-10-14.md)、[组件清单](docs/licenses/windows-qt-runtime-inventory-2026-10-14.csv)、[源码登记表](docs/licenses/windows-source-offer.md)和[替换指南](docs/licenses/windows-replace-qt.md)。本源码版本不声称二进制分发已符合 LGPL 要求。
+发布 Windows 二进制程序时，安装包需包含适用的许可证文本和声明、精确组件清单、对应 Qt/PySide 源码，以及允许接收者替换/重新链接这些库并运行程序的说明。当前本地候选包的审查材料见[Qt 许可审查](docs/licenses/windows-portable-review-2026-10-15.md)、[组件清单](docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv)、[源码登记表](docs/licenses/windows-source-offer.md)和[替换指南](docs/licenses/windows-replace-qt.md)。本源码版本不声称二进制分发已符合 LGPL 要求。
 
 - [Qt for Python 许可](https://doc.qt.io/qtforpython-6/)
 - [Qt 开源 LGPL/GPL 义务](https://www.qt.io/development/open-source-lgpl-obligations)
@@ -28,7 +28,7 @@ This source repository does not bundle third-party runtime binaries. Dependencie
 
 The application uses PySide6 (Qt for Python) for its graphical interface. The project intends to use the community LGPLv3 licensing path for the LGPL-eligible Qt/PySide6 components. PySide6/Qt also offers GPL and commercial licensing options, and individual modules or bundled third-party components can have different terms. The exact license must be checked against the components in each binary build.
 
-When a Windows binary is published, its release package must include the applicable license texts and notices, an exact component inventory, corresponding Qt/PySide source, and instructions that let recipients replace/relink those libraries and run the application. The current review materials are drafts for one build snapshot; see [Qt licensing review](docs/licenses/windows-portable-review-2026-10-14.md), [component inventory](docs/licenses/windows-qt-runtime-inventory-2026-10-14.csv), [source offer register](docs/licenses/windows-source-offer.md), and [replacement guide](docs/licenses/windows-replace-qt.md). The source-only release does not claim that a binary distribution is LGPL-compliant.
+When a Windows binary is published, its release package must include the applicable license texts and notices, an exact component inventory, corresponding Qt/PySide source, and instructions that let recipients replace/relink those libraries and run the application. The current local candidate's review materials are linked in [Qt licensing review](docs/licenses/windows-portable-review-2026-10-15.md), [component inventory](docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv), [source offer register](docs/licenses/windows-source-offer.md), and [replacement guide](docs/licenses/windows-replace-qt.md). The source-only release does not claim that a binary distribution is LGPL-compliant.
 
 - [Qt for Python licensing](https://doc.qt.io/qtforpython-6/)
 - [Qt open-source LGPL/GPL obligations](https://www.qt.io/development/open-source-lgpl-obligations)

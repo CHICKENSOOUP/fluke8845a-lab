@@ -26,7 +26,7 @@ The build under review is a Nuitka standalone directory. Keep the whole extracte
 
 ## Current limitation
 
-The instructions above do not prove that this specific Nuitka bundle meets LGPLv3 replacement/relink requirements. The `Fluke8845A_DCVGui_20261014` candidate has not been subjected to a replacement run, and its Qt PDF source match is unresolved. Do not publish this guide as completed compliance evidence until the maintainer verification succeeds on the final release artifact.
+The instructions above do not prove that this specific Nuitka bundle meets LGPLv3 replacement/relink requirements. The 2026-10-15 candidate no longer contains the Qt PDF plugin, but it has not been subjected to a replacement run. Do not publish this guide as completed compliance evidence until the maintainer verification succeeds on the final release artifact.
 
 ## References
 
@@ -51,4 +51,4 @@ The instructions above do not prove that this specific Nuitka bundle meets LGPLv
 
 对最终源码快照重新打包并记录 ZIP 的 SHA-256；复制 ZIP 后替换一个 LGPL Qt 库，再从副本启动应用；确认应用加载的是替换库，而不是 PATH 中的其他 Qt 副本；记录 DLL、替换构建信息和结果。若修改插件，也应验证插件加载。确认 EXE 没有阻止替换库运行的签名/哈希检查，并记录所需安装信息或重新链接步骤。替换后运行常规冒烟检查，同时确认原始 ZIP 仍可工作。
 
-以上步骤并不能证明当前 Nuitka 包满足 LGPLv3 的替换/重新链接要求。候选包尚未做替换运行验证，Qt PDF 对应源码仍未解决。只有在最终产物上完成验证后，才能将本指南作为合规证据发布。
+以上步骤并不能证明当前 Nuitka 包满足 LGPLv3 的替换/重新链接要求。2026-10-15 候选包已移除 Qt PDF 插件，但尚未做替换运行验证。只有在最终产物上完成验证后，才能将本指南作为合规证据发布。

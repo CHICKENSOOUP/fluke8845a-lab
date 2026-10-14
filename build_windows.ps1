@@ -170,6 +170,7 @@ try {
     & $portableExecutable -m nuitka $webEntryPoint `
         --standalone `
         --enable-plugin=pyside6 `
+        --noinclude-qt-plugins=imageformats `
         --assume-yes-for-downloads `
         --remove-output `
         "--output-dir=$outputDirectory" `
@@ -186,6 +187,12 @@ try {
     if (-not (Test-Path -LiteralPath $webExecutable)) { throw "Nuitka did not create $webExecutable" }
     $webReleaseDist = Join-Path $exeDist "Fluke8845A-Web.dist"
     Copy-Item -LiteralPath $webDist -Destination $webReleaseDist -Recurse -Force
+
+    # The desktop app never reads PDF files; Qt's default plugin set includes this unused plugin.
+    $unusedQtPdfPlugin = Join-Path $exeDist "PySide6\qt-plugins\imageformats\qpdf.dll"
+    if (Test-Path -LiteralPath $unusedQtPdfPlugin) {
+        Remove-Item -LiteralPath $unusedQtPdfPlugin -Force
+    }
 
     $exe = Join-Path $exeDist "Fluke8845A.exe"
     if (-not (Test-Path -LiteralPath $exe)) { throw "Nuitka did not create $exe" }

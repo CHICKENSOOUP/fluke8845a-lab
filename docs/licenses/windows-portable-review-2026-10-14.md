@@ -1,5 +1,7 @@
 # Windows portable build: Qt licensing review
 
+> Historical audit for the 2026-10-14 candidate only. It included a Qt PDF plugin that is absent from the later 2026-10-15 candidate. For the newer snapshot, use [windows-portable-review-2026-10-15.md](windows-portable-review-2026-10-15.md).
+
 [简体中文](#简体中文) | [English](#english)
 
 ## English

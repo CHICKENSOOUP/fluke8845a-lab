@@ -1,55 +1,41 @@
-# Qt/PySide source delivery register (draft)
+# Qt/PySide source delivery register
 
 [简体中文](#简体中文) | [English](#english)
 
 ## English
 
-This register is for the 2026-10-14 Windows portable build review. It is not yet a complete source offer for distribution because the Qt PDF binary in the candidate has not been matched to an exact stable source revision.
+This register covers the local `Fluke8845A_Essentials_6_12_7_Windows_x64.zip` candidate audited on 2026-10-15. The bundle's Qt/PySide inventory is [here](windows-qt-runtime-inventory-2026-10-15.csv). The binary package does not include Qt PDF or Qt WebEngine.
 
-## Source packages identified
+## Version-matched official source archives
 
-| Shipped component | Version indicated by candidate | Official source location | Status |
-|---|---:|---|---|
-| Qt framework modules in the candidate | 6.12.0 | [Qt 6.12.0 source packages](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/) (`qt-everywhere-src-6.12.0.zip` for Windows or `qt-everywhere-src-6.12.0.tar.xz`) | Version match identified; archive checksum and any build patches still need to be recorded for the actual release build. |
-| PySide6/Shiboken bindings | 6.12.0 | [PySide6 6.12.0 source package](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/) (`pyside-setup-everywhere-src-6.12.0.zip` or `.tar.xz`) | Version match identified; confirm the build's source patches and exact wheel provenance. |
-| Qt PDF / PDFium component | 6.140.0.0 file version | [QtWebEngine source repository](https://code.qt.io/cgit/qt/qtwebengine.git/) | **Open:** the public repository ref found was `v6.140.0-rc`, not a stable source matching the candidate. Do not represent the RC source as corresponding source for the stable binary. |
+| Distributed files | Version | Official archive | Size | Official SHA-256 | Audit status |
+|---|---:|---|---:|---|---|
+| Qt libraries and plugins | 6.12.0 | [qt-everywhere-src-6.12.0.tar.xz](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz) | 443,394,020 bytes | `98ff4f44bac6ec3e1e62ee2a4316ae0e3d15badb015d753cc0268a20db52f165` | Official URL and sidecar checksum returned successfully on 2026-10-15; patches/provenance used to build the wheel still need confirmation. |
+| PySide6 and Shiboken bindings | 6.12.0 | [pyside-setup-everywhere-src-6.12.0.tar.xz](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/pyside-setup-everywhere-src-6.12.0.tar.xz) | 18,211,772 bytes | `099c1a597cf33c1b000e11cf68a0b82d216fb802bf81726efc720394f10c7751` | Official URL and sidecar checksum returned successfully on 2026-10-15; wheel build patches/provenance still need confirmation. |
 
-The PDF candidate includes code from PDFium and other third-party projects. Its corresponding source set and notices must include the matching QtWebEngine/PDFium source and the license/attribution material for the components actually shipped. The general Qt 6.12 source archive alone does not establish this coverage.
+Checksum sidecars: [Qt](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz.sha256) and [Qt for Python](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/pyside-setup-everywhere-src-6.12.0.tar.xz.sha256). The actual source code has not been copied into this repository or attached to a GitHub Release.
 
-## Draft written-offer wording
+## Status and draft offer
 
-Use this wording only after the source set is complete, archived, and the release ZIP has passed the replacement procedure:
+The exact Qt/PySide versions and official source archives are identified, replacing the unresolved Qt PDF source match in the historical [2026-10-14 review](windows-portable-review-2026-10-14.md). Before using a written source offer for binary distribution, confirm that the archives contain the source and any patches corresponding to the distributed wheels, publish stable version-specific links and hashes, and preserve the source offer for the required period. The complete third-party notice set and the end-user library replacement/relaunch test are also open; see the [2026-10-15 package review](windows-portable-review-2026-10-15.md).
 
-> The Qt and PySide6 libraries distributed with this application are available under the GNU LGPL version 3. For at least three years from this release, the corresponding source code for the exact distributed versions, including any modifications made for the distributed libraries, can be obtained at the source links listed in `docs/licenses/windows-source-offer.md`, or by contacting the project maintainer through the GitHub repository. No fee is charged beyond the cost of providing the source. The source archive checksums and build patches are listed with the release.
+Draft wording, to use only after the open items above are closed:
 
-Before using this wording, replace the links with stable downloadable release assets, record SHA-256 hashes, record all patches, and ensure the source package remains available for the full stated period. The exact Qt PDF source is currently missing, so this offer must not yet be presented as complete.
+> Qt and PySide6 libraries distributed with this application are offered under the GNU LGPL version 3. For at least three years from this release, corresponding source for the exact distributed versions, including applicable modifications, is available from the version-specific archives and checksums listed in this register. No fee is charged beyond the cost of providing the source.
 
-## Source package integrity record
-
-No large upstream source archive has been copied into this repository. For the final portable release, retain the exact Qt, QtWebEngine/PDF, and PySide source archives separately from Git source history and publish stable download links plus SHA-256 checksums. Do not use an unrelated later/earlier source version as a substitute.
-
-## References
-
-- [Qt source downloads](https://www.qt.io/development/offline-installers)
-- [Qt 6.12.0 source archive index](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/)
-- [PySide6 6.12.0 source archive index](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/)
-- [Qt PDF source/build notes](https://wiki.qt.io/QtPDF_Build_Instructions)
-- [QtWebEngine repository](https://code.qt.io/cgit/qt/qtwebengine.git/)
+This is a draft, not a completed source offer or legal opinion. Qt's [official open-source obligations](https://www.qt.io/development/open-source-lgpl-obligations) and the complete [LGPLv3 text](LGPL-3.0.txt) remain the governing references.
 
 ## 简体中文
 
-### Qt/PySide 源码交付登记表（草稿）
+本登记表对应 2026-10-15 审查的本地候选包 `Fluke8845A_Essentials_6_12_7_Windows_x64.zip`。组件清单见[这里](windows-qt-runtime-inventory-2026-10-15.csv)。此包不含 Qt PDF 或 Qt WebEngine。
 
-本登记表针对 2026-10-14 Windows 便携构建审查。候选包中的 Qt PDF 二进制尚未匹配到精确稳定版源码，因此本登记表还不是完整的源码交付方案。
+| 随包文件 | 版本 | 官方源码包 | 大小 | 官方 SHA-256 | 核对状态 |
+|---|---:|---|---:|---|---|
+| Qt 库与插件 | 6.12.0 | [qt-everywhere-src-6.12.0.tar.xz](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz) | 443,394,020 字节 | `98ff4f44bac6ec3e1e62ee2a4316ae0e3d15badb015d753cc0268a20db52f165` | 2026-10-15 官方 URL 和校验和 sidecar 可访问；仍需确认构建 wheel 使用的补丁与来源。 |
+| PySide6 与 Shiboken 绑定 | 6.12.0 | [pyside-setup-everywhere-src-6.12.0.tar.xz](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/pyside-setup-everywhere-src-6.12.0.tar.xz) | 18,211,772 字节 | `099c1a597cf33c1b000e11cf68a0b82d216fb802bf81726efc720394f10c7751` | 2026-10-15 官方 URL 和校验和 sidecar 可访问；仍需确认 wheel 构建补丁与来源。 |
 
-| 随包组件 | 候选版本 | 官方源码位置 | 状态 |
-|---|---:|---|---|
-| Qt 框架模块 | 6.12.0 | [Qt 6.12.0 源码包](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/) | 已识别版本；最终构建仍须记录校验和及构建补丁。 |
-| PySide6/Shiboken 绑定 | 6.12.0 | [PySide6 6.12.0 源码包](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/) | 已识别版本；须确认补丁及 wheel 来源。 |
-| Qt PDF / PDFium | 文件版本 6.140.0.0 | [QtWebEngine 源码仓库](https://code.qt.io/cgit/qt/qtwebengine.git/) | **未解决：**审查时找到的公开 ref 只有 `v6.140.0-rc`，不能把它宣称为稳定版二进制的对应源码。 |
+校验和 sidecar： [Qt](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz.sha256) 和 [Qt for Python](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/pyside-setup-everywhere-src-6.12.0.tar.xz.sha256)。源码尚未复制到本仓库或上传到 GitHub Release。
 
-Qt PDF 的对应源码集还须覆盖匹配的 QtWebEngine/PDFium 源码及随包第三方组件的许可证/归属材料。Qt 6.12 通用源码包本身不能证明该覆盖完整。
+对应源码版本和官方归档已确认，替代了[2026-10-14 历史审查](windows-portable-review-2026-10-14.md)中未解决的 Qt PDF 源码匹配项。二进制发布前，还需确认归档确实包含与随包 wheel 对应的源码及补丁、发布版本固定的下载链接和校验值，并在要求期限内持续提供源码。完整第三方声明和用户替换/重启 Qt 库测试也未完成，详见[2026-10-15 候选包审查](windows-portable-review-2026-10-15.md)。
 
-文档中的书面要约措辞只有在源码完整归档、发布 ZIP 完成替换验证后才能使用。届时需提供稳定下载地址、SHA-256、所有补丁，并确保源码在承诺期限内持续可取。当前 Qt PDF 源码缺失，故不得将要约表述为已完备。
-
-本仓库没有复制大型上游源码包。最终便携版需将实际 Qt、QtWebEngine/PDF 和 PySide 源码包保存在 Git 之外，发布稳定链接及校验值；不能以不匹配的其他版本替代。
+上方英文书面源码提供声明只是草案，只有关闭上述事项后才能用于二进制发布；它不构成完整法律意见。请同时参阅 Qt 的[官方开源发行义务](https://www.qt.io/development/open-source-lgpl-obligations)和仓库中的[LGPLv3 完整文本](LGPL-3.0.txt)。

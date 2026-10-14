@@ -10,7 +10,7 @@
 - GitHub Packages 没有原生 Python 包注册表；这里把源码 ZIP 和校验文件作为 OCI 文件包发布，不是可用 `pip install` 安装的 Python wheel。可用 [ORAS](https://oras.land/) 下载：`oras pull ghcr.io/chickensooup/fluke8845a-lab-source:main-build-0123456789ab --output ./dist`。
 - GHCR 新包默认私有。若要让其他人无需登录即可从 Packages 下载，首次发布后需在 GitHub 包设置中将包改为 Public；GitHub 表示公开后不能改回私有。Release 附件仍可直接公开下载。
 - 重跑同一提交的工作流会更新该 Release 的附件和 GHCR 版本，不会重复创建同名 Release。
-- **暂不发布 Windows 便携 EXE。** Qt/PySide 对应源码、完整第三方声明和最终包上的库替换验证仍未闭环，详见 [Qt 许可审查](licenses/windows-portable-review-2026-10-14.md)。源码 ZIP 会保留可复现的 Windows 构建脚本。
+- **暂不发布 Windows 便携 EXE。** Qt/PySide 源码要约、完整第三方声明和最终包上的库替换验证仍未闭环，详见 [Qt 许可审查](licenses/windows-portable-review-2026-10-15.md)。源码 ZIP 会保留可复现的 Windows 构建脚本。
 - 自动发布使用仓库的 `GITHUB_TOKEN`（授予 `packages: write`），不需要个人访问令牌。测试与 Mock 验证不能视为真实 8845A 硬件验证。
 
 ## English
@@ -21,5 +21,5 @@
 - GitHub Packages does not provide a native Python package registry. The source ZIP and checksum are published as an OCI file package, not as a Python wheel installable with `pip`. Download with [ORAS](https://oras.land/): `oras pull ghcr.io/chickensooup/fluke8845a-lab-source:main-build-0123456789ab --output ./dist`.
 - New GHCR packages are private by default. To allow anonymous downloads from Packages, change the package to Public once after its first publication in GitHub package settings. GitHub does not allow changing a public package back to private. Release attachments remain directly downloadable.
 - Rerunning a workflow for the same commit updates the existing Release assets and GHCR tag instead of creating a duplicate Release.
-- **The Windows portable EXE is not published yet.** The Qt/PySide corresponding-source set, complete third-party notices, and library replacement verification against the final archive remain open. See the [Qt licensing review](licenses/windows-portable-review-2026-10-14.md). The source ZIP retains the reproducible Windows build script.
+- **The Windows portable EXE is not published yet.** The Qt/PySide source offer, complete third-party notices, and library replacement verification against the final archive remain open. See the [Qt licensing review](licenses/windows-portable-review-2026-10-15.md). The source ZIP retains the reproducible Windows build script.
 - Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`; no personal access token is required. Tests and Mock checks do not constitute validation on a real 8845A.

@@ -1,13 +1,20 @@
 import pytest
 
 from scripts.package_source import REQUIRED_ARCHIVE_PATHS
-from scripts.package_windows_release import REQUIRED_ENTRIES, validate_mock_e2e_report
+from scripts.package_windows_release import (
+    REQUIRED_ENTRIES,
+    validate_mock_e2e_report,
+    validate_portable_runtime_components,
+)
 
 
 def test_source_and_portable_manifests_require_qt_license_text_and_notice():
     expected = {
         "docs/qt-licensing-and-third-party-notices.md",
         "docs/licenses/LGPL-3.0.txt",
+        "docs/licenses/windows-portable-review-2026-10-15.md",
+        "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
+        "docs/licenses/windows-source-offer.md",
     }
     assert expected <= set(REQUIRED_ARCHIVE_PATHS)
     assert expected <= REQUIRED_ENTRIES
@@ -87,3 +94,13 @@ def test_release_report_validator_rejects_incomplete_or_stale_report(mutation):
 
     with pytest.raises(ValueError):
         validate_mock_e2e_report(report, "ABCD")
+
+
+@pytest.mark.parametrize("component", ["qpdf.dll", "qt6pdf.dll", "QtPdf.pyd"])
+def test_portable_release_rejects_unused_qt_pdf_components(component):
+    with pytest.raises(ValueError, match="unused Qt PDF components"):
+        validate_portable_runtime_components({"Fluke8845A-Web.dist/PySide6/qt-plugins/imageformats/" + component})
+
+
+def test_portable_release_accepts_runtime_without_qt_pdf_components():
+    validate_portable_runtime_components({"Fluke8845A.exe", "PySide6/qt-plugins/imageformats/qjpeg.dll"})
