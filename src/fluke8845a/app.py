@@ -239,8 +239,8 @@ def run_real_gui_speed_probe(
     try:
         if confirmation is None:
             raise ValueError("必须明确确认前面板2W端子接着标称30 MΩ电阻或输入端子短接")
-        if not 8.0 <= duration_s <= 3600.0:
-            raise ValueError("GUI硬件探测运行时间必须在8到3600秒之间")
+        if not 8.0 <= duration_s <= 50.0:
+            raise ValueError("GUI硬件探测运行时间必须在8到50秒之间")
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with report_path.open("x", encoding="utf-8") as stream:
             stream.write(json.dumps({**report, "status": "starting"}, ensure_ascii=False, indent=2) + "\n")
@@ -791,7 +791,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     select_mode(first_mode)
                     window._connect_mock()
                     timer.start()
-                    QTimer.singleShot(90_000, lambda: finish("六种模式Mock验收总超时"))
+                    QTimer.singleShot(45_000, lambda: finish("六种模式Mock验收总超时"))
                     app.exec()
             finally:
                 timer.stop()
@@ -840,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     wiring.add_argument("--confirm-front-2w-short", action="store_true",
                         help="确认前面板2W输入端子当前短接；探测后恢复原仪器测量设置")
     parser.add_argument("--duration", type=float, default=12.0,
-                        help="--probe-real-gui/--probe-real-gui-visible连续采集秒数（8至3600秒，默认12秒）")
+                        help="--probe-real-gui/--probe-real-gui-visible连续采集秒数（8至50秒，默认12秒）")
     parser.add_argument("--smoke", action="store_true", help="启动界面短暂检查后退出")
     parser.add_argument("--version", action="version", version=f"Fluke8845A {__version__}")
     args = parser.parse_args(argv)
@@ -879,8 +879,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"{probe_name} requires --report PATH")
         if not args.confirm_front_2w_30mohm and not args.confirm_front_2w_short:
             parser.error(f"{probe_name} requires --confirm-front-2w-30mohm or --confirm-front-2w-short")
-        if not math.isfinite(args.duration) or not 8 <= args.duration <= 3600:
-            parser.error(f"--duration must be between 8 and 3600 seconds for {probe_name}")
+        if not math.isfinite(args.duration) or not 8 <= args.duration <= 50:
+            parser.error(f"--duration must be between 8 and 50 seconds for {probe_name}")
         return run_real_gui_speed_probe(
             args.port or "COM3", args.report,
             wiring_confirmed=args.confirm_front_2w_30mohm,

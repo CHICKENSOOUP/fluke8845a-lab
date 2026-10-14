@@ -21,9 +21,13 @@ build = ["Nuitka>=4.1.1"]
 
 [project.scripts]
 fluke8845a = "fluke8845a.app:main"
+fluke8845a-web = "fluke8845a.webapp:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+fluke8845a = ["web/*.html", "web/*.css", "web/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

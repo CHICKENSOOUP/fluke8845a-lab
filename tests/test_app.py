@@ -247,7 +247,7 @@ def test_gui_probe_cli_requires_explicit_wiring_confirmation(tmp_path, capsys):
     assert "--confirm-front-2w-short" in error
 
 
-def test_gui_probe_cli_accepts_one_hour_duration_without_opening_hardware(tmp_path, monkeypatch):
+def test_gui_probe_cli_caps_test_duration_at_one_minute_without_opening_hardware(tmp_path, monkeypatch):
     captured = {}
 
     def fake_probe(port, report_path, *, wiring_confirmed, shorted_leads_confirmed, baudrate, duration_s, visible_window):
@@ -264,20 +264,27 @@ def test_gui_probe_cli_accepts_one_hour_duration_without_opening_hardware(tmp_pa
 
     monkeypatch.setattr(app_module, "run_real_gui_speed_probe", fake_probe)
     result = app_module.main([
-        "--probe-real-gui", "--port", "COM3", "--duration", "3600",
-        "--baudrate", "115200", "--report", str(tmp_path / "hour.json"), "--confirm-front-2w-30mohm",
+        "--probe-real-gui", "--port", "COM3", "--duration", "50",
+        "--baudrate", "115200", "--report", str(tmp_path / "minute.json"), "--confirm-front-2w-30mohm",
     ])
 
     assert result == 17
     assert captured == {
         "port": "COM3",
-        "report_path": tmp_path / "hour.json",
+        "report_path": tmp_path / "minute.json",
         "wiring_confirmed": True,
         "shorted_leads_confirmed": False,
         "baudrate": 115200,
-        "duration_s": 3600.0,
+        "duration_s": 50.0,
         "visible_window": False,
     }
+
+    with pytest.raises(SystemExit) as exit_info:
+        app_module.main([
+            "--probe-real-gui", "--port", "COM3", "--duration", "50.01",
+            "--report", str(tmp_path / "too-long.json"), "--confirm-front-2w-30mohm",
+        ])
+    assert exit_info.value.code == 2
 
 
 def test_gui_probe_cli_routes_confirmed_short_and_baudrate(tmp_path, monkeypatch):
@@ -333,7 +340,7 @@ def test_visible_gui_probe_cli_routes_visible_window_flag(tmp_path, monkeypatch)
     report = tmp_path / "visible-short.json"
     result = app_module.main([
         "--probe-real-gui-visible", "--port", "COM3", "--baudrate", "115200",
-        "--report", str(report), "--confirm-front-2w-short", "--duration", "60",
+        "--report", str(report), "--confirm-front-2w-short", "--duration", "50",
     ])
 
     assert result == 31
@@ -343,7 +350,7 @@ def test_visible_gui_probe_cli_routes_visible_window_flag(tmp_path, monkeypatch)
         "wiring_confirmed": False,
         "shorted_leads_confirmed": True,
         "baudrate": 115200,
-        "duration_s": 60.0,
+        "duration_s": 50.0,
         "visible_window": True,
     }
 

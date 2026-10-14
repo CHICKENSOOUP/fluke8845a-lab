@@ -61,8 +61,19 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Application icon generation failed." }
 
     $pytestTemp = Join-Path $PSScriptRoot ("build\pytest_temp_" + [guid]::NewGuid().ToString("N"))
-    & $python -m pytest -p no:cacheprovider --basetemp $pytestTemp
-    if ($LASTEXITCODE -ne 0) { throw "pytest failed; EXE packaging stopped." }
+    $pytestProcess = Start-Process -FilePath $python -ArgumentList @(
+        "-m", "pytest", "-p", "no:cacheprovider", "--basetemp", $pytestTemp
+    ) -PassThru -NoNewWindow
+    try {
+        Wait-Process -Id $pytestProcess.Id -Timeout 55 -ErrorAction Stop | Out-Null
+    } catch {
+        if (Get-Process -Id $pytestProcess.Id -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $pytestProcess.Id -Force
+        }
+        throw "pytest exceeded the 55-second limit; EXE packaging stopped."
+    }
+    $pytestProcess.Refresh()
+    if ($pytestProcess.ExitCode -ne 0) { throw "pytest failed; EXE packaging stopped." }
     $env:NUITKA_CACHE_DIR = Join-Path $PSScriptRoot "build\nuitka-cache"
     & $python -m nuitka --version
     if ($LASTEXITCODE -ne 0) { throw 'Install build dependencies with: python -m pip install -e ".[dev,build]"' }
@@ -108,6 +119,26 @@ try {
         --include-module=PySide6.QtOpenGL `
         --include-module=PySide6.QtOpenGLWidgets
     if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed." }
+
+    $webEntryPoint = Join-Path $PSScriptRoot "Fluke8845A_Web.py"
+    $webAssetsDirectory = Join-Path $PSScriptRoot "src\fluke8845a\web"
+    & $portableExecutable -m nuitka $webEntryPoint `
+        --standalone `
+        --enable-plugin=pyside6 `
+        --assume-yes-for-downloads `
+        --remove-output `
+        "--output-dir=$outputDirectory" `
+        --output-filename=Fluke8845A-Web.exe `
+        --windows-console-mode=disable `
+        "--windows-icon-from-ico=$PSScriptRoot\assets\fluke8845a_app_icon_v3.ico" `
+        "--include-data-dir=$webAssetsDirectory=fluke8845a\web" `
+        --include-package=serial
+    if ($LASTEXITCODE -ne 0) { throw "Nuitka localhost web build failed." }
+
+    $webDist = Join-Path $outputDirectory "Fluke8845A-Web.dist"
+    $webExecutable = Join-Path $webDist "Fluke8845A-Web.exe"
+    if (-not (Test-Path -LiteralPath $webExecutable)) { throw "Nuitka did not create $webExecutable" }
+    Copy-Item -LiteralPath $webDist -Destination $exeDist -Recurse -Force
 
     $exe = Join-Path $exeDist "Fluke8845A.exe"
     if (-not (Test-Path -LiteralPath $exe)) { throw "Nuitka did not create $exe" }

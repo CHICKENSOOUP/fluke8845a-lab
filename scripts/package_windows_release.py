@@ -6,9 +6,13 @@ import argparse
 import hashlib
 import json
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from pathlib import Path
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
@@ -21,6 +25,10 @@ MOCK_E2E_REPORT = "output/mock_validation/latest_frozen_exe_six_mode_e2e.json"
 MOCK_E2E_MODES = {"DCV", "ACV", "DCI", "ACI", "RES2", "RES4"}
 REQUIRED_ENTRIES = {
     "Fluke8845A.exe",
+    "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
+    "Fluke8845A-Web.dist/fluke8845a/web/index.html",
+    "Fluke8845A-Web.dist/fluke8845a/web/app.css",
+    "Fluke8845A-Web.dist/fluke8845a/web/app.js",
     "README.md",
     "LICENSE",
     "THIRD-PARTY-NOTICES.md",
@@ -97,12 +105,68 @@ def verify_extracted_portable_release(archive_path: Path, executable_sha256: str
         report_path = temporary_root / "portable_mock_e2e.json"
         mock_result = subprocess.run(
             [str(executable), "--mock-e2e", "--report", str(report_path)], cwd=release_root,
-            capture_output=True, text=True, timeout=110, check=False,
+            capture_output=True, text=True, timeout=55, check=False,
         )
         if mock_result.returncode != 0 or not report_path.is_file():
             raise RuntimeError(f"Extracted portable EXE six-mode Mock E2E failed: {mock_result.returncode}")
         report = json.loads(report_path.read_text(encoding="utf-8-sig"))
         validate_mock_e2e_report(report, executable_sha256)
+        verify_local_web_release(release_root)
+
+
+def verify_local_web_release(release_root: Path) -> None:
+    """Smoke the packaged loopback UI and its exit control with a hard time bound."""
+    executable = release_root / "Fluke8845A-Web.dist" / "Fluke8845A-Web.exe"
+    if not executable.is_file():
+        raise RuntimeError("Portable package has no Fluke8845A-Web.exe")
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    base_url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [str(executable), "--port", str(port), "--no-browser"],
+        cwd=release_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 12.0
+    try:
+        health = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"Packaged web UI exited before startup with {process.returncode}")
+            try:
+                with urlopen(base_url + "/api/health", timeout=1.0) as response:
+                    health = json.loads(response.read().decode("utf-8"))
+                break
+            except (URLError, TimeoutError, OSError):
+                time.sleep(0.15)
+        if not health or health.get("status") != "ok" or health.get("bind") != "127.0.0.1":
+            raise RuntimeError("Packaged web UI did not start on IPv4 loopback within 12 seconds")
+        with urlopen(base_url + "/", timeout=1.0) as response:
+            html = response.read().decode("utf-8")
+        if "实时趋势" not in html:
+            raise RuntimeError("Packaged localhost page is missing its measurement dashboard")
+        for asset in ("/app.css", "/app.js"):
+            with urlopen(base_url + asset, timeout=1.0) as response:
+                if not response.read(256):
+                    raise RuntimeError(f"Packaged localhost asset is empty: {asset}")
+        body = json.dumps({"action": "shutdown", "payload": {}}, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            base_url + "/api/command", data=body, method="POST",
+            headers={"Content-Type": "application/json", "Origin": base_url},
+        )
+        with urlopen(request, timeout=2.0) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if result.get("success") is not True:
+            raise RuntimeError("Packaged localhost exit command was rejected")
+        process.wait(timeout=5.0)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
 
 
 def _release_files(app_dist: Path) -> list[tuple[Path, str]]:

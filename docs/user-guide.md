@@ -98,6 +98,12 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 本源码发布未附带预编译 Windows 二进制。测试与硬件验证的当前范围见[硬件验证说明](hardware-validation.md)。
 
+## 9. localhost 浏览器界面
+
+运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat` 可启动本机网页界面。服务只监听 `127.0.0.1:8765`，不加载远程页面或 CDN；网页与桌面版共用仪器驱动、采集线程和逐点写盘器，支持六种测量模式、实时曲线、采集控制、统计、基准变化、事件记录、历史 CSV 加载和曲线 PNG 导出。
+
+启动服务不会自动打开串口。连接前先断开桌面版占用的 COM 端口，因为同一端口不能同时由两个程序打开。电流和电阻测量仍须由操作者确认接线、输入端子、保险丝和被测电路状态。页面的“退出服务”会停止采集、完成待写数据并安全关闭串口。Mock 读数始终是模拟数据。
+
 ## English
 
 Version 1.0.0 is a source release and does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
@@ -137,4 +143,10 @@ Historical CSV loading is read-only. Matching event markers are restored where a
 ### 6. Mock and verification limits
 
 Mock mode supports six-mode simulated readings, step response/recovery, long-term drift, selected timeouts, and simulated disconnects. Check the visible MOCK indicator and `simulation: true` in `config.json`. Mock workflows are not hardware tests. See the [SCPI reference](scpi-reference.md), [hardware verification notes](hardware-validation.md), and [known limitations](known-limitations.md).
+
+### 7. Local browser interface
+
+Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It listens only on `127.0.0.1:8765`, uses no remote pages or CDN, and shares the instrument driver, acquisition worker, and per-reading recorder with the desktop application. It supports all six measurement modes, live plots, acquisition controls, statistics, reference changes, event logging, CSV history, and PNG plot export.
+
+Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection. Mock readings remain simulated.
 

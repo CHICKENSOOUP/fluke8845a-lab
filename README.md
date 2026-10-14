@@ -14,6 +14,7 @@
 - 串口配置及项目自有驱动实现的 SCPI 通信
 - 连续 CSV 记录、时间戳、事件标记、统计和实时曲线
 - Mock 模式：无需连接仪器即可体验六种测量流程
+- 可选 localhost 浏览器界面，复用桌面版的仪器驱动和采集线程
 
 界面由 Qt/PySide6 提供；串口通信由 pyserial 和项目自有 SCPI 驱动负责。本项目不使用 Qt SerialPort。
 
@@ -28,6 +29,8 @@ python -m pip install -r requirements.txt
 python -m pip install -e ".[dev,build]"
 python -m fluke8845a
 ```
+
+启动本机网页界面：运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
 运行已有测试：`python -m pytest`。本地独立目录构建使用 `build_windows.ps1`。当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
 
@@ -60,6 +63,7 @@ Windows desktop application for controlling a Fluke 8845A over RS-232, recording
 - Serial-port configuration and SCPI communication through the project's own driver
 - Continuous CSV logging, timestamps, event markers, statistics, and live plots
 - Mock mode for exercising all six measurement workflows without connecting an instrument
+- Optional localhost browser interface sharing the desktop app's instrument driver and acquisition worker
 
 Qt/PySide6 supplies the graphical interface; pyserial and the project's SCPI driver handle serial communication. The application does not use Qt SerialPort.
 
@@ -74,6 +78,8 @@ python -m pip install -r requirements.txt
 python -m pip install -e ".[dev,build]"
 python -m fluke8845a
 ```
+
+Start the local browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
 
 To run the test suite:
 

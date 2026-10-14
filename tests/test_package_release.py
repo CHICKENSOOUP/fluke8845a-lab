@@ -13,6 +13,21 @@ def test_source_and_portable_manifests_require_qt_license_text_and_notice():
     assert expected <= REQUIRED_ENTRIES
 
 
+def test_source_and_portable_manifests_include_the_localhost_interface():
+    assert {
+        "Fluke8845A_Web.py",
+        "run_web.bat",
+        "src/fluke8845a/webapp.py",
+        "src/fluke8845a/web/index.html",
+    } <= set(REQUIRED_ARCHIVE_PATHS)
+    assert {
+        "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
+        "Fluke8845A-Web.dist/fluke8845a/web/index.html",
+        "Fluke8845A-Web.dist/fluke8845a/web/app.css",
+        "Fluke8845A-Web.dist/fluke8845a/web/app.js",
+    } <= REQUIRED_ENTRIES
+
+
 def valid_report(executable_sha256="ABCD"):
     modes = ("DCV", "ACV", "DCI", "ACI", "RES2", "RES4")
     return {
