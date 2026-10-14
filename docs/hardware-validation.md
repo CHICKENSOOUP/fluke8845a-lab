@@ -6,12 +6,13 @@
 
 本说明概述已记录的验证范围，不发布工作站标识、串口日志、原始测量数据或仪器序列号。
 
-### 当前源码版本
+### 最近已验证的应用代码版本
 
 - 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 本次 GUI 与时间戳改动之前，已验证并公开发布的源码基线为 `b173c29265287d95a9b990103b0aecd6b1d8e279`，对应 [GitHub Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-b173c2926528) 和 [Actions 运行 38624606820](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38624606820)。该提交在 Windows / Python 3.11、3.12 下各通过 217 项 pytest；源码 ZIP SHA-256 为 `D9426691C1D017E41A04C0211755678F4B0EB2276D9752E46B5389D44503D130`，下载包校验一致，解压后的 Mock 启动检查通过。
-- 基于该基线的当前工作树本地通过 219 项 pytest，用时 9.26 秒；本次本地运行设了 55 秒超时，发布工作流中的每个 pytest 步骤有 60 秒上限。改动包括小窗口 GUI 布局、删除重复的绘图行缓存，以及让样本和事件的本地/UTC 时间戳来自同一时刻。每次推送到 `main` 都先运行测试；通过后，同一工作流会为该提交发布专属 GitHub 预发布版和对应 GHCR 源码包。推送 `v*` 标签会发布正式版和匹配的 GHCR 包。
-- 当前源码快照没有完成六种模式的真实仪器逐项验证。Mock 数据和软件包检查不能证明真实仪器通信或测量准确度。GitHub Release 目前只发布源码 ZIP；Windows 二进制的 Qt/PySide 与 Microsoft Visual C++ 分发审查仍未关闭。
+- 最近已完整验收的应用代码提交为 `885d80bace9690657252a00cd5bf1a2007966781`，对应 [GitHub Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-885d80bace96) 和 [Actions 运行 38632084566](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38632084566)。Windows / Python 3.11、3.12 两个 CI 测试步骤均通过 220 项测试；本地全套 pytest 也通过 220 项，用时 9.24 秒。
+- 已从 GitHub Release 下载源码 ZIP，并核对附件 `SHA256SUMS.txt` 与 ZIP 内容一致：`3DC26A6EB98467CE084B40150F0289ADDA55C9C0BFB90B49844BC66AFAE85910`。从该下载 ZIP 解压后直接启动六模式 GUI Mock 验收，六种模式均成功保存有效读数、配置、事件与运行日志。对应 GHCR 标签为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-885d80bace96`；匿名读取该标签的 OCI manifest 返回 HTTP 200。
+- 同一源码提交还在本机生成了完整 Windows x64 ZIP（含桌面 EXE 和 localhost EXE）：`dist/Fluke8845A_Main_StopFix_20261015_Windows_x64.zip`，SHA-256 为 `9560E105955C465FC90B6D2C45A22575A3C6274858294E26BCA2D62F81F8AF6C`。冻结桌面程序的六模式 Mock 验收、串口枚举、解压包启动，以及 localhost 健康检查均通过；Windows ZIP 内含 `output/mock_validation/latest_frozen_exe_six_mode_e2e.json` 验收报告。此 Windows ZIP 目前是本机候选包，未上传到公开 Release。
+- 本次没有操作真机。当前源码尚未完成六种模式的逐项真机验收；Mock 数据和软件包检查不能证明真实仪器通信或测量准确度。GitHub Release 目前只发布源码 ZIP；Windows 二进制的 Qt/PySide 与 Microsoft Visual C++ 分发审查仍未关闭。
 
 ### 限制
 
@@ -23,12 +24,13 @@
 
 This file summarizes the scope of verification without publishing workstation identifiers, serial-port logs, raw measurements, or instrument serial numbers.
 
-## Current source release
+## Latest verified application code
 
 - The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- Before the GUI and timestamp changes in this update, the verified and published source baseline was `b173c29265287d95a9b990103b0aecd6b1d8e279`, with its [GitHub Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-b173c2926528) and [Actions run 38624606820](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38624606820). Windows / Python 3.11 and 3.12 each passed 217 pytest tests. The source ZIP SHA-256 is `D9426691C1D017E41A04C0211755678F4B0EB2276D9752E46B5389D44503D130`; the downloaded asset matched, and its extracted Mock startup check passed.
-- The current worktree, based on that commit, passes 219 local pytest tests in 9.26 seconds; this local run had a 55-second timeout, and each release-workflow pytest step has a 60-second limit. Changes cover compact-window GUI layout, removal of a duplicate full-row plotting cache, and paired sample/event local and UTC timestamps. Every push to `main` runs tests first; on success, that workflow publishes a commit-specific GitHub prerelease and matching GHCR source package. Pushing a `v*` tag publishes a stable release and matching GHCR package.
-- The current source snapshot has not been checked mode-by-mode against a real instrument. Mock data and package checks do not establish real-meter communication or measurement accuracy. GitHub Releases currently contain the source ZIP only because the Qt/PySide and Microsoft Visual C++ distribution review for a Windows binary remains open.
+- The latest fully verified application-code commit is `885d80bace9690657252a00cd5bf1a2007966781`, with its [GitHub Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-885d80bace96) and [Actions run 38632084566](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38632084566). Both Windows CI test steps, on Python 3.11 and 3.12, passed 220 tests. The complete local pytest suite also passed 220 tests in 9.24 seconds.
+- The source ZIP was downloaded from the GitHub Release and its contents matched the accompanying `SHA256SUMS.txt`: `3DC26A6EB98467CE084B40150F0289ADDA55C9C0BFB90B49844BC66AFAE85910`. After extraction, the six-mode GUI Mock acceptance launched from the downloaded source and saved valid readings, configuration, events, and run logs in all modes. The corresponding GHCR tag is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-885d80bace96`; an anonymous read of its OCI manifest returned HTTP 200.
+- A complete Windows x64 ZIP containing the desktop and localhost executables was also built locally from the same source commit: `dist/Fluke8845A_Main_StopFix_20261015_Windows_x64.zip`, SHA-256 `9560E105955C465FC90B6D2C45A22575A3C6274858294E26BCA2D62F81F8AF6C`. The frozen desktop passed six-mode Mock acceptance, serial enumeration, and extracted-package startup; the localhost health check passed. The Windows ZIP contains the six-mode acceptance report at `output/mock_validation/latest_frozen_exe_six_mode_e2e.json`. This Windows ZIP is a local candidate and is not attached to the public Release.
+- No real instrument was operated during this verification. The current source has not completed real-hardware validation mode by mode. Mock data and package checks do not establish real-meter communication or measurement accuracy. GitHub Releases currently contain only the source ZIP because the Qt/PySide and Microsoft Visual C++ distribution review for a Windows binary remains open.
 
 ## Limits
 
