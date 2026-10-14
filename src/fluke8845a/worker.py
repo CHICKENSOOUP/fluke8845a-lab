@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
@@ -67,6 +67,7 @@ class MeasurementWorker(QObject):
         self._ui_notification_pending = False
         self._ui_latest_hz = 0.0
         self._ui_latest_stats: dict = {}
+        self._stop_requested = Event()
 
     @property
     def state(self) -> AcquisitionState:
@@ -187,6 +188,7 @@ class MeasurementWorker(QObject):
             self._last_gui_emit_ns = 0
             self._target_interval_s = interval_s
             self._one_shot = one_shot
+            self._stop_requested.clear()
             info = self.info
             metadata = {
                 "simulation": self.simulation,
@@ -353,6 +355,7 @@ class MeasurementWorker(QObject):
 
     @Slot()
     def stop(self) -> None:
+        self._stop_requested.clear()
         self._timer.stop()
         try:
             self._machine.stop()
@@ -360,8 +363,15 @@ class MeasurementWorker(QObject):
             return
         self._finish_experiment("stopped")
 
+    def request_stop(self) -> None:
+        """Thread-safe stop request used to interrupt zero-delay timer churn."""
+        self._stop_requested.set()
+
     def _take_sample(self) -> None:
         if self.state != AcquisitionState.RUNNING or self._recorder is None or self.instrument is None:
+            return
+        if self._stop_requested.is_set():
+            self.stop()
             return
         routine_start_ns = time.monotonic_ns()
         host_time = datetime.now(timezone.utc)
@@ -439,6 +449,9 @@ class MeasurementWorker(QObject):
                 self.stop()
                 return
         if self.state != AcquisitionState.RUNNING:
+            return
+        if self._stop_requested.is_set():
+            self.stop()
             return
         if self._target_interval_s is None:
             delay_ms = 0

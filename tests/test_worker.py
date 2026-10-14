@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
+from threading import Thread
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
@@ -293,6 +295,50 @@ def test_live_sampling_interval_changes_apply_and_are_recorded(tmp_path):
         assert all(row["status"] == "ok" for row in rows)
         assert int(rows[-1]["sample_index"]) == len(rows)
     finally:
+        worker.shutdown()
+
+
+def test_fast_sampling_honors_thread_safe_stop_request_after_current_read(tmp_path):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.ACV)
+    worker.connect_mock(
+        settings,
+        MockScenario(
+            name="fast stop request",
+            noise_fraction=0,
+            drift_fraction_per_minute=0,
+            step_at_s=1e9,
+            recovery_at_s=None,
+            read_latency_s=0.08,
+        ),
+    )
+    finished = []
+    loop = QEventLoop()
+    worker.experiment_finished.connect(lambda directory: (finished.append(directory), loop.quit()))
+    worker.sample_ready.connect(lambda: worker.take_sample_update())
+
+    try:
+        worker.start_experiment(settings, "thread-safe stop", str(tmp_path), 0, False)
+        stopper = Thread(target=lambda: (time.sleep(0.02), worker.request_stop()), daemon=True)
+        stopper.start()
+        QTimer.singleShot(1500, loop.quit)
+        loop.exec()
+        stopper.join(timeout=0.5)
+
+        assert len(finished) == 1
+        assert worker.state is AcquisitionState.STOPPED
+        directory = Path(finished[0])
+        with (directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
+            rows = list(csv.DictReader(stream))
+        metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        assert len(rows) == 1
+        assert rows[0]["status"] == "ok"
+        assert rows[0]["raw_reading"]
+        assert metadata["completion_status"] == "stopped"
+    finally:
+        worker.request_stop()
+        if worker.state != AcquisitionState.STOPPED:
+            worker.stop()
         worker.shutdown()
 
 

@@ -149,6 +149,7 @@ def test_real_reading_updates_gui_curve_and_stats_without_plotting_failed_value(
         window._clear_plot()
         assert not window.plot_empty_overlay.isHidden()
         assert window.latest_value_label.text() == "等待读数"
+        assert window._global_stats["count"] == 0
     finally:
         window.close()
         qt_app.processEvents()

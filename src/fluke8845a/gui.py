@@ -1952,6 +1952,7 @@ class MainWindow(QMainWindow):
 
     def _stop(self) -> None:
         if self._acquiring:
+            self._worker.request_stop()
             self._bridge.stop.emit()
 
     def _on_status(self, status: str) -> None:
@@ -2402,6 +2403,7 @@ class MainWindow(QMainWindow):
         self._clear_event_markers()
         self._last_value = None
         self._last_elapsed = 0.0
+        self._global_stats = {"count": 0, "minimum": None, "maximum": None, "mean": None, "sample_stddev": None}
         self.curve.setData([], [])
         self.plot_empty_overlay.show()
         for item in self.plot_widget.items():
@@ -2597,6 +2599,7 @@ class MainWindow(QMainWindow):
         self._clock_timer.stop()
         for task in self._region_stats_tasks.values():
             task.cancel()
+        self._worker.request_stop()
         self._bridge.close_app.emit()
         if not self._worker_thread.wait(5000):
             self._append_log("! 仪器线程退出超时；当前测量读取的串口响应尚未返回")

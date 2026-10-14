@@ -630,6 +630,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
         "probe_type": "mock_gui_six_mode_e2e",
         "started_local": datetime.now().astimezone().isoformat(timespec="microseconds"),
         "modes": [],
+        "status": "starting",
     }
     executable = Path(sys.argv[0]).resolve()
     if executable.suffix.lower() == ".exe" and executable.is_file():
@@ -638,7 +639,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with report_path.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps({**report, "status": "starting"}, ensure_ascii=False, indent=2) + "\n")
+            stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     except FileExistsError:
         print(f"Mock GUI report already exists; choose a new path: {report_path}", file=sys.stderr)
         return 1
@@ -646,18 +647,29 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
         print(f"Unable to prepare Mock GUI report: {exc}", file=sys.stderr)
         return 1
 
+    def save_progress(phase: str) -> None:
+        report["phase"] = phase
+        temporary_report = report_path.with_suffix(report_path.suffix + ".tmp")
+        temporary_report.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary_report.replace(report_path)
+
     previous_config_dir = os.environ.get("FLUKE8845A_CONFIG_DIR")
     app: QApplication | None = None
     window: MainWindow | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="fluke8845a-mock-e2e-") as temporary_root:
+            save_progress("preparing_application")
             temporary_root_path = Path(temporary_root)
             os.environ["FLUKE8845A_CONFIG_DIR"] = str(temporary_root_path / "config")
             output_root = temporary_root_path / "experiments"
             QApplication.setApplicationName("Fluke 8845A Mock E2E")
             QApplication.setOrganizationName("Fluke8845A")
             app = QApplication(sys.argv[:1])
+            save_progress("creating_main_window")
             window = MainWindow()
+            save_progress("main_window_ready")
             window.mock_mode_check.setChecked(True)
             window.output_root.setText(str(output_root))
             window.interval_spin.setValue(0.0)
@@ -679,10 +691,11 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     return
                 state["finished"] = True
                 state["error"] = error
-                report["status"] = "error" if error else "ok"
+                report["status"] = "error" if error else "finishing"
                 if error:
                     report["error"] = error
                 report["finished_local"] = datetime.now().astimezone().isoformat(timespec="microseconds")
+                save_progress("closing_after_error" if error else "closing_after_success")
                 timer.stop()
                 if window is not None:
                     window.close()
@@ -708,12 +721,16 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 state["phase"] = "acquiring"
                 state["deadline"] = time.monotonic() + 15.0
                 window._start_continuous()
+                save_progress(f"acquiring_{mode.value}")
 
             def on_experiment_finished(directory: str) -> None:
+                if state["finished"]:
+                    return
                 if state["phase"] != "awaiting_finish":
                     finish(f"{modes[state['mode_index']].value}实验意外结束")
                     return
                 mode = modes[state["mode_index"]]
+                save_progress(f"validating_saved_{mode.value}")
                 try:
                     run_directory = Path(directory)
                     with (run_directory / "measurements.csv").open(
@@ -741,6 +758,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                             "measurements.csv", "config.json", "events.csv", "run.log"
                         ],
                     })
+                    save_progress(f"saved_{mode.value}")
                 except Exception as exc:
                     finish(f"{mode.value}验收失败：{exc}")
                     return
@@ -770,12 +788,14 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     return
                 if state["phase"] == "connecting" and window._connected:
                     try:
+                        save_progress(f"connected_{modes[state['mode_index']].value}")
                         start_current_mode()
                     except Exception as exc:
                         finish(str(exc))
                 elif state["phase"] == "acquiring" and int(window._global_stats.get("count", 0)) >= 3:
                     state["phase"] = "awaiting_finish"
                     state["deadline"] = time.monotonic() + 10.0
+                    save_progress(f"stopping_{modes[state['mode_index']].value}")
                     window._stop()
 
             receiver = _MockE2EReceiver(on_experiment_finished)
@@ -789,8 +809,10 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 ), patch.object(QMessageBox, "warning", side_effect=on_warning):
                     first_mode = modes[0]
                     select_mode(first_mode)
+                    save_progress("connecting_mock")
                     window._connect_mock()
                     timer.start()
+                    save_progress("event_loop_starting")
                     QTimer.singleShot(45_000, lambda: finish("六种模式Mock验收总超时"))
                     app.exec()
             finally:
@@ -800,6 +822,9 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 window.close()
                 app.processEvents()
             report["mode_count"] = len(report["modes"])
+            if report.get("status") == "finishing":
+                report["status"] = "ok"
+                report.pop("phase", None)
     except Exception as exc:
         report.update(status="error", error=str(exc))
     finally:
