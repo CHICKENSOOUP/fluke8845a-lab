@@ -26,12 +26,14 @@ from .storage import ExperimentRecorder
 log = logging.getLogger(__name__)
 ACTUAL_RATE_WINDOW_POINTS = 21
 MAX_PENDING_GUI_ROWS = 10_000
+MAX_PENDING_GUI_SCPI_LOG_LINES = 5_000
 
 
 class MeasurementWorker(QObject):
     connected_changed = Signal(bool, str)
     status_changed = Signal(str)
     log_line = Signal(str)
+    scpi_logs_ready = Signal()
     configuration_ready = Signal(object)
     active_settings_ready = Signal(object)
     # A coalesced wake-up prevents the Qt event queue growing during GUI stalls.
@@ -65,6 +67,9 @@ class MeasurementWorker(QObject):
         self._ui_mailbox_lock = Lock()
         self._ui_pending_rows: deque[dict] = deque(maxlen=MAX_PENDING_GUI_ROWS)
         self._ui_notification_pending = False
+        self._ui_pending_scpi_logs: deque[tuple[str, str]] = deque(maxlen=MAX_PENDING_GUI_SCPI_LOG_LINES)
+        self._ui_dropped_scpi_logs = 0
+        self._ui_scpi_log_notification_pending = False
         self._ui_latest_hz = 0.0
         self._ui_latest_stats: dict = {}
         self._stop_requested = Event()
@@ -74,7 +79,16 @@ class MeasurementWorker(QObject):
         return self._machine.state
 
     def _write_log(self, line: str) -> None:
-        self.log_line.emit(line)
+        timestamp = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
+        with self._ui_mailbox_lock:
+            if len(self._ui_pending_scpi_logs) == MAX_PENDING_GUI_SCPI_LOG_LINES:
+                self._ui_dropped_scpi_logs += 1
+            self._ui_pending_scpi_logs.append((timestamp, line))
+            notify = not self._ui_scpi_log_notification_pending
+            if notify:
+                self._ui_scpi_log_notification_pending = True
+        if notify:
+            self.scpi_logs_ready.emit()
         # Every raw reading is already preserved in measurements.csv. Keep the
         # run log bounded to setup commands and faults during long experiments.
         if self._recorder is not None and (line.startswith("! ") or (line.startswith("> ") and line != "> READ?")):
@@ -82,6 +96,16 @@ class MeasurementWorker(QObject):
                 self._recorder.log("SCPI", line)
             except OSError:
                 log.exception("SCPI run-log write failed")
+
+    def take_scpi_log_update(self) -> tuple[list[tuple[str, str]], int]:
+        """Drain a bounded batch of SCPI UI logs without queuing one Qt event per line."""
+        with self._ui_mailbox_lock:
+            lines = list(self._ui_pending_scpi_logs)
+            self._ui_pending_scpi_logs.clear()
+            dropped = self._ui_dropped_scpi_logs
+            self._ui_dropped_scpi_logs = 0
+            self._ui_scpi_log_notification_pending = False
+            return lines, dropped
 
     def _emit_active_settings(self, settings: ModeSettings) -> None:
         """Publish only settings confirmed by a readback or a verified configure call."""

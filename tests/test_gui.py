@@ -18,7 +18,7 @@ from fluke8845a.gui import MainWindow
 from fluke8845a.mock import MockScenario
 from fluke8845a.modes import DESCRIPTORS, Mode
 from fluke8845a.scpi import ModeSettings
-from fluke8845a.worker import MAX_PENDING_GUI_ROWS
+from fluke8845a.worker import MAX_PENDING_GUI_ROWS, MAX_PENDING_GUI_SCPI_LOG_LINES
 
 
 @pytest.fixture(scope="module")
@@ -93,6 +93,30 @@ def test_help_menu_exposes_qt_license_notice(qt_app, monkeypatch, tmp_path):
         )
         assert any(action.text() == "Qt 与第三方许可…" for action in help_menu.actions())
         assert gui_module.MainWindow._find_document("qt-licensing-and-third-party-notices.md").is_file()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_scpi_log_batch_shows_original_times_and_reports_dropped_backlog(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        with window._worker._ui_mailbox_lock:
+            window._worker._ui_pending_scpi_logs.extend((
+                ("12:00:00.001", "> READ?"),
+                ("12:00:00.002", "< 1.000000E+00"),
+            ))
+            window._worker._ui_dropped_scpi_logs = MAX_PENDING_GUI_SCPI_LOG_LINES + 4
+            window._worker._ui_scpi_log_notification_pending = True
+
+        window._on_scpi_logs_ready()
+
+        displayed = window.log_text.toPlainText()
+        assert "12:00:00.001  > READ?" in displayed
+        assert "12:00:00.002  < 1.000000E+00" in displayed
+        assert "5004 行" in displayed
+        assert window._worker.take_scpi_log_update() == ([], 0)
     finally:
         window.close()
         qt_app.processEvents()

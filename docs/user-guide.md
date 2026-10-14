@@ -53,7 +53,7 @@ ZERO/AUTO设置控制自动零点校正；“执行ZERO校正”会发送一次 
 
 采集中调整速度下拉框只修改“所选值”，不会立即改变仪表。读数卡会分别显示仪表已回读生效的参数和“待应用”值；点击“应用采集速度”且仪表回读成功后，新速度才从下一读数起生效。若应用失败，采集会安全停止并保留失败记录，不会把所选值误记为仪表当前值。
 
-界面左侧的“仪器”页用于选COM端口、连接设备及设置测量模式；“实验”页用于填写实验名称、保存目录和Mock验证场景。NPLC/交流带宽仅在适用模式中启用，灰色控件表示当前模式不可用。软件目标间隔与单次/连续采集按钮位于曲线上方；曲线跟随、视图复位、历史加载和截图放在下一行。串口高级参数默认收起，完整SCPI通信日志可从“仪器”菜单打开。窗口较矮时可滚动左侧设置页。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
+界面左侧的“仪器”页用于选COM端口、连接设备及设置测量模式；“实验”页用于填写实验名称、保存目录和Mock验证场景。NPLC/交流带宽仅在适用模式中启用，灰色控件表示当前模式不可用。软件目标间隔与单次/连续采集按钮位于曲线上方；曲线跟随、视图复位、历史加载和截图放在下一行。串口高级参数默认收起，完整SCPI通信日志可从“仪器”菜单打开。界面日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃的较早日志，测量CSV和全程统计不受影响。窗口较矮时可滚动左侧设置页。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
 
 采集速率会受测量模式、量程、NPLC/交流带宽、自动零点、串口波特率和被测条件共同影响。请以当前实验中实际记录的时间戳和有效读数为准，不要把某一台设备或某次接线的速率当作准确度或通用性能保证。
 
@@ -81,7 +81,7 @@ CSV的PC本地/UTC时间和`elapsed_s`记录主机发送单次`READ?`前的时�
 - `measurements.csv`：每次测量/失败尝试一行。`raw_reading`保留仪器响应文本，`value_si`保存未经滤波/舍入的SI值；`voltage_v`、`current_a`、`resistance_ohm`三列供常见工具直接筛选。无效值为空字符串，状态列写`timeout`、`overflow`、`invalid`、`instrument_local`或其他通信错误。
 - `config.json`：仪器身份和固件、串口、请求的模式设置、仪器回读、数据是真机还是模拟、采样时间语义及最终状态。
 - `events.csv`：人工事件、暂停/继续和相对基准变更。
-- `run.log`：实验启动/停止、SCPI配置命令和异常。逐点原始响应在CSV；为避免长期高速采集产生巨型日志，测量响应不重复写入run.log。实时SCPI发送/接收在GUI日志面板可见。
+- `run.log`：实验启动/停止、SCPI配置命令和异常。逐点原始响应在CSV；为避免长期高速采集产生巨型日志，测量响应不重复写入run.log。实时SCPI发送/接收在GUI日志面板可见；显示队列有界，界面跟不上时会提示丢弃的旧日志行。
 
 CSV以UTF-8 BOM编码，含样本序号、主机本地和UTC ISO时间、单调经过时间、读数通信耗时、实际间隔、模式、SI单位、原始响应、仪器量程、NPLC、交流带宽、滤波/零点状态和异常信息。Python `repr(float)`不做小数位截断；`raw_reading`保留SCPI返回的十进制文本。
 
@@ -132,7 +132,7 @@ Enter an experiment name and output directory, then start a single reading or co
 
 The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Timestamps are host-side: the CSV records the time before `READ?`, and `read_duration_s` records the read and range-query communication period. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
 
-Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, notifications are coalesced and at most the latest 10,000 pending display points are kept; the curve may skip intermediate display points while the CSV and full-run statistics remain complete.
+Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, sample notifications are coalesced and at most the latest 10,000 pending display points are kept; the SCPI display-log mailbox also stays bounded at 5,000 lines and reports when earlier display entries are dropped. The curve may skip intermediate display points while the CSV and full-run statistics remain complete.
 
 ### 5. Analysis, events, and history
 

@@ -498,6 +498,7 @@ class MainWindow(QMainWindow):
         self._worker.connected_changed.connect(self._on_connected)
         self._worker.status_changed.connect(self._on_status)
         self._worker.log_line.connect(self._append_log)
+        self._worker.scpi_logs_ready.connect(self._on_scpi_logs_ready)
         self._worker.configuration_ready.connect(self._on_configuration)
         self._worker.active_settings_ready.connect(self._on_active_settings)
         self._worker.sample_ready.connect(self._on_sample_ready)
@@ -2591,6 +2592,19 @@ class MainWindow(QMainWindow):
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
         self.log_text.appendPlainText(f"{timestamp}  {message}")
+
+    @Slot()
+    def _on_scpi_logs_ready(self) -> None:
+        lines, dropped = self._worker.take_scpi_log_update()
+        if not lines and not dropped:
+            return
+        display_lines = []
+        if dropped:
+            display_lines.append(
+                f"! SCPI显示日志缓冲曾丢弃较早的 {dropped} 行；测量读数和原始响应仍逐点保存在CSV中。"
+            )
+        display_lines.extend(f"{timestamp}  {message}" for timestamp, message in lines)
+        self.log_text.appendPlainText("\n".join(display_lines))
 
     @Slot(str)
     def _show_error(self, message: str) -> None:

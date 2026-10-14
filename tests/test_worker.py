@@ -14,13 +14,37 @@ from fluke8845a.modes import Mode, descriptor
 from fluke8845a.mock import MockScenario
 from fluke8845a.scpi import ModeSettings, Serial8845A, SerialSettings
 from fluke8845a.state import AcquisitionState
-from fluke8845a.worker import MAX_PENDING_GUI_ROWS, MeasurementWorker
+from fluke8845a.worker import (
+    MAX_PENDING_GUI_ROWS, MAX_PENDING_GUI_SCPI_LOG_LINES, MeasurementWorker,
+)
 from tests.fakes import FakeTransport
 
 
 @pytest.fixture(scope="module", autouse=True)
 def qt_core_application():
     return QCoreApplication.instance() or QCoreApplication([])
+
+
+def test_scpi_log_mailbox_coalesces_notifications_and_bounds_backlog(qt_core_application):
+    worker = MeasurementWorker()
+    notifications = []
+    worker.scpi_logs_ready.connect(lambda: notifications.append(True))
+
+    total = MAX_PENDING_GUI_SCPI_LOG_LINES + 17
+    for index in range(total):
+        worker._write_log(f"> command {index}")
+
+    assert len(notifications) == 1
+    lines, dropped = worker.take_scpi_log_update()
+    assert len(lines) == MAX_PENDING_GUI_SCPI_LOG_LINES
+    assert dropped == 17
+    assert lines[0][1] == "> command 17"
+    assert lines[-1][1] == f"> command {total - 1}"
+    assert lines[0][0]
+
+    assert worker.take_scpi_log_update() == ([], 0)
+    worker._write_log("> fresh command")
+    assert len(notifications) == 2
 
 
 @pytest.mark.parametrize(
