@@ -77,6 +77,23 @@ jobs:
           "$hash  Fluke8845A_Source_Project.zip" | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
         shell: pwsh
 
+      - name: Smoke test first launch from extracted source ZIP (60-second limit)
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP ("Fluke8845A_source_smoke_" + [guid]::NewGuid().ToString("N"))
+          Expand-Archive -Path $archive -DestinationPath $extractRoot
+          Push-Location $extractRoot
+          try {
+            $env:QT_QPA_PLATFORM = "offscreen"
+            python "scripts\launch_windows.py" desktop --mock --smoke
+            if ($LASTEXITCODE -ne 0) { throw "Extracted source ZIP first-launch smoke failed (exit $LASTEXITCODE)." }
+          }
+          finally {
+            Pop-Location
+          }
+        shell: pwsh
+        timeout-minutes: 1
+
       - name: Set up ORAS
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
         with:
