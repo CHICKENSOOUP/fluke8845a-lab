@@ -34,7 +34,7 @@ python -m fluke8845a
 
 启动本机网页界面：运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
-开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；运行测试：`python -m pytest`。Windows 便携构建需要 64 位 Python 3.12 环境，可按下面命令安装锁定依赖并构建。每次构建会运行 pytest，单次测试上限为 55 秒。
+开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1`。该脚本会在 55 秒停止 pytest 及其子进程，并把输出日志保留在 `build` 目录。若依赖装在其他 Python 环境，可加 `-PythonPath .\.venv-build\Scripts\python.exe`。Windows 便携构建需要 64 位 Python 3.12 环境，可按下面命令安装锁定依赖并构建。每次构建也会运行 pytest，单次测试上限为 55 秒。
 
 ```powershell
 py -3.12 -m venv .venv-build
@@ -99,10 +99,10 @@ python -m fluke8845a
 
 Start the local browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
 
-Install developer dependencies with `python -m pip install -e ".[dev]"`. To run the test suite:
+Install developer dependencies with `python -m pip install -e ".[dev]"`. In PowerShell, run the bounded test suite; it stops pytest and child processes after 55 seconds and retains output logs under `build`. If the dependencies are installed in another Python environment, pass `-PythonPath .\.venv-build\Scripts\python.exe`:
 
 ```powershell
-python -m pytest
+powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1
 ```
 
 For a reproducible local build, use 64-bit Python 3.12 and install the locked test/build dependencies before invoking the script:
