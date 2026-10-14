@@ -4,7 +4,7 @@
 
 ## 简体中文
 
-- 每次推送到 `main`，GitHub Actions 在 Windows runner 上安装锁定依赖，并在 **60 秒上限**内运行 pytest。测试通过后，为该提交创建一条独立的预发布版本，附带 `Fluke8845A_Source_Project.zip` 和 `SHA256SUMS.txt`。
+- 每次推送到 `main`，GitHub Actions 分别在 Windows / Python 3.11 和 3.12 环境安装锁定依赖，并为每个 pytest 步骤设置 **60 秒上限**。两套测试都通过后，才为该提交创建独立预发布版本，附带 `Fluke8845A_Source_Project.zip` 和 `SHA256SUMS.txt`。
 - 推送 `v*` 版本标签会创建对应的正式 GitHub Release，并附带同样的源码包和校验文件。
 - 重跑同一提交的工作流会更新该 Release 中的附件，不会重复创建同名 Release。
 - Release 附件是下载包；本项目没有向 GitHub Packages 注册表发布 Python 包。
@@ -13,7 +13,7 @@
 
 ## English
 
-- Every push to `main` runs pytest on a Windows runner with a **60-second test limit**. If tests pass, the workflow creates a commit-specific prerelease with `Fluke8845A_Source_Project.zip` and `SHA256SUMS.txt`.
+- Every push to `main` runs pytest on Windows with locked Python 3.11 and 3.12 environments; each pytest step has a **60-second limit**. Both suites must pass before the workflow creates a commit-specific prerelease with `Fluke8845A_Source_Project.zip` and `SHA256SUMS.txt`.
 - Pushing a `v*` version tag creates the corresponding stable GitHub Release with the same source package and checksum file.
 - Rerunning a workflow for the same commit updates the existing Release assets instead of creating a duplicate Release.
 - Release attachments are downloadable project packages; this project does not publish a Python package to the GitHub Packages registry.

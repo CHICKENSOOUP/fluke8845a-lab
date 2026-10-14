@@ -36,7 +36,7 @@ python -m fluke8845a
 
 开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；运行测试：`python -m pytest`。本地独立目录构建使用 `build_windows.ps1`，还需安装 `.[build]`。当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
 
-推送到 `main` 后会自动运行不超过 60 秒的测试，并为该提交发布带源码 ZIP 和 SHA-256 校验文件的预发布版本；推送 `v*` 标签会发布正式版本。自动发布流程见[发布说明](docs/releasing.md)。
+推送到 `main` 后会在 Python 3.11 和 3.12 Windows 环境分别运行 pytest（每个测试步骤最多 60 秒），全部通过后为该提交发布带源码 ZIP 和 SHA-256 校验文件的预发布版本；推送 `v*` 标签会发布正式版本。自动发布流程见[发布说明](docs/releasing.md)。
 
 ### 仪器与验证状态
 
@@ -96,7 +96,7 @@ python -m pytest
 
 Build a local standalone package after installing `python -m pip install -e ".[build]"`. By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
 
-Pushes to `main` automatically run tests capped at 60 seconds and publish a commit-specific prerelease with the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes a stable release. See the [release guide](docs/releasing.md).
+Pushes to `main` automatically run pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds); both suites must pass before the workflow publishes a commit-specific prerelease with the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes a stable release. See the [release guide](docs/releasing.md).
 
 ## Hardware and verification status
 

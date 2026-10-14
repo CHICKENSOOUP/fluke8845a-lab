@@ -1,6 +1,6 @@
 # Exact environment snapshot: Windows 11, CPython 3.12.14 x64.
 # This is not a cross-version lock: NumPy 2.5.4 requires Python >=3.12.
-# Python 3.11 source installs should use requirements.txt; runtime testing on 3.11 is pending.
+# Python 3.11 CI uses the separate requirements-lock-python311.txt snapshot.
 colorama==0.4.6
 iniconfig==2.3.1
 Nuitka==4.1.1

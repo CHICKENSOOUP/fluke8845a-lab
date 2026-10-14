@@ -22,6 +22,7 @@ INCLUDED_ROOT_FILES = (
     "pyproject.toml",
     "requirements.txt",
     "requirements-lock.txt",
+    "requirements-lock-python311.txt",
 )
 INCLUDED_TREES = (
     "src",
@@ -49,6 +50,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/hardware-validation.md",
     "docs/release-notes-v1.0.1.md",
     "docs/releasing.md",
+    "requirements-lock-python311.txt",
     "tests/test_worker.py",
     "assets/fluke8845a_app_icon_v3.png",
     ".github/workflows/publish-release.yml",

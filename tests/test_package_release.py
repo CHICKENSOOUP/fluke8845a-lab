@@ -42,6 +42,10 @@ def test_source_archive_includes_automated_release_workflow_and_guide():
     assert "docs/releasing.md" in REQUIRED_ARCHIVE_PATHS
 
 
+def test_source_archive_includes_python311_dependency_lock():
+    assert "requirements-lock-python311.txt" in REQUIRED_ARCHIVE_PATHS
+
+
 def valid_report(executable_sha256="ABCD"):
     modes = ("DCV", "ACV", "DCI", "ACI", "RES2", "RES4")
     return {
