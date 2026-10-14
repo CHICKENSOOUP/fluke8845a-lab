@@ -9,8 +9,8 @@
 ### 当前源码版本
 
 - 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 源码提交 `cb0893c` 的 209 项 pytest 已在 Windows / Python 3.11（10.57 秒）和 Python 3.12（10.93 秒）通过；对应 GitHub Actions 发布也成功，每个 pytest 步骤设有 60 秒上限。另有 Python 3.11 Mock GUI 启停检查通过。这些是软件自动化/Mock 检查，不是仪器准确度或真机兼容性验证。
-- 提交 `cb0893c` 尚未连接真实仪器逐模式验证。早期版本的真机检查不能作为当前源码快照的验证证据。
+- 最近验证的应用提交 `600a793` 有 209 项 pytest 在 Windows / Python 3.11（14.12 秒）和 Python 3.12（9.91 秒）通过；每个 pytest 步骤设有 60 秒上限。该提交的 GitHub Actions Release 和 GHCR OCI 源码包发布均成功。这些是软件自动化/Mock 与发布流程检查，不是仪器准确度或真机兼容性验证。
+- 提交 `600a793` 尚未连接真实仪器逐模式验证。早期版本的真机检查不能作为当前源码快照的验证证据。
 
 ### 限制
 
@@ -25,8 +25,8 @@ This file summarizes the scope of verification without publishing workstation id
 ## Current source release
 
 - The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- Source commit `cb0893c` passed 209 pytest tests on Windows / Python 3.11 (10.57 seconds) and Python 3.12 (10.93 seconds); the corresponding GitHub Actions release also succeeded, with a 60-second limit on each pytest step. A Python 3.11 Mock GUI startup/shutdown check also passed. These are software automation/Mock checks, not meter-accuracy or real-hardware validation.
-- Commit `cb0893c` has not been checked mode-by-mode against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot.
+- Most recently verified application commit `600a793` passed 209 pytest tests on Windows / Python 3.11 (14.12 seconds) and Python 3.12 (9.91 seconds); each pytest step has a 60-second limit. The GitHub Actions Release and GHCR OCI source package also published successfully for this commit. These are software automation/Mock and publishing checks, not meter-accuracy or real-hardware validation.
+- Commit `600a793` has not been checked mode-by-mode against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot.
 
 ## Limits
 
