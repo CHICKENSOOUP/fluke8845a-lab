@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluke8845a-lab"
+version = "1.0.0"
+description = "Fluke 8845A RS-232 scientific measurement and logging application"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "PySide6>=6.7",
+  "pyserial>=3.5",
+  "pyqtgraph>=0.13.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+build = ["Nuitka>=4.1.1"]
+
+[project.scripts]
+fluke8845a = "fluke8845a.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

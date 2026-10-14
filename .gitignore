@@ -1,0 +1,16 @@
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+deployment/
+nuitka-crash-report.xml
+*.spec.bak
+*.egg-info/
+.coverage
+htmlcov/
+output/
+Fluke8845A_Agent_Reference_Pack/
+.research_*/
