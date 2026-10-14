@@ -16,11 +16,12 @@ The candidate dynamically loads Qt 6.12.0 and PySide6/Shiboken 6.12.0 libraries.
 
 ### Other bundled runtime families
 
-The frozen package also contains CPython 3.12.10, NumPy 2.5.4 and its OpenBLAS DLL, OpenSSL 3 DLLs, Nuitka runtime code, pyqtgraph 0.14.0, pyserial 3.5, Shiboken, and Microsoft Visual C++ runtime DLLs. The `pyqtgraph` package's CET color-map attribution file is present in the archive. The project has not yet completed the full, exact notice set for these components or confirmed every applicable Microsoft redistribution condition. A lock file is not a substitute for inspecting the actual binary package.
+The frozen package also contains CPython 3.12.10, NumPy 2.5.4 and its OpenBLAS DLL, OpenSSL 3.0.16 DLLs, Nuitka 4.1.1 runtime code, pyqtgraph 0.14.0, pySerial 3.5, Shiboken, and Microsoft Visual C++ runtime DLLs. The build copies the CPython license, NumPy's full wheel license tree (including OpenBLAS/LAPACK/GCC notices), pyqtgraph and CET color-map notices, the pinned pySerial license, OpenSSL's Apache 2.0 license, and Nuitka's license/exception/notice files. The generated `docs/licenses/windows-runtime-license-manifest.json` records all 25 copied files and their SHA-256 hashes. This is evidence for the copied texts, not yet a complete binary redistribution review.
 
 ### Open items
 
-- Add and verify the license materials for all bundled Python and native runtime components.
+- Verify the complete mapping of every bundled native component; Microsoft Visual C++ DLL provenance and applicable redistribution terms remain open.
+- Reconcile Qt/PySide modules and embedded third-party code against the exact bundle.
 - Publish a version-specific Qt/PySide corresponding-source offer after confirming wheel patches and provenance.
 - Test that recipients can replace/relink the Qt libraries and start this exact portable package.
 - Regenerate and review the inventory for each candidate build.
@@ -34,6 +35,11 @@ Until these items are closed, this candidate is not attached to a public Release
 - [Qt Test licensing](https://doc.qt.io/qt-6/qttest-index.html)
 - [Qt for Python licensing](https://doc.qt.io/qtforpython-6/)
 - [Qt open-source LGPL/GPL obligations](https://www.qt.io/development/open-source-lgpl-obligations)
+- [Python 3.12 license](https://docs.python.org/3.12/license.html)
+- [NumPy license](https://numpy.org/doc/stable/license.html)
+- [OpenSSL license](https://www.openssl.org/source/license.html)
+- [pySerial v3.5 license](https://github.com/pyserial/pyserial/blob/v3.5/LICENSE.txt)
+- [Nuitka runtime exception](https://github.com/Nuitka/Nuitka/blob/develop/LICENSE-RUNTIME.txt)
 - [Microsoft Visual C++ redistribution terms](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files)
 
 ## 简体中文
@@ -50,11 +56,12 @@ Fluke 8845A Lab 自有代码和图稿采用 MIT 许可证，见包内 `LICENSE`�
 
 ### 其他随包运行时
 
-冻结包还包含 CPython 3.12.10、NumPy 2.5.4 及其 OpenBLAS DLL、OpenSSL 3 DLL、Nuitka 运行时代码、pyqtgraph 0.14.0、pyserial 3.5、Shiboken 和 Microsoft Visual C++ 运行库。压缩包已包含 pyqtgraph CET 色表的归属说明文件。项目尚未完成这些组件的完整、精确声明，也未核实所有适用的 Microsoft 再分发条件；依赖锁文件不能代替对实际二进制包的检查。
+冻结包还包含 CPython 3.12.10、NumPy 2.5.4 及其 OpenBLAS DLL、OpenSSL 3.0.16 DLL、Nuitka 4.1.1 运行时代码、pyqtgraph 0.14.0、pySerial 3.5、Shiboken 和 Microsoft Visual C++ 运行库。构建过程复制了 CPython 许可、NumPy wheel 完整许可树（含 OpenBLAS/LAPACK/GCC 声明）、pyqtgraph 与 CET 色表归属说明、固定版本的 pySerial 许可、OpenSSL Apache 2.0 许可，以及 Nuitka 运行库许可/例外/声明文件。生成的 `docs/licenses/windows-runtime-license-manifest.json` 记录这 25 份文件及其 SHA-256。这能证明包内许可正文与清单匹配，但还不能证明全部二进制再分发条件均已核验。
 
 ### 尚未完成
 
-- 补齐并核验所有随包 Python 与本机运行库的许可证材料。
+- 核对每个本机运行库与许可材料的完整映射；Microsoft Visual C++ DLL 的来源和适用再分发条款仍未关闭。
+- 按确切包内容核对 Qt/PySide 模块和嵌入式第三方代码。
 - 核实 wheel 的补丁和来源后，提供版本固定的 Qt/PySide 对应源码要约。
 - 实测接收者可替换/重新链接 Qt 库并启动此便携包。
 - 对每个候选构建重新生成并审查组件清单。
@@ -68,4 +75,9 @@ Fluke 8845A Lab 自有代码和图稿采用 MIT 许可证，见包内 `LICENSE`�
 - [Qt Test 许可](https://doc.qt.io/qt-6/qttest-index.html)
 - [Qt for Python 许可](https://doc.qt.io/qtforpython-6/)
 - [Qt LGPL/GPL 开源发行义务](https://www.qt.io/development/open-source-lgpl-obligations)
+- [Python 3.12 许可](https://docs.python.org/3.12/license.html)
+- [NumPy 许可](https://numpy.org/doc/stable/license.html)
+- [OpenSSL 许可](https://www.openssl.org/source/license.html)
+- [pySerial v3.5 许可](https://github.com/pyserial/pyserial/blob/v3.5/LICENSE.txt)
+- [Nuitka 运行库例外](https://github.com/Nuitka/Nuitka/blob/develop/LICENSE-RUNTIME.txt)
 - [Microsoft Visual C++ 再分发条款](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files)

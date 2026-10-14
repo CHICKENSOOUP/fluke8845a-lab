@@ -13,7 +13,7 @@ import tempfile
 import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 
@@ -40,6 +40,16 @@ REQUIRED_ENTRIES = {
     "docs/licenses/windows-portable-review-2026-10-15.md",
     "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
     "docs/licenses/windows-source-offer.md",
+    "docs/licenses/windows-runtime-license-manifest.json",
+    "docs/licenses/third-party/cpython/LICENSE.txt",
+    "docs/licenses/third-party/numpy/LICENSE.txt",
+    "docs/licenses/third-party/pyqtgraph/LICENSE.txt",
+    "docs/licenses/third-party/pyqtgraph/CET-color-map-CC-BY.txt",
+    "docs/licenses/third-party/pyserial/LICENSE.txt",
+    "docs/licenses/third-party/openssl/Apache-2.0.txt",
+    "docs/licenses/third-party/nuitka-runtime/LICENSE.txt",
+    "docs/licenses/third-party/nuitka-runtime/LICENSE-RUNTIME.txt",
+    "docs/licenses/third-party/nuitka-runtime/NOTICE.txt",
     "assets/fluke8845a_app_icon_v3.png",
     MOCK_E2E_REPORT,
 }
@@ -97,6 +107,53 @@ def validate_portable_runtime_components(entries: set[str]) -> None:
     )
     if unexpected:
         raise ValueError("Portable package contains unused Qt PDF components: " + ", ".join(unexpected))
+
+
+def validate_runtime_license_manifest(manifest: dict, license_contents: dict[str, bytes]) -> None:
+    """Require copied license texts to match the collector's content-addressed manifest."""
+    if not isinstance(manifest, dict):
+        raise ValueError("Runtime license manifest is not a JSON object")
+    if manifest.get("format_version") != 1 or not manifest.get("python_runtime_version"):
+        raise ValueError("Runtime license manifest has an unsupported format or no Python runtime version")
+    required_components = {
+        "CPython", "numpy", "pyqtgraph", "pyserial", "OpenSSL", "Nuitka runtime library",
+    }
+    components = manifest.get("components")
+    if not isinstance(components, list):
+        raise ValueError("Runtime license manifest does not list components")
+    component_names = {entry.get("name") for entry in components if isinstance(entry, dict)}
+    if not required_components <= component_names:
+        raise ValueError("Runtime license manifest omits components: " + ", ".join(sorted(required_components - component_names)))
+
+    records = manifest.get("license_files")
+    if not isinstance(records, list) or not records:
+        raise ValueError("Runtime license manifest contains no file records")
+    record_paths: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Runtime license manifest contains an invalid file record")
+        relative = PurePosixPath(str(record.get("path", "")))
+        if "\\" in str(record.get("path", "")) or relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "third-party":
+            raise ValueError(f"Runtime license manifest contains an unsafe path: {relative}")
+        relative_name = relative.as_posix()
+        if relative_name in record_paths:
+            raise ValueError(f"Runtime license manifest repeats a path: {relative_name}")
+        record_paths.add(relative_name)
+        data = license_contents.get(relative_name)
+        if data is None:
+            raise ValueError(f"Runtime license file is missing from the portable package: {relative_name}")
+        if len(data) != record.get("bytes"):
+            raise ValueError(f"Runtime license file size does not match manifest: {relative_name}")
+        digest = hashlib.sha256(data).hexdigest().upper()
+        if digest != str(record.get("sha256", "")).upper():
+            raise ValueError(f"Runtime license file SHA-256 does not match manifest: {relative_name}")
+    for component in components:
+        if not isinstance(component, dict) or not isinstance(component.get("license_files"), list):
+            raise ValueError("Runtime license manifest contains an invalid component entry")
+        if not set(component["license_files"]) <= record_paths:
+            raise ValueError(f"Runtime license files for {component.get('name')} are not covered by the file manifest")
+    if not manifest.get("known_open_items"):
+        raise ValueError("Runtime license manifest must preserve known open review items")
 
 
 def verify_extracted_portable_release(archive_path: Path, executable_sha256: str) -> None:
@@ -253,6 +310,18 @@ def main(argv: list[str] | None = None) -> int:
             if missing:
                 raise RuntimeError("Portable package is missing required files: " + ", ".join(missing))
             validate_portable_runtime_components(names)
+            license_manifest = json.loads(archive.read("docs/licenses/windows-runtime-license-manifest.json").decode("utf-8"))
+            if not isinstance(license_manifest, dict):
+                raise RuntimeError("Portable package runtime license manifest is not a JSON object")
+            license_records = license_manifest.get("license_files", [])
+            if not isinstance(license_records, list):
+                license_records = []
+            license_contents = {
+                path: archive.read("docs/licenses/" + path)
+                for path in (str(record.get("path", "")) for record in license_records if isinstance(record, dict))
+                if "docs/licenses/" + path in names and "\\" not in path
+            }
+            validate_runtime_license_manifest(license_manifest, license_contents)
             if unsafe:
                 raise RuntimeError("Portable package contains excluded paths or identifiers: " + ", ".join(unsafe))
             if damaged:

@@ -34,9 +34,20 @@ python -m fluke8845a
 
 启动本机网页界面：运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
-开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；运行测试：`python -m pytest`。本地独立目录构建使用 `build_windows.ps1`，还需安装 `.[build]`。当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
+开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；运行测试：`python -m pytest`。Windows 便携构建需要 64 位 Python 3.12 环境，可按下面命令安装锁定依赖并构建。每次构建会运行 pytest，单次测试上限为 55 秒。
 
-推送到 `main` 后会在 Python 3.11 和 3.12 Windows 环境分别运行 pytest（每个测试步骤最多 60 秒），全部通过后为该提交发布带源码 ZIP 和 SHA-256 校验文件的预发布版本；推送 `v*` 标签会发布正式版本。自动发布流程见[发布说明](docs/releasing.md)。
+```powershell
+py -3.12 -m venv .venv-build
+.\.venv-build\Scripts\Activate.ps1
+python -m pip install -r requirements-lock.txt
+python -m pip install --no-deps --no-build-isolation -e .
+$buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
+.\build_windows.ps1 -SideBySide -BuildName $buildName -PythonPath ".venv-build\Scripts\python.exe"
+```
+
+当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
+
+每次推送到 `main` 都会在 Python 3.11 和 3.12 Windows 环境分别运行 pytest（每个测试步骤最多 60 秒）；全部通过后，同一工作流会为该提交创建 GitHub 预发布版本，并同时发布源码 ZIP、SHA-256 校验文件和 GHCR Packages 源码包。推送 `v*` 标签也会同时发布正式 GitHub Release 和 Packages。自动发布流程见[发布说明](docs/releasing.md)。
 
 ### 仪器与验证状态
 
@@ -94,9 +105,20 @@ Install developer dependencies with `python -m pip install -e ".[dev]"`. To run 
 python -m pytest
 ```
 
-Build a local standalone package after installing `python -m pip install -e ".[build]"`. By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
+For a reproducible local build, use 64-bit Python 3.12 and install the locked test/build dependencies before invoking the script:
 
-Pushes to `main` automatically run pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds); both suites must pass before the workflow publishes a commit-specific GitHub prerelease and a matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes both a stable release and package. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
+```powershell
+py -3.12 -m venv .venv-build
+.\.venv-build\Scripts\Activate.ps1
+python -m pip install -r requirements-lock.txt
+python -m pip install --no-deps --no-build-isolation -e .
+$buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
+.\build_windows.ps1 -SideBySide -BuildName $buildName -PythonPath ".venv-build\Scripts\python.exe"
+```
+
+By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
+
+Every push to `main` automatically runs pytest on Windows with Python 3.11 and 3.12 (each test step is capped at 60 seconds); both suites must pass before the same workflow publishes a commit-specific GitHub prerelease and matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Pushing a `v*` tag publishes both a stable release and package. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
 
 ## Hardware and verification status
 

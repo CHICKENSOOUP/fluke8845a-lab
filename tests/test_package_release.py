@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from scripts.package_source import REQUIRED_ARCHIVE_PATHS
@@ -5,19 +7,37 @@ from scripts.package_windows_release import (
     REQUIRED_ENTRIES,
     validate_mock_e2e_report,
     validate_portable_runtime_components,
+    validate_runtime_license_manifest,
 )
 
 
 def test_source_and_portable_manifests_require_qt_license_text_and_notice():
-    expected = {
+    source_expected = {
         "docs/qt-licensing-and-third-party-notices.md",
         "docs/licenses/LGPL-3.0.txt",
         "docs/licenses/windows-portable-review-2026-10-15.md",
         "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
         "docs/licenses/windows-source-offer.md",
     }
-    assert expected <= set(REQUIRED_ARCHIVE_PATHS)
-    assert expected <= REQUIRED_ENTRIES
+    binary_expected = {
+        "docs/licenses/windows-runtime-license-manifest.json",
+        "docs/licenses/third-party/cpython/LICENSE.txt",
+        "docs/licenses/third-party/numpy/LICENSE.txt",
+        "docs/licenses/third-party/pyserial/LICENSE.txt",
+        "docs/licenses/third-party/openssl/Apache-2.0.txt",
+        "docs/licenses/third-party/nuitka-runtime/LICENSE-RUNTIME.txt",
+    }
+    assert source_expected <= set(REQUIRED_ARCHIVE_PATHS)
+    assert source_expected | binary_expected <= REQUIRED_ENTRIES
+
+
+def test_source_archive_includes_runtime_license_collector_and_sources():
+    assert "scripts/collect_windows_runtime_licenses.py" in REQUIRED_ARCHIVE_PATHS
+    assert {
+        "docs/licenses/third-party/README.md",
+        "docs/licenses/third-party/Apache-2.0.txt",
+        "docs/licenses/third-party/pyserial-3.5-LICENSE.txt",
+    } <= set(REQUIRED_ARCHIVE_PATHS)
 
 
 def test_source_and_portable_manifests_include_the_localhost_interface():
@@ -104,3 +124,27 @@ def test_portable_release_rejects_unused_qt_pdf_components(component):
 
 def test_portable_release_accepts_runtime_without_qt_pdf_components():
     validate_portable_runtime_components({"Fluke8845A.exe", "PySide6/qt-plugins/imageformats/qjpeg.dll"})
+
+
+def test_runtime_license_manifest_verifies_every_copied_file_hash():
+    contents = {"third-party/cpython/LICENSE.txt": b"PSF license"}
+    manifest = {
+        "format_version": 1,
+        "python_runtime_version": "3.12.10",
+        "components": [
+            {"name": name, "license_files": ["third-party/cpython/LICENSE.txt"] if name == "CPython" else []}
+            for name in ("CPython", "numpy", "pyqtgraph", "pyserial", "OpenSSL", "Nuitka runtime library")
+        ],
+        "license_files": [{
+            "component": "CPython",
+            "path": "third-party/cpython/LICENSE.txt",
+            "bytes": len(b"PSF license"),
+            "sha256": hashlib.sha256(b"PSF license").hexdigest().upper(),
+        }],
+        "known_open_items": ["Qt review remains open"],
+    }
+    validate_runtime_license_manifest(manifest, contents)
+
+    manifest["license_files"][0]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="SHA-256"):
+        validate_runtime_license_manifest(manifest, contents)

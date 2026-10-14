@@ -194,6 +194,14 @@ try {
         Remove-Item -LiteralPath $unusedQtPdfPlugin -Force
     }
 
+    & $python (Join-Path $PSScriptRoot "scripts\collect_windows_runtime_licenses.py") `
+        --python-root $portablePython `
+        --site-packages $pythonSitePackages `
+        --project-root $PSScriptRoot `
+        --output-root (Join-Path $exeDist "docs\licenses") `
+        --python-version $pythonVersion
+    if ($LASTEXITCODE -ne 0) { throw "Windows runtime license collection failed." }
+
     $exe = Join-Path $exeDist "Fluke8845A.exe"
     if (-not (Test-Path -LiteralPath $exe)) { throw "Nuitka did not create $exe" }
 

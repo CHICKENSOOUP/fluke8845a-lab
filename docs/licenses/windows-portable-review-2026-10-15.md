@@ -8,8 +8,9 @@
 
 - Candidate: `Fluke8845A_Essentials_6_12_7_Windows_x64.zip`, built on Windows 11 x64 with CPython 3.12.10.
 - Qt/PySide runtime: Qt 6.12.0, `PySide6-Essentials` 6.12.0, and `shiboken6` 6.12.0.
-- The rebuilt ZIP contains 248 files. The [Qt/PySide inventory](windows-qt-runtime-inventory-2026-10-15.csv) records 59 binding, library, plugin, and Shiboken files with sizes, PE versions where present, and SHA-256 hashes.
+- The rebuilt ZIP contains 277 files. The [Qt/PySide inventory](windows-qt-runtime-inventory-2026-10-15.csv) records 59 binding, library, plugin, and Shiboken files with sizes, PE versions where present, and SHA-256 hashes.
 - The frozen desktop executable SHA-256 is `B4D83AF40B85B6E5B0B5C60582F488BFEB8279FEADCEE6A868D485497608C1B7` (also recorded in the six-mode Mock report).
+- The ZIP includes a generated runtime license manifest with 25 file records for CPython 3.12.10, NumPy 2.5.4 (including its OpenBLAS/LAPACK/GCC notices), pyqtgraph 0.14.0, pySerial 3.5, OpenSSL 3.0.16, and the Nuitka 4.1.1 runtime exception/notice. It records package versions, archive-relative paths, byte counts, and SHA-256 values; the package verifier checks each archived license file against the manifest.
 
 ### Qt components
 
@@ -24,9 +25,10 @@ The frozen package passed the bounded Mock desktop startup, serial-port enumerat
 ### Remaining release gates
 
 - This is a candidate audit, not legal advice or approval to distribute the binary.
-- The package's CPython, NumPy/OpenBLAS, OpenSSL, Nuitka runtime, and Microsoft Visual C++ files still need a complete, exact third-party notice set. Their licenses and redistribution terms are distinct from Qt's.
+- The copied license texts cover the listed CPython, NumPy/OpenBLAS, pyqtgraph, pySerial, OpenSSL, and Nuitka runtime materials. The complete mapping of every bundled native component still needs final review, especially the Microsoft Visual C++ DLL source and applicable redistribution terms.
+- Qt/PySide module and embedded third-party attribution must be reconciled against this exact bundle.
 - The Qt/PySide replacement and relaunch instructions have not been exercised with a modified/relinked library against this exact ZIP.
-- The official Qt and PySide source archives are available at the version-matched links and hashes in the source register, but this project has not yet published a durable, release-specific source offer for binary recipients.
+- The official Qt and PySide source archives are identified in the source register, but wheel patches/provenance still need confirmation and a durable, release-specific source offer for binary recipients has not been published.
 
 Until those items are closed, the GitHub workflow continues to publish source-only Releases and GHCR packages; it does not attach the Windows ZIP.
 
@@ -44,8 +46,9 @@ Until those items are closed, the GitHub workflow continues to publish source-on
 
 - 候选包：`Fluke8845A_Essentials_6_12_7_Windows_x64.zip`，Windows 11 x64、CPython 3.12.10 构建。
 - Qt/PySide 运行时：Qt 6.12.0、`PySide6-Essentials` 6.12.0、`shiboken6` 6.12.0。
-- 重新生成的 ZIP 共 248 个文件。[Qt/PySide 组件清单](windows-qt-runtime-inventory-2026-10-15.csv)记录了 59 个绑定、库、插件和 Shiboken 文件，并包含文件大小、可读取的 PE 版本及 SHA-256。
+- 重新生成的 ZIP 共 277 个文件。[Qt/PySide 组件清单](windows-qt-runtime-inventory-2026-10-15.csv)记录了 59 个绑定、库、插件和 Shiboken 文件，并包含文件大小、可读取的 PE 版本及 SHA-256。
 - 冻结桌面 EXE 的 SHA-256：`B4D83AF40B85B6E5B0B5C60582F488BFEB8279FEADCEE6A868D485497608C1B7`（六模式 Mock 报告中也记录了此值）。
+- ZIP 内含生成的运行时许可清单，共 25 条文件记录，涉及 CPython 3.12.10、NumPy 2.5.4（含 OpenBLAS/LAPACK/GCC 声明）、pyqtgraph 0.14.0、pySerial 3.5、OpenSSL 3.0.16 和 Nuitka 4.1.1 运行库例外/声明。清单记录包版本、相对包内路径、文件大小和 SHA-256；打包校验器会逐项核对归档中的实际内容。
 
 ### Qt 组件
 
@@ -60,8 +63,9 @@ Qt 6.12.0 和 PySide6/Shiboken 6.12.0 的源码版本与组件清单匹配。官
 ### 仍未关闭的发布门槛
 
 - 本文件是候选包审查记录，不构成法律意见或二进制发布批准。
-- 包中的 CPython、NumPy/OpenBLAS、OpenSSL、Nuitka 运行时代码及 Microsoft Visual C++ 文件仍需补齐精确的第三方声明；其许可证和再分发条件与 Qt 不同。
+- 已为清单所列 CPython、NumPy/OpenBLAS、pyqtgraph、pySerial、OpenSSL 和 Nuitka 运行库复制许可文本。所有本机文件与许可的完整映射仍需最终核对，特别是 Microsoft Visual C++ DLL 的来源及适用再分发条款。
+- Qt/PySide 模块和嵌入式第三方组件仍需按这个确切候选包逐项核对声明。
 - 尚未使用修改或重新链接过的库，在此确切 ZIP 上完成 Qt/PySide 替换和重启验证。
-- 官方 Qt 和 PySide 对应源码包及 SHA-256 已在源码登记表列出，但项目尚未为二进制接收者发布稳定、针对具体版本的源码交付要约。
+- Qt 和 PySide 官方源码包已在登记表列出，但仍需确认 wheel 的补丁/来源，并为二进制接收者提供稳定、对应版本的源码交付要约。
 
 这些事项关闭之前，GitHub 工作流继续只发布源码 Release 和 GHCR 包，不附加 Windows ZIP。
