@@ -2525,20 +2525,20 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "8845A SCPI诊断", text)
 
     def _open_manual(self) -> None:
-        path = self._find_document("使用说明.md")
+        path = self._find_document("user-guide.md")
         if path.exists():
             import os
             os.startfile(str(path))
         else:
-            self.statusBar().showMessage("使用说明位于工程 docs/使用说明.md", 10000)
+            self.statusBar().showMessage("使用说明位于工程 docs/user-guide.md", 10000)
 
     def _open_license_notice(self) -> None:
-        path = self._find_document("Qt_许可与第三方声明.md")
+        path = self._find_document("qt-licensing-and-third-party-notices.md")
         if path.exists():
             import os
             os.startfile(str(path))
         else:
-            self.statusBar().showMessage("许可说明随包位于 docs/Qt_许可与第三方声明.md", 10000)
+            self.statusBar().showMessage("许可说明随包位于 docs/qt-licensing-and-third-party-notices.md", 10000)
 
     @staticmethod
     def _find_document(filename: str) -> Path:

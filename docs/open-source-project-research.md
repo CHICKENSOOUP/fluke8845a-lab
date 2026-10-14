@@ -1,4 +1,8 @@
-# 测量软件开源项目源码与许可证调研
+# 测量软件开源项目源码与许可证调研 | Open-source Project Research
+
+[简体中文](#简体中文) | [English](#english)
+
+## 简体中文
 
 调研日期：2026-10-14
 
@@ -10,7 +14,7 @@
 | [wwd_gui_api](https://github.com/andersbandt/wwd_gui_api) | `main`，提交 `66b0d8c` | MIT（主仓库） |
 | [psc-datalogger](https://github.com/DiamondLightSource/psc-datalogger) | `1.1.0` | Apache-2.0 |
 
-本审查未复制三个项目的源码，也未连接 COM 端口 或执行这些项目的运行测试。SCPI 命令、量程、固件门槛、触发和测量限制仍以研发时参考的 Fluke 官方资料（手册未随此仓库发布）及[SCPI 技术依据](SCPI与技术依据.md)为准。
+本审查未复制三个项目的源码，也未连接 COM 端口或执行这些项目的运行测试。SCPI 命令、量程、固件门槛、触发和测量限制仍以研发时参考的 Fluke 官方资料（手册未随此仓库发布）及[SCPI 技术依据](scpi-reference.md)为准。
 
 ## 横向比较
 
@@ -95,3 +99,25 @@
 - 将连接、测量配置、实验控制、曲线和统计分层展示；常用状态（连接、模式、当前读数、实际频率、保存状态）应一直可见，把串口诊断、SCPI 日志、设备参数放到可展开区域。
 - 对设备参数采用“选择模式后只显示有效参数”的方式。连接或模式切换时回读仪器配置；不确定、超时或断线状态要显式呈现，不能显示成正常数值。
 - COM 端口 是本机串口号，不是仪器型号的一部分。启动时枚举可用端口并默认选中 COM 端口（若存在），同时允许手动修改；连接参数继续显式设置超时、8N1、流控和 CRLF。
+
+## English
+
+Research date: 2026-10-14. This review examined three public measurement/data-logging projects as architectural and licensing references. No source code was copied, and the projects were not run or connected to a COM device. Instrument commands, ranges, firmware constraints, triggering, and measurement limits remain governed by Fluke's official manuals referenced during development; those PDFs are not included here. See the [SCPI reference](scpi-reference.md).
+
+### Projects reviewed
+
+- **ETH Zurich HVL CCB**: the reviewed repository is MIT-licensed. Its separation of device service, plotting cache, and raw records offers architectural ideas. A separately maintained `EEequipment` submodule did not contain a license or a working Fluke 8845A driver; its Fluke 8842A range/mode methods were stubs. No submodule code is reused.
+- **`wwd_gui_api`**: the reviewed project uses a different device/network and GUI architecture. Its Tkinter/Dash interface, generic serial classes, and DMM methods are not drop-in replacements for this application's PySide6/pyqtgraph interface and direct 8845A serial driver. The detailed Chinese review records the frozen revision and license evidence; do not infer a submodule's rights from its parent repository license.
+- **`psc-datalogger`**: Apache-2.0 licensed, using PyQt5, worker threads, PyVISA, and a Prologix GPIB adapter for Agilent meters. Per-row CSV flushing and worker signaling are useful reference patterns, but its transport, commands, device support, and output format differ. Apache reuse requires retaining license/copyright notices, marking changes, and including applicable NOTICE material. No code was ported.
+
+These findings apply to the frozen revisions examined on the research date and are not an exhaustive audit of the projects.
+
+### Application-specific boundaries
+
+This application uses direct Windows COM serial communication through PySerial; it must not send Prologix `++help`/`++addr` commands or use a TCP socket. `*IDN?` must identify a Fluke 8845A; 8846A behavior must not be assumed. Mode, range, NPLC, AC filter, terminal, and firmware support are validated against Fluke references. Serial I/O is owned by the acquisition worker; failed attempts are stored with an empty value and explicit status. Plot downsampling must not change raw CSV records or block acquisition.
+
+The implementation maps those responsibilities to `scpi.py` (serial and SCPI), `worker.py` (acquisition thread and state), `storage.py` (CSV/config/events/logging), and `gui.py` (PySide6 UI and plotting). This research did not modify command behavior or instrument capability claims. Reuse permissions and technical correctness are separate checks.
+
+### Design takeaways
+
+Keep acquisition, timestamps, and durable writes independent of GUI refresh. Keep connection state, mode, current reading, actual rate, and save status visible; put diagnostics and advanced serial settings in an accessible secondary area. Show only settings applicable to the selected mode, and make uncertain or failed states explicit. COM is the host port name, not an instrument model. The port and serial settings must remain configurable and be verified by the operator.

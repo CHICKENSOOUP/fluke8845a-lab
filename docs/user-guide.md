@@ -1,10 +1,14 @@
-# Fluke 8845A 科研测量软件使用说明
+# Fluke 8845A Lab 使用指南 | User Guide
+
+[简体中文](#简体中文) | [English](#english)
+
+## 简体中文
 
 版本 1.0.0 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-当前交付候选可启动 `dist\Fluke8845A_QtLicenses_20261014\Fluke8845A.dist\Fluke8845A.exe`（需保留同目录全部文件），或解压 `dist\Fluke8845A_QtLicenses_20261014_Windows_x64.zip` 后运行根目录 EXE；源码包为 `dist\Fluke8845A_QtLicenses_20261014_Source_Project.zip`。当前 EXE SHA-256 为 `3CCC7543931CD4E3B083544AC9E682102EF96394DD78564F82A4B0B4D7F2EE4D`。此候选通过软件/Mock验收但**尚未真机验证**。最近 20.110 秒 RES2 短接真测绑定前一 `_6` 构建；一小时可见 GUI 长测绑定更早的 `_4` 构建。验证范围不包括准确度；完整报告见[硬件验证清单](硬件验证清单.md)。
+v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [README](../README.md) 的步骤安装并启动软件。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232 远程接口，并选择 8845A/8846A 指令集的 COMPUTER 模式。连接时本程序查询 `*IDN?`，只接受设备型号字段为 `8845A` 的 Fluke 仪器；不会重置仪器。
 - **MOCK**：勾选模拟模式后点击“启动MOCK模拟仪器”。状态栏和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
@@ -87,10 +91,50 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 ## 8. 依据、限制和状态
 
-最新冻结EXE的构建流程还会逐模式执行六种测量的Mock GUI采集和文件保存检查；带对应EXE SHA256的报告位于`output/mock_validation/latest_frozen_exe_six_mode_e2e.json`并包含在发行包中。报告标记`simulation: true`，不可作为真实8845A硬件验收记录。
+此前记录的冻结程序构建流程曾逐模式执行六种测量的 Mock GUI 采集和文件保存检查；这些记录不是当前源码快照的硬件验收结果。
 
-可追溯 SCPI 与规格请看 `docs/SCPI与技术依据.md`。硬件检查范围与当前版本的验证限制见 `docs/硬件验证清单.md`。当前源码包含 Mock 工作流；模拟结果不是真机验证。
+可追溯 SCPI 与规格请看 [SCPI 参考](scpi-reference.md)。硬件检查范围与当前版本的验证限制见[硬件验证说明](hardware-validation.md)。当前源码包含 Mock 工作流；模拟结果不是真机验证。
 
 
-本源码发布未附带预编译 Windows 二进制。测试与硬件验证的当前范围见[硬件验证清单](硬件验证清单.md)。
+本源码发布未附带预编译 Windows 二进制。测试与硬件验证的当前范围见[硬件验证说明](hardware-validation.md)。
+
+## English
+
+Version 1.0.0 is a source release and does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
+
+### 1. Connection and modes
+
+For a real meter, set the rear interface to RS-232 and select COMPUTER mode with the 8845A/8846A command set. The application queries `*IDN?`, accepts only a Fluke model identified as `8845A`, and does not reset the instrument. Mock mode exercises simulated workflows; its readings are not instrument measurements and must not be used as calibration or experimental evidence.
+
+The application scans serial ports at startup and also accepts a manually entered COM port. Defaults are 9600 baud, 8 data bits, no parity, one stop bit, no flow control, CRLF termination, and a two-second response timeout. Confirm the instrument's settings. Restore remote/COMPUTER control if the meter is in LOCAL mode. A normal disconnect attempts `SYST:LOC`.
+
+### 2. Measurement modes and safe wiring
+
+Supported modes are DCV, ACV, DCI, ACI, 2-wire resistance, and 4-wire resistance. AC readings are RMS values, not peak values or waveform samples. The application cannot inspect the circuit, test leads, terminals, or fuses. Connect voltage inputs in parallel. De-energize the circuit before resistance measurements. For current, de-energize first and connect the meter in series. Select the appropriate mA/400 mA or 10 A input, never connect both red current inputs simultaneously, and never place a current input in parallel with a voltage source. Check wiring, range, front-panel input selection, and fuses before each measurement. Software cannot identify which physical red jack contains a lead.
+
+The mA input has a 440 mA fuse and the 10 A input an 11 A fuse. The documented limit is 400 mA continuous; 550 mA is limited to two minutes followed by one minute off. Fuse ratings are not continuous operating limits. Some current ranges depend on model, firmware, or front-panel terminals; unsupported or unconfirmed ranges and autoranging are disabled.
+
+### 3. Measurement settings and speed
+
+DCV ranges are 100 mV–1000 V; ACV ranges are 100 mV–750 V. DCI ranges are 100 µA–10 A and ACI ranges 10 mA–10 A, subject to firmware and terminal conditions. Resistance ranges are 100 Ω–100 MΩ. DC voltage/current and resistance provide NPLC values 0.02, 0.2, 1, 10, and 100. AC voltage/current provide 3, 20, and 200 Hz bandwidth settings; these are filter bandwidths, not sample rates.
+
+Instrument conversion speed and the application's target interval are independent. Actual rate depends on range, auto-zero, filtering, serial settings, instrument conversion, and communication. During acquisition, a speed change applies only after instrument readback confirms it. A target interval of zero means no additional host delay, not zero instrument or serial latency.
+
+### 4. Acquisition and data files
+
+Enter an experiment name and output directory, then start a single reading or continuous acquisition. Continuous acquisition can be paused, resumed, or stopped. Stop a run before changing modes; the next run uses a separate timestamped directory.
+
+The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Timestamps are host-side: the CSV records the time before `READ?`, and `read_duration_s` records the read and range-query communication period. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
+
+Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points, while streaming statistics cover the full run.
+
+### 5. Analysis, events, and history
+
+Plots support zoom, pan, follow mode, a nearest-point cursor, time-window statistics, and PNG export. A reference can be entered, taken from the current reading, or calculated from the cached plot mean. Relative change is displayed as ΔV/V₀, ΔI/I₀, or ΔR/R₀ when the reference exceeds the configured threshold. Event notes, pause/resume actions, and reference changes are saved to `events.csv` and marked on the plot.
+
+Historical CSV loading is read-only. Matching event markers are restored where available. For files over 100,000 points, the graph uses a uniformly downsampled view while statistics scan the full source file in the background; the original CSV is unchanged.
+
+### 6. Mock and verification limits
+
+Mock mode supports six-mode simulated readings, step response/recovery, long-term drift, selected timeouts, and simulated disconnects. Check the visible MOCK indicator and `simulation: true` in `config.json`. Mock workflows are not hardware tests. See the [SCPI reference](scpi-reference.md), [hardware verification notes](hardware-validation.md), and [known limitations](known-limitations.md).
 
