@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
@@ -24,6 +25,7 @@ from .storage import ExperimentRecorder
 
 log = logging.getLogger(__name__)
 ACTUAL_RATE_WINDOW_POINTS = 21
+MAX_PENDING_GUI_ROWS = 10_000
 
 
 class MeasurementWorker(QObject):
@@ -32,8 +34,8 @@ class MeasurementWorker(QObject):
     log_line = Signal(str)
     configuration_ready = Signal(object)
     active_settings_ready = Signal(object)
-    # A small batch prevents a queued GUI update for every fast RS-232 sample.
-    sample_ready = Signal(object, float, object)
+    # A coalesced wake-up prevents the Qt event queue growing during GUI stalls.
+    sample_ready = Signal()
     experiment_started = Signal(str)
     experiment_finished = Signal(str)
     diagnostic_ready = Signal(str)
@@ -60,6 +62,11 @@ class MeasurementWorker(QObject):
         self._pending_rows: list[dict] = []
         self._last_gui_emit_ns = 0
         self._running_stats = RunningStats()
+        self._ui_mailbox_lock = Lock()
+        self._ui_pending_rows: deque[dict] = deque(maxlen=MAX_PENDING_GUI_ROWS)
+        self._ui_notification_pending = False
+        self._ui_latest_hz = 0.0
+        self._ui_latest_stats: dict = {}
 
     @property
     def state(self) -> AcquisitionState:
@@ -449,8 +456,29 @@ class MeasurementWorker(QObject):
     def _flush_ui_rows(self) -> None:
         if self._pending_rows:
             rows, self._pending_rows = self._pending_rows, []
-            self.sample_ready.emit(rows, self._actual_hz(), self._running_stats.as_dict())
+            with self._ui_mailbox_lock:
+                self._ui_pending_rows.extend(rows)
+                self._ui_latest_hz = self._actual_hz()
+                self._ui_latest_stats = self._running_stats.as_dict()
+                notify = not self._ui_notification_pending
+                if notify:
+                    self._ui_notification_pending = True
+            if notify:
+                self.sample_ready.emit()
         self._last_gui_emit_ns = time.monotonic_ns()
+
+    def take_sample_update(self) -> tuple[list[dict], float, dict]:
+        """Atomically drain the bounded display mailbox from the GUI thread.
+
+        The worker writes every attempt to disk before it reaches this mailbox.
+        If a GUI stalls, only the most recent MAX_PENDING_GUI_ROWS are retained
+        for display; the original CSV and streaming statistics remain complete.
+        """
+        with self._ui_mailbox_lock:
+            rows = list(self._ui_pending_rows)
+            self._ui_pending_rows.clear()
+            self._ui_notification_pending = False
+            return rows, self._ui_latest_hz, dict(self._ui_latest_stats)
 
     def _actual_hz(self) -> float:
         if len(self._valid_receipts_ns) < 2:

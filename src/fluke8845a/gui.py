@@ -498,7 +498,7 @@ class MainWindow(QMainWindow):
         self._worker.log_line.connect(self._append_log)
         self._worker.configuration_ready.connect(self._on_configuration)
         self._worker.active_settings_ready.connect(self._on_active_settings)
-        self._worker.sample_ready.connect(self._on_sample)
+        self._worker.sample_ready.connect(self._on_sample_ready)
         self._worker.experiment_started.connect(self._on_experiment_started)
         self._worker.experiment_finished.connect(self._on_experiment_finished)
         self._worker.diagnostic_ready.connect(self._show_diagnostic)
@@ -1999,6 +1999,11 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(self._acquiring)
         self.disconnect_button.setEnabled(self._connected and idle)
         self.connect_button.setEnabled(not self._connected)
+
+    @Slot()
+    def _on_sample_ready(self) -> None:
+        rows, rate, full_stats = self._worker.take_sample_update()
+        self._on_sample(rows, rate, full_stats)
 
     @Slot(object, float, object)
     def _on_sample(self, rows: list[dict], rate: float, full_stats: dict) -> None:

@@ -12,7 +12,7 @@ from fluke8845a.modes import Mode, descriptor
 from fluke8845a.mock import MockScenario
 from fluke8845a.scpi import ModeSettings, Serial8845A, SerialSettings
 from fluke8845a.state import AcquisitionState
-from fluke8845a.worker import MeasurementWorker
+from fluke8845a.worker import MAX_PENDING_GUI_ROWS, MeasurementWorker
 from tests.fakes import FakeTransport
 
 
@@ -35,7 +35,7 @@ def test_worker_one_shot_persists_valid_or_failed_attempt_without_fabricating_va
     worker = MeasurementWorker()
     rows_seen = []
     finished = []
-    worker.sample_ready.connect(lambda rows, _rate, _stats: rows_seen.extend(rows))
+    worker.sample_ready.connect(lambda: rows_seen.extend(worker.take_sample_update()[0]))
     worker.experiment_finished.connect(finished.append)
 
     settings = ModeSettings(Mode.DCV)
@@ -69,7 +69,7 @@ def test_worker_one_shot_records_each_mock_mode_with_correct_unit(tmp_path, mode
     settings = ModeSettings(mode)
     scenario = MockScenario(noise_fraction=0, drift_fraction_per_minute=0,
                             step_at_s=1e9, recovery_at_s=None, read_latency_s=0)
-    worker.sample_ready.connect(lambda rows, _rate, _stats: rows_seen.extend(rows))
+    worker.sample_ready.connect(lambda: rows_seen.extend(worker.take_sample_update()[0]))
     worker.experiment_finished.connect(finished.append)
     worker.connect_mock(settings, scenario)
 
@@ -115,7 +115,7 @@ def test_worker_continuous_mock_acquisition_persists_all_six_modes(tmp_path, mod
     rows_seen = []
     loop = QEventLoop()
     worker.experiment_finished.connect(lambda directory: (finished.append(directory), loop.quit()))
-    worker.sample_ready.connect(lambda rows, _rate, _stats: rows_seen.extend(rows))
+    worker.sample_ready.connect(lambda: rows_seen.extend(worker.take_sample_update()[0]))
     worker.connect_mock(settings, scenario)
 
     try:
@@ -149,6 +149,35 @@ def test_worker_continuous_mock_acquisition_persists_all_six_modes(tmp_path, mod
         assert (directory / "run.log").is_file()
     finally:
         worker.shutdown()
+
+
+def test_worker_coalesces_notifications_and_bounds_gui_mailbox():
+    worker = MeasurementWorker()
+    notifications = []
+    worker.sample_ready.connect(lambda: notifications.append("ready"))
+    worker._running_stats.add(42.0)
+
+    for start in (0, 5_000, 10_000):
+        worker._pending_rows.extend(
+            {"sample_index": index} for index in range(start, start + 5_000)
+        )
+        worker._flush_ui_rows()
+
+    assert notifications == ["ready"]
+    assert len(worker._ui_pending_rows) == MAX_PENDING_GUI_ROWS
+    assert worker._ui_notification_pending is True
+
+    rows, rate, stats = worker.take_sample_update()
+    assert [row["sample_index"] for row in rows] == list(range(10_000, 15_000))
+    assert rate == 0.0
+    assert stats["count"] == 1
+    assert worker._ui_notification_pending is False
+
+    worker._pending_rows.append({"sample_index": 15_000})
+    worker._flush_ui_rows()
+    assert notifications == ["ready", "ready"]
+    worker.take_sample_update()
+    worker.shutdown()
 
 
 def test_real_connection_reads_current_mode_without_reconfiguring_instrument(monkeypatch):

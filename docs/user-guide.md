@@ -65,7 +65,7 @@ ZERO/AUTO设置控制自动零点校正；“执行ZERO校正”会发送一次 
 
 CSV的PC本地/UTC时间和`elapsed_s`记录主机发送单次`READ?`前的时间；`read_duration_s`包括读数及量程回读的主机通信周期。仪器没有给每个读数提供本机硬件时间戳，因此转换器真实采样时刻只在一次读取周期内，不能宣称比这个窗口更精确。GUI实际频率由最近最多21个有效读数的PC单调接收时刻差计算，短实验使用现有点数；它不是目标间隔的倒数。可用每点`elapsed_s + read_duration_s`重建接收时刻核对该滚动值。每次超时/异常尝试仍占一个序号，`value_si`留空并写明状态，不伪造零值。
 
-串口、触发/读数解析、CSV写入、统计累积均在专用采集线程完成。测量数据逐点追加并刷新文件；GUI绘图按小批次刷新，最多保留最近100,000个点在内存中。长实验全程min/max/平均值/样本标准差采用流式统计，不受绘图缓存长度影响。程序退出会请求停止当前采集、关闭文件和串口并尝试恢复仪器本地控制。
+串口、触发/读数解析、CSV写入、统计累积均在专用采集线程完成。测量数据逐点追加并刷新文件；GUI绘图按小批次刷新，最多保留最近100,000个点在内存中。若GUI线程暂时卡顿，界面通知会合并，待处理显示数据最多保留最近10,000点；曲线可能跳过中间显示点，但CSV和全程统计不会因此丢失。长实验全程min/max/平均值/样本标准差采用流式统计，不受绘图缓存长度影响。程序退出会请求停止当前采集、关闭文件和串口并尝试恢复仪器本地控制。
 
 ## 5. 分析、事件与历史数据
 
@@ -132,7 +132,7 @@ Enter an experiment name and output directory, then start a single reading or co
 
 The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Timestamps are host-side: the CSV records the time before `READ?`, and `read_duration_s` records the read and range-query communication period. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
 
-Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points, while streaming statistics cover the full run.
+Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, notifications are coalesced and at most the latest 10,000 pending display points are kept; the curve may skip intermediate display points while the CSV and full-run statistics remain complete.
 
 ### 5. Analysis, events, and history
 

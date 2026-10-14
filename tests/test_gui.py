@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFrame
 from fluke8845a import gui as gui_module
 from fluke8845a.gui import MainWindow
 from fluke8845a.modes import DESCRIPTORS, Mode
+from fluke8845a.worker import MAX_PENDING_GUI_ROWS
 
 
 @pytest.fixture(scope="module")
@@ -886,9 +887,12 @@ def test_acquisition_thread_keeps_saving_while_gui_event_loop_is_stalled(qt_app,
         after = recorder.sample_count
         assert after - before >= 5
         assert (recorder.directory / "measurements.csv").stat().st_size > 200
+        assert window._worker._ui_notification_pending is True
+        assert len(window._worker._ui_pending_rows) <= MAX_PENDING_GUI_ROWS
 
         window._stop()
         assert pump_until(lambda: bool(finished) and not window._acquiring)
+        assert window._worker._ui_notification_pending is False
         directory = Path(finished[0])
         with (directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
             rows = list(csv.DictReader(stream))

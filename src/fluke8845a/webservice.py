@@ -322,8 +322,9 @@ class WebCommandRouter(QObject):
     def _on_active_settings(self, settings: dict) -> None:
         self.store.update(active_settings=dict(settings))
 
-    @Slot(object, float, object)
-    def _on_samples(self, rows: list[dict], rate: float, stats: dict) -> None:
+    @Slot()
+    def _on_samples(self) -> None:
+        rows, rate, stats = self.worker.take_sample_update()
         self.store.append_samples(rows, rate, stats)
 
     @Slot(bool, str)
