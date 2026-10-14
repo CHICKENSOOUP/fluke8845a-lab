@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import csv
 import json
+import subprocess
+import sys
+import textwrap
 import time
 from threading import Event
 from pathlib import Path
@@ -80,6 +83,87 @@ def test_minimum_window_size_does_not_clip_the_readout_or_analysis(qt_app, monke
     finally:
         window.close()
         qt_app.processEvents()
+
+
+def test_high_dpi_layout_keeps_readout_chart_and_controls_separate(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "QT_QPA_PLATFORM": "offscreen",
+        "QT_SCALE_FACTOR": "1.5",
+        "FLUKE8845A_CONFIG_DIR": str(tmp_path / "high-dpi-config"),
+    })
+    probe = textwrap.dedent(
+        """
+        import time
+        import json
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+        from fluke8845a.gui import MainWindow
+
+        app = QApplication([])
+        window = MainWindow()
+        window.resize(1280, 720)
+        window.show()
+        app.processEvents()
+        app.processEvents()
+
+        controls = (window.nplc_combo, window.apply_speed_button, window.interval_spin)
+        panel_items = []
+        for index in range(window._chart_panel_layout.count()):
+            widget = window._chart_panel_layout.itemAt(index).widget()
+            panel_items.append({
+                "name": widget.objectName() if widget is not None else "",
+                "class": widget.metaObject().className() if widget is not None else "spacer",
+                "geometry": (
+                    [widget.geometry().x(), widget.geometry().y(),
+                     widget.geometry().width(), widget.geometry().height()]
+                    if widget is not None else []
+                ),
+            })
+        snapshot = {
+            "device_pixel_ratio": window.devicePixelRatioF(),
+            "reading_labels_overlap": window.reading_mode_label.geometry().intersects(
+                window.latest_value_label.geometry()
+            ),
+            "plot_height": window.plot_widget.height(),
+            "plot_minimum_height": window.plot_widget.minimumHeight(),
+            "analysis_height": window.analysis_tabs.height(),
+            "analysis_minimum_height": window.analysis_tabs.minimumHeight(),
+            "setup_scroll_area": window.splitter.widget(0).objectName(),
+            "controls_visible": [control.isVisible() for control in controls],
+            "controls_fit": [control.height() >= control.sizeHint().height() for control in controls],
+            "panel_items": panel_items,
+            "panel_items_ordered": all(
+                current["geometry"][1] + current["geometry"][3] <= following["geometry"][1]
+                for current, following in zip(panel_items, panel_items[1:])
+            ),
+        }
+        QTimer.singleShot(0, window.close)
+        QTimer.singleShot(5000, app.quit)
+        app.exec()
+        snapshot["worker_shutdown"] = window._shutdown_finished
+        print(json.dumps(snapshot, ensure_ascii=False))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, f"high-DPI probe failed:\n{result.stdout}\n{result.stderr}"
+    snapshot = json.loads(result.stdout)
+    assert snapshot["device_pixel_ratio"] == 1.5
+    assert not snapshot["reading_labels_overlap"]
+    assert snapshot["plot_height"] >= snapshot["plot_minimum_height"]
+    assert snapshot["analysis_height"] >= snapshot["analysis_minimum_height"]
+    assert snapshot["setup_scroll_area"] == "setupScrollArea"
+    assert all(snapshot["controls_visible"])
+    assert all(snapshot["controls_fit"])
+    assert snapshot["panel_items_ordered"], snapshot["panel_items"]
+    assert snapshot["worker_shutdown"]
 
 
 def test_long_run_plot_cache_is_bounded_without_truncating_global_stats(qt_app, monkeypatch, tmp_path):

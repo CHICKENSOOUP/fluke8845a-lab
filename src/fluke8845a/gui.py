@@ -944,6 +944,7 @@ class MainWindow(QMainWindow):
         self._reading_layout = reading_layout
         self._metrics_layout = metrics_row
         self._reading_layout_mode = None
+        self._short_chart_layout = None
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
@@ -1162,10 +1163,13 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_reading_layout"):
             return
         workspace_width = self.measurement_workspace.width()
+        workspace_height = self.measurement_workspace.height()
         mode = "stacked" if workspace_width < 620 else "compact" if workspace_width < 820 else "wide"
-        if mode == self._reading_layout_mode:
+        short_chart = workspace_height < 620
+        if mode == self._reading_layout_mode and short_chart == self._short_chart_layout:
             return
         self._reading_layout_mode = mode
+        self._short_chart_layout = short_chart
         narrow = mode != "wide"
         self._reading_layout.setSpacing(12 if narrow else 20)
         self._metrics_layout.setSpacing(4 if narrow else 6)
@@ -1182,15 +1186,16 @@ class MainWindow(QMainWindow):
         else:
             self._reading_layout.setContentsMargins(18, 14, 18, 14)
         self._reading_text_layout.setSpacing(1 if stacked else 3)
-        self._chart_panel_layout.setSpacing(4 if stacked else 10)
-        if stacked:
+        self._chart_panel_layout.setSpacing(4 if stacked or short_chart else 10)
+        if stacked or short_chart:
             self._action_layout.setContentsMargins(10, 4, 10, 4)
         else:
             self._action_layout.setContentsMargins(10, 7, 10, 7)
-        self.plot_widget.setMinimumHeight(175 if stacked else 230)
-        self._plot_frame.setMinimumHeight(177 if stacked else 232)
-        self.analysis_tabs.setMinimumHeight(96 if stacked else 122)
-        self.analysis_tabs.setMaximumHeight(136 if stacked else 168)
+        compact_chart = stacked or short_chart
+        self.plot_widget.setMinimumHeight(175 if compact_chart else 230)
+        self._plot_frame.setMinimumHeight(177 if compact_chart else 232)
+        self.analysis_tabs.setMinimumHeight(96 if compact_chart else 122)
+        self.analysis_tabs.setMaximumHeight(136 if compact_chart else 168)
         self._reading_card.style().unpolish(self._reading_card)
         self._reading_card.style().polish(self._reading_card)
         self._reading_card.updateGeometry()
