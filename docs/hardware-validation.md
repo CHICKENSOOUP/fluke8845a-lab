@@ -9,7 +9,7 @@
 ### 当前源码版本
 
 - 当前代码提供六种模式的 Mock 流程，可在无仪器情况下体验 GUI 采集与保存。
-- 项目记录中有 198 项测试通过，以及 Windows 候选程序的 Mock 检查结果。这些是此前记录，并非本次 GitHub 发布准备期间重新运行的测试。
+- 源码提交 `88d40d8` 的 207 项 pytest 在本机 8.79 秒通过；对应 GitHub Actions 发布工作流也通过，且 pytest 步骤设置了 60 秒上限。这些是软件自动化/Mock 检查，不是仪器准确度或真机兼容性验证。
 - Qt 许可审查候选程序尚未连接真实仪器验证。早期版本的真机检查不能作为当前源码快照的验证证据。
 
 ### 限制
@@ -25,7 +25,7 @@ This file summarizes the scope of verification without publishing workstation id
 ## Current source release
 
 - The current code has a six-mode Mock workflow for exercising GUI acquisition and file saving without an instrument.
-- Project notes record a 198-test suite and frozen-app Mock checks on the Windows candidate. These are previously recorded results, not tests run for this GitHub release preparation.
+- Source commit `88d40d8` passed 207 pytest tests locally in 8.79 seconds, and the corresponding GitHub Actions release workflow passed with a 60-second test-step limit. These are software automation/Mock checks, not meter-accuracy or real-hardware validation.
 - The Qt licensing candidate has not been verified against a real instrument. Earlier real-instrument checks apply to older builds and are not evidence for this source snapshot.
 
 ## Limits
