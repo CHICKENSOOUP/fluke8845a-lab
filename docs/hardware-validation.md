@@ -8,10 +8,10 @@
 
 ### 当前源码与软件包验证
 
-- 当前源码提交：`4b5144490bb5f1125b82e840ea1fdbc8941abb1c`。新增的长运行回归测试向 GUI 输入 110,000 个模拟读数，确认绘图缓存只保留最近 100,000 点，同时全程统计仍计入全部样本。
-- [GitHub Actions 运行 38644381286](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38644381286) 在 Windows 上通过完整 pytest：Python 3.11 为 225 项、12.01 秒；Python 3.12 为 225 项、12.60 秒。两个 pytest 步骤各自设置 60 秒超时。源码 ZIP 构建与校验、GHCR Package 发布和 GitHub Release 发布也均成功。
-- [提交对应的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-4b5144490bb5) 附有 `Fluke8845A_Source_Project.zip`，GitHub 记录的 ZIP SHA-256 为 `4683a358412b17986e53368fc9971ad8cfacbf315ca3a850c569ac347feb6e4c`，另附 `SHA256SUMS.txt`。
-- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-4b5144490bb5`，推送摘要为 `sha256:5eeb84d490f2715c9af04b1a83b1f3808eb53bc1b08aa017c0e996b98d589b9d`。
+- 当前应用源码提交：`1d4889eec7071672555b6419febce6676b556433`。本次加入 150% 缩放、1280×720 窗口的布局回归检查；长运行回归也覆盖 110,000 个模拟读数，确认绘图缓存只保留最近 100,000 点，同时全程统计仍计入全部样本。
+- [GitHub Actions 运行 38646706325](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38646706325) 在 Windows 上通过完整 pytest：Python 3.11 为 226 项、18.02 秒；Python 3.12 为 226 项、12.80 秒。两个 pytest 步骤各自设置 60 秒超时。源码 ZIP 构建与校验、GHCR Package 发布和 GitHub Release 发布也均成功。
+- [提交对应的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-1d4889eec707) 附有 `Fluke8845A_Source_Project.zip`，GitHub 记录的 ZIP SHA-256 为 `10a4eae0a2512920dc6baa60524ad25488df9241404b2589c1d5bf648eba15b8`，另附 `SHA256SUMS.txt`。
+- 同一提交的公开 GHCR 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-1d4889eec707`，推送摘要为 `sha256:f809c256d158bae61da327811b00ecaa5636cd1b4e356c0f7ffdefa12ac3dd10`。
 - Actions 的源码包构建/校验成功不等于在新 Windows 环境完成解压冷启动。本记录不把早期提交的启动验证外推到这个提交。
 
 ### 真机验证与发布限制
@@ -28,10 +28,10 @@ This record reports only evidence that was obtained. It does not publish worksta
 
 ### Current source and package checks
 
-- Current source commit: `4b5144490bb5f1125b82e840ea1fdbc8941abb1c`. The long-run regression test feeds 110,000 simulated readings into the GUI and verifies that the plot cache retains only the newest 100,000 points while full-run statistics still include every sample.
-- [GitHub Actions run 38644381286](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38644381286) passed the full pytest suite on Windows: 225 cases in 12.01 seconds on Python 3.11 and 225 cases in 12.60 seconds on Python 3.12. Each pytest step has a 60-second timeout. Source ZIP build and verification, GHCR Package publication, and GitHub Release publication also succeeded.
-- The [commit-specific Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-4b5144490bb5) contains `Fluke8845A_Source_Project.zip`. GitHub reports its SHA-256 as `4683a358412b17986e53368fc9971ad8cfacbf315ca3a850c569ac347feb6e4c`; `SHA256SUMS.txt` is attached as well.
-- The public GHCR package for the same commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-4b5144490bb5`, with push digest `sha256:5eeb84d490f2715c9af04b1a83b1f3808eb53bc1b08aa017c0e996b98d589b9d`.
+- Current application source commit: `1d4889eec7071672555b6419febce6676b556433`. This change adds a high-DPI layout regression check at 150% scaling and a 1280×720 window; the long-run regression also feeds 110,000 simulated readings and verifies that the plot cache retains only the latest 100,000 while full-run statistics include every sample.
+- [GitHub Actions run 38646706325](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38646706325) passed the full pytest suite on Windows: 226 cases in 18.02 seconds on Python 3.11 and 226 cases in 12.80 seconds on Python 3.12. Each pytest step has a 60-second timeout. Source ZIP build and verification, GHCR Package publication, and GitHub Release publication also succeeded.
+- The [commit-specific Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-1d4889eec707) contains `Fluke8845A_Source_Project.zip`. GitHub reports its SHA-256 as `10a4eae0a2512920dc6baa60524ad25488df9241404b2589c1d5bf648eba15b8`; `SHA256SUMS.txt` is attached as well.
+- The public GHCR package for the same commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-1d4889eec707`, with push digest `sha256:f809c256d158bae61da327811b00ecaa5636cd1b4e356c0f7ffdefa12ac3dd10`.
 - Successful source-package build and verification in Actions do not establish a fresh Windows extraction/startup check. This record does not extend an earlier commit's startup evidence to this commit.
 
 ### Hardware validation and release limits
