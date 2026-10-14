@@ -12,7 +12,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
 VENV_PYTHON = VENV / "Scripts" / "python.exe"
-RUNTIME_IMPORT_CHECK = "import numpy, PySide6, serial, pyqtgraph"
+RUNTIME_IMPORT_CHECK = (
+    "import numpy, PySide6.QtCore, PySide6.QtGui, PySide6.QtWidgets, serial, pyqtgraph"
+)
 APP_MODULES = {
     "desktop": "fluke8845a",
     "web": "fluke8845a.webapp",

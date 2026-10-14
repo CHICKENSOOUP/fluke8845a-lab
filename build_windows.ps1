@@ -160,9 +160,7 @@ try {
         "--windows-icon-from-ico=$PSScriptRoot\assets\fluke8845a_app_icon_v3.ico" `
         --include-data-dir=docs=docs `
         --include-data-dir=assets=assets `
-        --include-package=serial `
-        --include-module=PySide6.QtOpenGL `
-        --include-module=PySide6.QtOpenGLWidgets
+        --include-package=serial
     if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed." }
 
     $webEntryPoint = Join-Path $PSScriptRoot "Fluke8845A_Web.py"

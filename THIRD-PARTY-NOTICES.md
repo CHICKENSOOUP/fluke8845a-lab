@@ -18,7 +18,7 @@
 
 ### 其他依赖
 
-项目直接依赖 NumPy、PySide6、pyserial 和 pyqtgraph。请核对构建所安装的精确版本随附的许可证元数据和文件。完整的二进制构建清单还必须包括传递依赖和本机库，不能只列出直接 Python 依赖。
+项目直接依赖 NumPy、PySide6-Essentials、pyserial 和 pyqtgraph。`PySide6-Essentials` 提供 `PySide6` 导入命名空间；源码版不安装完整 PySide6 元包，因此不会由项目依赖额外拉入 Qt PDF 或 Qt WebEngine。请核对构建所安装的精确版本随附的许可证元数据和文件。完整的二进制构建清单还必须包括传递依赖和本机库，不能只列出直接 Python 依赖。
 
 ## English
 
@@ -36,4 +36,4 @@ When a Windows binary is published, its release package must include the applica
 
 ## Other dependencies
 
-The project directly depends on NumPy, PySide6, pyserial, and pyqtgraph. Refer to the license metadata and license files distributed by the exact versions installed for a build. A complete binary-build inventory must include transitive dependencies and native libraries, not only these direct Python packages.
+The project directly depends on NumPy, PySide6-Essentials, pyserial, and pyqtgraph. `PySide6-Essentials` supplies the `PySide6` import namespace; the source release does not install the full PySide6 meta-package, so Qt PDF and Qt WebEngine are not pulled in by the project dependency. Refer to the license metadata and license files distributed by the exact versions installed for a build. A complete binary-build inventory must include transitive dependencies and native libraries, not only these direct Python packages.
