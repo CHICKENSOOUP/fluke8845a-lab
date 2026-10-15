@@ -795,6 +795,63 @@ def test_sampling_interval_preference_persists_across_window_restarts(qt_app, mo
         qt_app.processEvents()
 
 
+def test_initialize_parameters_restores_mode_defaults_without_resetting_instrument(
+    qt_app, monkeypatch, tmp_path
+):
+    config_dir = tmp_path / "app-config"
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(
+        gui_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: gui_module.QMessageBox.StandardButton.Yes,
+    )
+    window = MainWindow()
+    configure_requests = []
+    window._bridge.configure.connect(configure_requests.append)
+    output_directory = tmp_path / "experiment-output"
+    window.output_root.setText(str(output_directory))
+    window.baud_combo.setCurrentText("115200")
+    window.interval_spin.setValue(2.75)
+    window._simulation = True
+    for mode in Mode:
+        profile = window._profiles[mode.value]
+        spec = DESCRIPTORS[mode]
+        profile.update({
+            "autorange": False,
+            "range_si": spec.ranges_si[-1],
+            "nplc": spec.nplc_values[-1] if spec.nplc_values else None,
+            "ac_bandwidth_hz": spec.ac_bandwidths_hz[-1] if spec.ac_bandwidths_hz else None,
+            "analog_filter": bool(spec.analog_filter),
+            "autozero": False,
+            "baseline": 12.5,
+        })
+    window._current_mode = Mode.DCV
+    window._load_mode_controls(Mode.DCV)
+    window._baseline = 12.5
+    window.baseline_line.show()
+    try:
+        assert window.initialize_parameters_button.isEnabled()
+        window.initialize_parameters_button.click()
+
+        for mode in Mode:
+            assert window._profiles[mode.value] == window._default_mode_profile(mode)
+        assert window.interval_spin.value() == 1.0
+        assert window.baud_combo.currentText() == "115200"
+        assert window.output_root.text() == str(output_directory)
+        assert window._baseline is None
+        assert window.baseline_edit.text() == ""
+        assert not window.baseline_line.isVisible()
+        assert configure_requests == []
+
+        saved = json.loads(window._profile_path.read_text(encoding="utf-8"))
+        assert saved["serial"]["baudrate"] == "115200"
+        assert saved["sampling_interval_s"] == 1.0
+        assert all(saved[mode.value] == window._default_mode_profile(mode) for mode in Mode)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 @pytest.mark.parametrize(
     ("firmware", "terminals", "stored_range", "unsupported_ranges"),
     [

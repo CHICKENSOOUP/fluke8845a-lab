@@ -825,6 +825,13 @@ class MainWindow(QMainWindow):
         self.apply_button = QPushButton("应用仪器参数")
         self.apply_button.setObjectName("primaryButton")
         self.apply_button.clicked.connect(self._apply_settings)
+        self.initialize_parameters_button = QPushButton("初始化参数")
+        self.initialize_parameters_button.setObjectName("secondaryButton")
+        self.initialize_parameters_button.setToolTip(
+            "将六种测量模式及软件采样间隔恢复到默认值。不会更改串口设置、保存目录，"
+            "也不会向仪表发送复位命令；当前模式要写入仪表时，再点“应用仪器参数”。"
+        )
+        self.initialize_parameters_button.clicked.connect(self._initialize_parameters)
         self.apply_speed_button = QPushButton("应用采集速度")
         self.apply_speed_button.setObjectName("secondaryButton")
         self.apply_speed_button.setToolTip(
@@ -832,7 +839,11 @@ class MainWindow(QMainWindow):
             "不会更改测量模式、量程、滤波或接线端子。"
         )
         self.apply_speed_button.clicked.connect(self._apply_acquisition_speed)
-        mode_form.addRow("", self.apply_button)
+        parameter_actions = QHBoxLayout()
+        parameter_actions.setSpacing(6)
+        parameter_actions.addWidget(self.apply_button, 1)
+        parameter_actions.addWidget(self.initialize_parameters_button)
+        mode_form.addRow("", parameter_actions)
         mode_form.addRow("仪器速度", self.apply_speed_button)
         self.zero_button = QPushButton("执行 ZERO 校正")
         self.zero_button.setObjectName("secondaryButton")
@@ -1456,13 +1467,23 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError):
                 log.exception("无法读取配置文件")
         for mode, spec in DESCRIPTORS.items():
-            default = {"autorange": True, "range_si": spec.ranges_si[0],
-                       "nplc": 1 if spec.nplc_values else None,
-                       "ac_bandwidth_hz": 20 if spec.ac_bandwidths_hz else None,
-                       "analog_filter": False, "autozero": True, "baseline": None}
+            default = self._default_mode_profile(mode)
             default.update(profiles.get(mode.value, {}))
             profiles[mode.value] = default
         return profiles
+
+    @staticmethod
+    def _default_mode_profile(mode: Mode) -> dict:
+        spec = descriptor(mode)
+        return {
+            "autorange": True,
+            "range_si": spec.ranges_si[0],
+            "nplc": 1 if spec.nplc_values else None,
+            "ac_bandwidth_hz": 20 if spec.ac_bandwidths_hz else None,
+            "analog_filter": False,
+            "autozero": True,
+            "baseline": None,
+        }
 
     def _save_profiles(self) -> None:
         payload = {
@@ -1917,6 +1938,34 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error(str(exc))
 
+    def _initialize_parameters(self) -> None:
+        if self._acquiring:
+            self.statusBar().showMessage("请先停止采集，再初始化参数。", 5000)
+            return
+        answer = QMessageBox.question(
+            self,
+            "初始化测量参数",
+            "将六种测量模式恢复为默认参数：自动量程、默认积分时间/交流带宽、关闭模拟滤波、启用自动零点并清除模式基准；"
+            "软件目标采样间隔设为 1 秒。\n\n"
+            "串口设置和保存目录会保留。此操作只改软件配置，不会复位仪表；若要让当前模式生效，请随后点击“应用仪器参数”。\n\n"
+            "确定初始化吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        for mode in Mode:
+            self._profiles[mode.value] = self._default_mode_profile(mode)
+        self._profiles["sampling_interval_s"] = 1.0
+        self.interval_spin.setValue(1.0)
+        self._load_mode_controls(self._current_mode)
+        self.baseline_line.hide()
+        self.change_label.setText("未设置基准值")
+        self._save_profiles()
+        self._update_readout_context()
+        self.statusBar().showMessage("软件测量参数已初始化；需要时请点击“应用仪器参数”写入仪表。", 10000)
+
     def _apply_acquisition_speed(self) -> None:
         if not self._connected or not self._acquiring:
             self._show_error("请先连接仪器并开始连续采集；运行中或暂停时可应用速度")
@@ -2120,6 +2169,7 @@ class MainWindow(QMainWindow):
         # Interval remains editable during acquisition and is applied by the worker immediately.
         self.interval_spin.setEnabled(True)
         self.apply_button.setEnabled(idle and self._connected)
+        self.initialize_parameters_button.setEnabled(idle)
         self.apply_speed_button.setEnabled(
             self._acquiring and self._connected and not self._speed_update_pending
             and bool(spec.nplc_values or spec.ac_bandwidths_hz)

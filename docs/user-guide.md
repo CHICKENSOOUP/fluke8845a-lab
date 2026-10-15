@@ -51,6 +51,8 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 **仪器测量速度和软件采样间隔是两项独立设置。** 直流电压/电流及电阻模式通过NPLC控制积分时间：0.02 NPLC通常转换较快，100 NPLC积分时间较长、通常更有利于抑制工频噪声；交流电压/电流模式使用3/20/200 Hz带宽档，200 Hz档响应较快。速度参数会按模式保存。停止采集时点击“应用仪器参数”写入仪器，开始实验时也会自动写入；连续采集或暂停时可修改NPLC/交流带宽，再点“应用采集速度”。仪表回读确认后从下一读数起生效，修改时间及生效样本写入配置和事件文件，CSV每行记录当时生效的NPLC/带宽。采集中的实时调速仅会改NPLC或交流带宽，不改变测量模式、量程、滤波或零点校正。软件目标采样间隔可单独设定，并能在连续采集中即时修改；实际Hz由有效读数时间戳计算。最低NPLC或最快带宽不保证某个固定Hz，实际速度还受量程、自动零点、滤波、仪器转换及串口通信影响。
 
+“初始化参数”会将六种测量模式恢复为软件默认设置，并把目标采样间隔设为1秒；会清除各模式保存的基准值，但保留串口通信设置和当前保存目录。它只更改软件配置，不会向仪器发送复位或配置命令；若需把当前模式参数写入已连接的仪器，请随后单独点击“应用仪器参数”。采集时须先停止才能初始化。
+
 采集中调整速度下拉框只修改“所选值”，不会立即改变仪表。读数卡会分别显示仪表已回读生效的参数和“待应用”值；点击“应用采集速度”且仪表回读成功后，新速度才从下一读数起生效。若应用失败，采集会安全停止并保留失败记录，不会把所选值误记为仪表当前值。
 
 桌面主窗口以单张曲线和当前读数/采集状态为主。点击右下角状态栏的“设置与分析…”打开独立窗口：“连接与采集”页含串口、测量模式、仪器速度、实验目录和目标间隔；“分析与事件”页含统计、基准、局部区间和事件。完整SCPI通信日志可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
@@ -125,6 +127,8 @@ The mA input has a 440 mA fuse and the 10 A input an 11 A fuse. The documented l
 DCV ranges are 100 mV–1000 V; ACV ranges are 100 mV–750 V. DCI ranges are 100 µA–10 A and ACI ranges 10 mA–10 A, subject to firmware and terminal conditions. Resistance ranges are 100 Ω–100 MΩ. DC voltage/current and resistance provide NPLC values 0.02, 0.2, 1, 10, and 100. AC voltage/current provide 3, 20, and 200 Hz bandwidth settings; these are filter bandwidths, not sample rates.
 
 Instrument conversion speed and the application's target interval are independent. Actual rate depends on range, auto-zero, filtering, serial settings, instrument conversion, and communication. During acquisition, a speed change applies only after instrument readback confirms it. A target interval of zero means no additional host delay, not zero instrument or serial latency.
+
+**Initialize parameters** restores the software defaults for all six measurement modes, clears their saved baselines, and sets the target interval to one second. It preserves serial communication settings and the current output directory. The button changes software preferences only; it does not reset or configure the instrument. Stop acquisition before initializing. To apply the selected mode to a connected meter, click **Apply instrument parameters** separately.
 
 ### 4. Acquisition and data files
 
