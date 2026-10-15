@@ -94,20 +94,42 @@ try {
     & $python (Join-Path $PSScriptRoot "scripts\create_app_icon_ico.py")
     if ($LASTEXITCODE -ne 0) { throw "Application icon generation failed." }
 
-    $pytestTemp = Join-Path $PSScriptRoot ("build\pytest_temp_" + [guid]::NewGuid().ToString("N"))
-    $pytestProcess = Start-Process -FilePath $python -ArgumentList @(
-        "-m", "pytest", "-p", "no:cacheprovider", "--basetemp", $pytestTemp
-    ) -PassThru -NoNewWindow
-    try {
-        Wait-Process -Id $pytestProcess.Id -Timeout 55 -ErrorAction Stop | Out-Null
-    } catch {
-        if (Get-Process -Id $pytestProcess.Id -ErrorAction SilentlyContinue) {
-            Stop-Process -Id $pytestProcess.Id -Force
+    $pytestRunId = [guid]::NewGuid().ToString("N")
+    $pytestTemp = Join-Path $PSScriptRoot ("build\pytest_temp_" + $pytestRunId)
+    $pytestStdoutPath = Join-Path $PSScriptRoot ("build\pytest_build_" + $pytestRunId + ".stdout.log")
+    $pytestStderrPath = Join-Path $PSScriptRoot ("build\pytest_build_" + $pytestRunId + ".stderr.log")
+    $pytestStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pytestStartInfo.FileName = $python
+    $pytestStartInfo.Arguments = '-m pytest -p no:cacheprovider --basetemp "{0}"' -f $pytestTemp
+    $pytestStartInfo.WorkingDirectory = $PSScriptRoot
+    $pytestStartInfo.UseShellExecute = $false
+    $pytestStartInfo.CreateNoWindow = $true
+    $pytestStartInfo.RedirectStandardOutput = $true
+    $pytestStartInfo.RedirectStandardError = $true
+    $pytestProcess = New-Object System.Diagnostics.Process
+    $pytestProcess.StartInfo = $pytestStartInfo
+    [void]$pytestProcess.Start()
+    $pytestStdoutTask = $pytestProcess.StandardOutput.ReadToEndAsync()
+    $pytestStderrTask = $pytestProcess.StandardError.ReadToEndAsync()
+    $pytestTimedOut = -not $pytestProcess.WaitForExit(50000)
+    if ($pytestTimedOut) {
+        & taskkill.exe /PID $pytestProcess.Id /T /F *> $null
+        if (-not $pytestProcess.WaitForExit(3000)) {
+            try { $pytestProcess.Kill() } catch { }
+            [void]$pytestProcess.WaitForExit(1000)
         }
-        throw "pytest exceeded the 55-second limit; EXE packaging stopped."
     }
-    $pytestProcess.Refresh()
-    if ($pytestProcess.ExitCode -ne 0) { throw "pytest failed; EXE packaging stopped." }
+    $pytestStdout = $pytestStdoutTask.GetAwaiter().GetResult()
+    $pytestStderr = $pytestStderrTask.GetAwaiter().GetResult()
+    Set-Content -LiteralPath $pytestStdoutPath -Value $pytestStdout -Encoding utf8
+    Set-Content -LiteralPath $pytestStderrPath -Value $pytestStderr -Encoding utf8
+    Write-Output $pytestStdout
+    Write-Output $pytestStderr
+    if ($pytestTimedOut) { throw "pytest exceeded the 50-second limit; EXE packaging stopped." }
+    if (-not $pytestProcess.HasExited) { throw "pytest did not exit after the bounded stop attempt; EXE packaging stopped." }
+    if ($pytestProcess.ExitCode -ne 0) {
+        throw "pytest failed with exit code $($pytestProcess.ExitCode); EXE packaging stopped."
+    }
     $env:NUITKA_CACHE_DIR = $nuitkaCacheDirectory
     & $python -m nuitka --version
     if ($LASTEXITCODE -ne 0) { throw 'Install build dependencies with: python -m pip install -e ".[dev,build]"' }
