@@ -717,11 +717,11 @@ def test_sampling_interval_preference_persists_across_window_restarts(qt_app, mo
 @pytest.mark.parametrize(
     ("firmware", "terminals", "stored_range", "unsupported_ranges"),
     [
-        ("1.0.0", "FRON", 0.4, (0.4,)),
+        ("1.0", "FRON", 0.4, (0.4,)),
         ("2.0", "REAR", 1.0, (1.0, 3.0, 10.0)),
     ],
 )
-def test_unverified_current_autorange_and_ranges_are_disabled_in_gui(
+def test_known_unsupported_current_autorange_and_ranges_are_disabled_in_gui(
     qt_app, monkeypatch, tmp_path, firmware, terminals, stored_range, unsupported_ranges
 ):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
@@ -743,6 +743,28 @@ def test_unverified_current_autorange_and_ranges_are_disabled_in_gui(
             index = window.range_combo.findData(value)
             assert index >= 0
             assert not window.range_combo.model().item(index).isEnabled()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_date_coded_idn_firmware_keeps_400ma_and_autorange_available_in_gui(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._simulation = False
+        window._firmware = "02/14/08-08:54"
+        window._terminals = "FRONT"
+        window._current_mode = Mode.DCI
+        window._profiles[Mode.DCI.value].update({"autorange": True, "range_si": 0.4})
+
+        window._load_mode_controls(Mode.DCI)
+
+        assert window.autorange_check.isEnabled()
+        assert window.autorange_check.isChecked()
+        index = window.range_combo.findData(0.4)
+        assert index >= 0
+        assert window.range_combo.model().item(index).isEnabled()
     finally:
         window.close()
         qt_app.processEvents()

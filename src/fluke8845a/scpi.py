@@ -336,24 +336,27 @@ FRONT_ONLY_CURRENT_RANGES = (1.0, 3.0, 10.0)
 
 
 def current_autorange_block_reason(mode: Mode, firmware: str, terminals: str | None) -> str | None:
-    """Explain why current autorange must be blocked for unverified 8845A capabilities."""
+    """Explain why current autorange must be blocked for known unsupported capabilities."""
     minimum = CURRENT_RANGE_FIRMWARE_MINIMUM.get(mode)
     if minimum is None:
         return None
-    if compare_firmware(firmware, minimum) is not True:
-        return "固件版本未确认支持400 mA；自动量程可能进入该档"
+    # Some 8845A units return a date-coded *IDN? field rather than a semantic
+    # software version. An unparseable version is not evidence that 400 mA is
+    # unsupported; only an explicitly older version blocks the range.
+    if compare_firmware(firmware, minimum) is False:
+        return "固件版本低于400 mA档要求"
     if not (terminals or "").strip().upper().startswith("FRON"):
         return "当前输入端子未确认是前面板；自动量程可能进入仅前面板支持的1/3/10 A档"
     return None
 
 
 def unsupported_current_ranges(mode: Mode, firmware: str, terminals: str | None) -> tuple[float, ...]:
-    """Return current ranges that cannot be safely selected from known 8845A state."""
+    """Return current ranges explicitly unsupported by known 8845A state."""
     minimum = CURRENT_RANGE_FIRMWARE_MINIMUM.get(mode)
     if minimum is None:
         return ()
     unsupported: set[float] = set()
-    if compare_firmware(firmware, minimum) is not True:
+    if compare_firmware(firmware, minimum) is False:
         unsupported.add(0.4)
     if not (terminals or "").strip().upper().startswith("FRON"):
         unsupported.update(FRONT_ONLY_CURRENT_RANGES)
@@ -609,11 +612,8 @@ class Serial8845A:
                 )
         if not settings.autorange and settings.range_si in unsupported:
             if settings.range_si == 0.4:
-                minimum = CURRENT_RANGE_FIRMWARE_MINIMUM[settings.mode]
                 need = "2.0" if settings.mode == Mode.DCI else "1.0.700.18"
-                supported = compare_firmware(self.info.firmware, minimum)
-                reason = "无法识别固件版本" if supported is None else f"固件低于{need}"
-                detail = f"400 mA档要求软件版本至少{need}；{reason}"
+                detail = f"仪器回报的软件版本低于400 mA档要求的{need}"
             else:
                 detail = "1 A、3 A和10 A量程仅在前面板电流端子支持"
             raise UnsupportedRange(f"8845A {spec.label}：{detail}，为避免无效/危险配置已拒绝。")

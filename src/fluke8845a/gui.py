@@ -1668,7 +1668,7 @@ class MainWindow(QMainWindow):
                 item = self.range_combo.model().item(i)
                 if item is not None:
                     item.setEnabled(False)
-                    item.setToolTip("固件版本或当前输入端子未确认支持此档；不会向仪器发送该量程。")
+                    item.setToolTip("仪器回报的固件版本低于门槛或当前输入端子不支持此档；不会向仪器发送该量程。")
         idx = self.range_combo.findData(stored.get("range_si"))
         selected_item = self.range_combo.model().item(idx) if idx > 0 else None
         if selected_item is not None and not selected_item.isEnabled():

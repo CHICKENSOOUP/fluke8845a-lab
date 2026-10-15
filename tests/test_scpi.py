@@ -495,21 +495,20 @@ def test_firmware_compare_returns_unknown_instead_of_guessing():
     assert compare_firmware("1.0.700.18", (2, 0)) is False
 
 
-def test_date_coded_real_firmware_does_not_enable_400ma_range():
-    transport = FakeTransport("FLUKE,8845A,1234567,1.0.0")
+def test_date_coded_idn_firmware_does_not_block_400ma_range():
+    transport = FakeTransport("FLUKE,8845A,1234567,02/14/08-08:54")
     instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
     instrument.connect()
-    with pytest.raises(UnsupportedRange, match="无法识别固件版本"):
-        instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.4))
-    assert not any(command.endswith("RANG 0.4") for command in transport.commands)
+    instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.4))
+    assert "SENS:CURR:DC:RANG 0.4" in transport.commands
     instrument.close()
 
 
 @pytest.mark.parametrize(
     ("mode", "firmware", "terminals"),
     [
-        (Mode.DCI, "1.0.0", "FRONT"),
-        (Mode.ACI, "1.0.0", "FRONT"),
+        (Mode.DCI, "1.0", "FRONT"),
+        (Mode.ACI, "1.0.700.17", "FRONT"),
         (Mode.DCI, "2.0", "REAR"),
         (Mode.ACI, "1.0.700.18", "REAR"),
     ],
@@ -525,6 +524,15 @@ def test_current_autorange_is_rejected_when_any_auto_range_limit_is_unverified(m
 
     assert not any(command.startswith("CONF:") for command in transport.commands[before:])
     assert not any(":RANG:AUTO ON" in command for command in transport.commands[before:])
+    instrument.close()
+
+
+def test_current_autorange_allows_date_coded_idn_firmware_on_front_terminals():
+    transport = FakeTransport("FLUKE,8845A,1234567,02/14/08-08:54", terminals="FRONT")
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.configure(ModeSettings(Mode.DCI, autorange=True))
+    assert "SENS:CURR:DC:RANG:AUTO ON" in transport.commands
     instrument.close()
 
 

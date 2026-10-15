@@ -61,13 +61,13 @@ DESCRIPTORS: Final[dict[Mode, ModeDescriptor]] = {
         Mode.DCI, "直流电流 DCI", "CURR:DC", "current", "A",
         (100e-6, 1e-3, 10e-3, 100e-3, 400e-3, 1, 3, 10), NPLC_VALUES,
         analog_filter=True, wiring_group="current",
-        safety="电流测量必须串联：先关闭被测回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。400 mA 档需核实固件。",
+        safety="电流测量必须串联：先关闭被测回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。",
     ),
     Mode.ACI: ModeDescriptor(
         Mode.ACI, "交流电流 ACI · 真 RMS", "CURR:AC", "current", "A",
         (10e-3, 100e-3, 400e-3, 1, 3, 10), ac_bandwidths_hz=AC_BANDWIDTHS_HZ,
         rms=True, wiring_group="current",
-        safety="交流电流读数为仪器真 RMS 值。必须串联测量：关闭回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。400 mA 档需核实固件。",
+        safety="交流电流读数为仪器真 RMS 值。必须串联测量：关闭回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。",
     ),
     Mode.RES2: ModeDescriptor(
         Mode.RES2, "两线电阻 2W", "RES", "resistance", "Ohm",
