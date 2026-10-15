@@ -57,6 +57,24 @@ def test_gui_uses_separate_setup_tabs_and_keeps_the_plot_workspace_clear(
         qt_app.processEvents()
 
 
+def test_real_connection_displays_remote_front_panel_lock(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._on_connected(True, "已连接 · FLUKE,8845A,TEST,2.0")
+        assert "REMOTE" in window.connection_badge.text()
+        assert "除LOCAL键外" in window.connection_badge.toolTip()
+        assert "先断开软件连接" in window.connection_badge.toolTip()
+
+        window._on_status("就绪（REMOTE远程控制；除LOCAL外面板按键已禁用）")
+        assert "REMOTE" in window.statusBar().currentMessage()
+        assert "LOCAL" in window.experiment_status.toolTip()
+    finally:
+        window._on_connected(False, "未连接")
+        window.close()
+        qt_app.processEvents()
+
+
 def test_minimum_window_size_does_not_clip_the_readout_or_analysis(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()

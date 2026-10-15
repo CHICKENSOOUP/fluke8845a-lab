@@ -1498,11 +1498,17 @@ class MainWindow(QMainWindow):
         if self._simulation:
             badge_text = "MOCK 模拟模式"
         elif connected:
-            badge_text = "已连接 · Fluke 8845A"
+            badge_text = "已连接 · 8845A / REMOTE"
         else:
             badge_text = text if text and text != "未读取" else "未连接"
         self.connection_badge.setText(badge_text)
-        self.connection_badge.setToolTip(text)
+        tooltip = text
+        if connected and not self._simulation:
+            tooltip = (
+                f"{text}\nREMOTE远程控制已启用：除LOCAL键外，仪表面板按键不可用。"
+                "若需用面板改挡，请先断开软件连接；采集中不要按LOCAL。"
+            )
+        self.connection_badge.setToolTip(tooltip)
         self.connection_badge.setProperty(
             "state", "mock" if self._simulation else "connected" if connected else "disconnected"
         )

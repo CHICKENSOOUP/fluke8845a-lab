@@ -74,6 +74,11 @@ class MeasurementWorker(QObject):
         self._ui_latest_stats: dict = {}
         self._stop_requested = Event()
 
+    def _ready_status(self) -> str:
+        if self.simulation:
+            return "就绪（MOCK模拟）"
+        return "就绪（REMOTE远程控制；除LOCAL外面板按键已禁用）"
+
     @property
     def state(self) -> AcquisitionState:
         return self._machine.state
@@ -156,7 +161,7 @@ class MeasurementWorker(QObject):
             if active_settings is not None:
                 self._emit_active_settings(active_settings)
             self.connected_changed.emit(True, f"{'模拟' if use_mock else '已连接'} · {self.info.idn_raw}")
-            self.status_changed.emit("就绪（MOCK模拟）" if use_mock else "就绪")
+            self.status_changed.emit(self._ready_status())
         except Exception as exc:
             self.log_line.emit(f"! 连接失败：{exc}")
             if self.instrument is not None:
@@ -184,7 +189,7 @@ class MeasurementWorker(QObject):
             self.configuration_ready.emit({"idn": self.info.idn_raw, **actual, "simulation": self.simulation})
             self._emit_active_settings(settings)
             self.log_line.emit(f"模式切换完成：{descriptor(settings.mode).label}")
-            self.status_changed.emit("就绪（MOCK模拟）" if self.simulation else "就绪")
+            self.status_changed.emit(self._ready_status())
         except Exception as exc:
             self.log_line.emit(f"! 配置测量模式失败：{exc}")
             self.error.emit(str(exc))
@@ -600,7 +605,7 @@ class MeasurementWorker(QObject):
         if self.instrument is None or not self.instrument.connected:
             self.status_changed.emit("连接中断")
         else:
-            self.status_changed.emit("就绪（MOCK模拟）" if self.simulation else "就绪")
+            self.status_changed.emit(self._ready_status())
 
     @Slot()
     def shutdown(self) -> None:

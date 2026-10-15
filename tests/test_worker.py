@@ -221,17 +221,23 @@ def test_real_connection_reads_current_mode_without_reconfiguring_instrument(mon
     )
     worker = MeasurementWorker()
     connection_info = []
+    statuses = []
     worker.configuration_ready.connect(connection_info.append)
+    worker.status_changed.connect(statuses.append)
 
     worker.connect_real("COM3", SerialSettings(), ModeSettings(Mode.DCV))
 
     assert worker.instrument is not None and worker.instrument.connected
+    assert "REMOTE" in statuses[-1]
+    assert "除LOCAL外" in statuses[-1]
     assert worker.current_mode is Mode.RES2
     assert connection_info[0]["function"] == "RES"
     assert connection_info[0]["input_terminals"] == "FRONT"
+    assert "SYST:REM" in transport.commands
     assert not any(command.startswith("CONF:") for command in transport.commands)
     assert "READ?" not in transport.commands
     worker.shutdown()
+    assert "SYST:LOC" in transport.commands
 
 
 def test_front_panel_local_rejection_stops_without_fake_reading(tmp_path, monkeypatch):
