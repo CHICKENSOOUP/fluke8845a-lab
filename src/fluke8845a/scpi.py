@@ -352,6 +352,10 @@ CURRENT_RANGE_FIRMWARE_MINIMUM = {
     Mode.DCI: (2, 0),
     Mode.ACI: (1, 0, 700, 18),
 }
+# For the 8845A, DCI marks 1 A front-only; 3 A is part of the 10 A range and
+# the user manual says 10 A current cannot use the rear terminals. ACI marks
+# 1/3/10 A front-only. Keep this terminal gate separate from the 400 mA
+# firmware gate above.
 FRONT_ONLY_CURRENT_RANGES = (1.0, 3.0, 10.0)
 
 
