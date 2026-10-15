@@ -53,13 +53,13 @@ ZERO/AUTO设置控制自动零点校正；“执行ZERO校正”会发送一次 
 
 采集中调整速度下拉框只修改“所选值”，不会立即改变仪表。读数卡会分别显示仪表已回读生效的参数和“待应用”值；点击“应用采集速度”且仪表回读成功后，新速度才从下一读数起生效。若应用失败，采集会安全停止并保留失败记录，不会把所选值误记为仪表当前值。
 
-界面左侧的“仪器”页用于选COM端口、连接设备及设置测量模式；“实验”页用于填写实验名称、保存目录和Mock验证场景。NPLC/交流带宽仅在适用模式中启用，灰色控件表示当前模式不可用。软件目标间隔与单次/连续采集按钮位于曲线上方；曲线跟随、视图复位、历史加载和截图放在下一行。串口高级参数默认收起，完整SCPI通信日志可从“仪器”菜单打开。界面日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃的较早日志，测量CSV和全程统计不受影响。窗口较矮时可滚动左侧设置页。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
+桌面主窗口以单张曲线和当前读数/采集状态为主。点击右下角状态栏的“设置与分析…”打开独立窗口：“连接与采集”页含串口、测量模式、仪器速度、实验目录和目标间隔；“分析与事件”页含统计、基准、局部区间和事件。完整SCPI通信日志可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
 
 采集速率会受测量模式、量程、NPLC/交流带宽、自动零点、串口波特率和被测条件共同影响。请以当前实验中实际记录的时间戳和有效读数为准，不要把某一台设备或某次接线的速率当作准确度或通用性能保证。
 
 ## 4. 单次测量与连续采集
 
-填写实验名称和保存根目录；目标间隔在曲线上方设置。目标间隔可设0至86400秒，输入精度为0.001秒；填0表示每次读数后不额外等待。默认目标间隔保存在当前Windows用户设置中，重启软件后仍保留。采集过程中也可修改目标间隔，新值立即调整后续调度，并记入`config.json`的变更历史及`events.csv`。软件不承诺超出仪器转换、串口波特率或积分时间能力的速率；请以实际频率显示和CSV时间戳为准。按“单次测量”会创建一份仅含一次尝试的实验；连续模式支持开始、暂停、继续和停止。必须停止当前实验后切换模式，切换后下一次采集创建独立数据目录。
+填写实验名称和保存根目录；目标间隔位于“设置与分析…”窗口的“连接与采集”页。目标间隔可设0至86400秒，输入精度为0.001秒；填0表示每次读数后不额外等待。默认目标间隔保存在当前Windows用户设置中，重启软件后仍保留。采集过程中也可修改目标间隔，新值立即调整后续调度，并记入`config.json`的变更历史及`events.csv`。软件不承诺超出仪器转换、串口波特率或积分时间能力的速率；请以实际频率显示和CSV时间戳为准。按“单次测量”会创建一份仅含一次尝试的实验；连续模式支持开始、暂停、继续和停止。必须停止当前实验后切换模式，切换后下一次采集创建独立数据目录。
 
 真实后端使用 `CONF:<function>` 配置，之后逐次 `READ?` 触发/读取，并在每点读取实际量程。它不会调用 `INIT/FETCh` 批次模式，因此不占用或压缩仪器内部缓存，也不会把缓存批次的主机读取时刻误当作每个样本的采样时刻。
 
@@ -69,7 +69,7 @@ CSV的PC本地/UTC时间和`elapsed_s`记录主机发送单次`READ?`前的时�
 
 ## 5. 分析、事件与历史数据
 
-- 图中支持鼠标缩放/平移、自动跟随、最近点游标读数、可拖动时间区间统计和PNG截图。自动跟随先逐步扩展视窗至120秒，再滚动显示最近120秒。
+- 滚轮默认缩放读数轴；Shift+滚轮缩放时间轴，Ctrl+滚轮同时缩放两轴，Alt+滚轮缩放读数轴并以零点为锚。拖动曲线可平移视图，“自动缩放”重新适配当前数据；另可启用自动跟随、读取最近点、选择局部统计区间和导出PNG。自动跟随先逐步扩展视窗至120秒，再滚动显示最近120秒。
 - 基准可以手动输入SI值、取当前读数或取当前图中缓存均值。电压显示ΔV/V₀，电流显示ΔI/I₀，电阻显示ΔR/R₀。阈值栏使用SI值；基准绝对值小于或等于阈值、阈值无效或基准未设置时不计算相对变化率。
 - “记录实验事件”写入事件CSV并在曲线上画标记。基准设置、更改和清除在活动实验中也会写入事件并画出曲线标记。
 - “加载历史CSV”只读现存测量文件；若同一实验目录中有配套`events.csv`，会一并恢复落在当前时间范围内的事件标记。超过100,000点时，图形显示均匀抽稀视图，原文件不变；拖选区间后，软件在后台扫描完整原始CSV计算统计，图表抽稀不影响统计。实时采集期间，统计完成后会把区间内新到的有效读数增量纳入，后台读取不阻塞采集线程。
@@ -100,7 +100,7 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 ## 9. localhost 浏览器界面
 
-运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat` 可启动本机网页界面。服务只监听 `127.0.0.1:8765`，不加载远程页面或 CDN；网页与桌面版共用仪器驱动、采集线程和逐点写盘器，支持六种测量模式、实时曲线、采集控制、统计、基准变化、事件记录、历史 CSV 加载和曲线 PNG 导出。
+运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat` 可启动本机网页界面。服务只监听 `127.0.0.1:8765`，不加载远程页面或 CDN；网页与桌面版共用仪器驱动、采集线程和逐点写盘器。主页面只显示当前读数、采集状态、控制按钮和一张大曲线；顶部“设置与分析”打开单独的设置对话框。图表的滚轮和 Shift/Ctrl/Alt 用法与桌面端相同，并提供自动缩放、自动跟随、历史 CSV 和 PNG 导出。
 
 启动服务不会自动打开串口。连接前先断开桌面版占用的 COM 端口，因为同一端口不能同时由两个程序打开。电流和电阻测量仍须由操作者确认接线、输入端子、保险丝和被测电路状态。页面的“退出服务”会停止采集、完成待写数据并安全关闭串口。Mock 读数始终是模拟数据。
 
@@ -136,7 +136,7 @@ Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`,
 
 ### 5. Analysis, events, and history
 
-Plots support zoom, pan, follow mode, a nearest-point cursor, time-window statistics, and PNG export. A reference can be entered, taken from the current reading, or calculated from the cached plot mean. Relative change is displayed as ΔV/V₀, ΔI/I₀, or ΔR/R₀ when the reference exceeds the configured threshold. Event notes, pause/resume actions, and reference changes are saved to `events.csv` and marked on the plot.
+The primary desktop window shows the live reading, acquisition status, controls, and one plot. The status-bar **Settings & Analysis** button opens a separate window for serial, instrument, experiment, statistics, baseline, and event settings. Plots support Y-axis wheel zoom, Shift+wheel X-axis zoom, Ctrl+wheel zoom of both axes, and Alt+wheel Y zoom anchored at zero. Drag to pan and use **Auto scale** to fit the current data. A reference can be entered, taken from the current reading, or calculated from the cached plot mean. Relative change is displayed as ΔV/V₀, ΔI/I₀, or ΔR/R₀ when the reference exceeds the configured threshold. Event notes, pause/resume actions, and reference changes are saved to `events.csv` and marked on the plot.
 
 Historical CSV loading is read-only. Matching event markers are restored where available. For files over 100,000 points, the graph uses a uniformly downsampled view while statistics scan the full source file in the background; the original CSV is unchanged.
 
@@ -146,7 +146,7 @@ Mock mode supports six-mode simulated readings, step response/recovery, long-ter
 
 ### 7. Local browser interface
 
-Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It listens only on `127.0.0.1:8765`, uses no remote pages or CDN, and shares the instrument driver, acquisition worker, and per-reading recorder with the desktop application. It supports all six measurement modes, live plots, acquisition controls, statistics, reference changes, event logging, CSV history, and PNG plot export.
+Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It listens only on `127.0.0.1:8765`, uses no remote pages or CDN, and shares the instrument driver, acquisition worker, and per-reading recorder with the desktop application. The main page keeps the reading, acquisition state, controls, and one large plot; **Settings & Analysis** opens a separate dialog. It supports all six modes, wheel/modifier zoom, auto scale, statistics, reference changes, event logging, CSV history, and PNG export.
 
 Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection. Mock readings remain simulated.
 

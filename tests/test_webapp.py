@@ -145,6 +145,21 @@ def test_localhost_mock_api_enforces_origin_and_records_one_shot(tmp_path, local
     assert status == 200
     assert b"Fluke 8845A" in page
     assert headers["Content-Security-Policy"]
+    assert b'id="settingsDialog"' in page
+    assert b'id="openSettings"' in page
+    assert b'id="autoScale"' in page
+    assert b'id="plot"' in page
+    assert b'class="control-rail"' not in page
+    main_view = page.split(b"<dialog", 1)[0]
+    assert b'id="mode"' not in main_view and b'id="serialTimeout"' not in main_view
+
+    status, _headers, stylesheet = _main_thread_wait(app, lambda: _http(base_url + "/app.css"))
+    assert status == 200
+    assert b".settings-dialog" in stylesheet
+    status, _headers, script = _main_thread_wait(app, lambda: _http(base_url + "/app.js"))
+    assert status == 200
+    assert b"event.altKey" in script and b"event.ctrlKey" in script and b"event.shiftKey" in script
+    assert b"app.yView = zoomRange" in script
 
     status, _headers, metadata = _main_thread_wait(app, lambda: _http(base_url + "/api/meta"))
     assert status == 200

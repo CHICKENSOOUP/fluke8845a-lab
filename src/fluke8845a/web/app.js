@@ -12,7 +12,7 @@ const app = {
   xView: null, yView: null, dragging: null, cursor: null, bufferTruncated: false,
   awaitInitialSettings: false, awaitSettingsReadback: false, awaitSpeedReadback: false,
 };
-const COLORS = { ink: "#53666e", muted: "#87969b", grid: "#e8edef", axis: "#b9c5c8", line: "#087f86", lineFill: "#0d929022", event: "#d79a3b" };
+const COLORS = { ink: "#526064", muted: "#87918b", grid: "#e5e4da", axis: "#aeb6ad", line: "#138b92", lineFill: "#138b9218", event: "#d39130" };
 
 function htmlText(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -221,6 +221,7 @@ async function pollState() {
       app.lastSample = 0;
       app.imported = null;
       app.xView = null;
+      app.yView = null;
       app.bufferTruncated = false;
       el("restoreLive").classList.add("hidden");
     }
@@ -289,6 +290,7 @@ function updateStateDisplay(state) {
   el("actualRate").innerHTML = `${numberText(state.actual_hz || 0, 4)} <small>Hz</small>`;
   const directory = state.experiment_dir || state.last_experiment_dir;
   el("experimentPath").textContent = directory || "实验目录尚未创建";
+  el("experimentPathDetail").textContent = directory || "实验目录将在开始测量后创建";
   el("downloadCsv").disabled = !state.last_experiment_dir;
   const running = /采集中|测量中/.test(state.status || "");
   const paused = String(state.status || "").includes("暂停");
@@ -451,7 +453,7 @@ function drawChart() {
   ui.empty.classList.toggle("hidden", rows.length > 0);
   if (!rows.length) {
     el("plotRange").textContent = "等待数据";
-    el("pointCursor").textContent = "悬停查看读数 · 滚轮缩放 · 拖动平移";
+    el("pointCursor").textContent = "滚轮缩放纵轴 · Shift 时间轴 · Ctrl 双轴 · Alt 锚定零点 · 拖动平移";
     return;
   }
   const maxX = rows[rows.length - 1].x;
@@ -480,14 +482,14 @@ function drawChart() {
   const padding = dataSpan === 0 ? Math.max(Math.abs(dataMax) * .025, 1e-9) : dataSpan * .12;
   let yMin = dataMin - padding;
   let yMax = dataMax + padding;
-  if (app.yView && app.cursor?.locked) [yMin, yMax] = app.yView;
+  if (app.yView) [yMin, yMax] = app.yView;
   const left = plot.left, top = plot.top, right = width - plot.right, bottom = height - plot.bottom;
   const plotWidth = Math.max(1, right - left), plotHeight = Math.max(1, bottom - top);
   const xToPixel = (x) => left + (x - xMin) / (xMax - xMin) * plotWidth;
   const yToPixel = (y) => bottom - (y - yMin) / (yMax - yMin) * plotHeight;
   const unit = rows[0].unit || activeMode()?.unit || "";
 
-  ctx.fillStyle = "#fbfcfc";
+  ctx.fillStyle = "#faf9f2";
   ctx.fillRect(left, top, plotWidth, plotHeight);
   ctx.font = "10px Segoe UI, Microsoft YaHei UI, sans-serif";
   ctx.textBaseline = "middle";
@@ -610,14 +612,13 @@ ui.canvas.addEventListener("pointermove", (event) => {
   const x = event.clientX - rect.left, y = event.clientY - rect.top;
   if (app.dragging) {
     const scale = app.chartScale;
-    const span = scale.xMax - scale.xMin;
-    const delta = -(x - app.dragging.x) / Math.max(1, scale.right - scale.left) * span;
-    app.xView = [app.dragging.start[0] + delta, app.dragging.start[1] + delta];
+    const deltaX = -(x - app.dragging.x) / Math.max(1, scale.right - scale.left) * (app.dragging.xRange[1] - app.dragging.xRange[0]);
+    const deltaY = (y - app.dragging.y) / Math.max(1, scale.bottom - scale.top) * (app.dragging.yRange[1] - app.dragging.yRange[0]);
+    app.xView = [app.dragging.xRange[0] + deltaX, app.dragging.xRange[1] + deltaX];
+    app.yView = [app.dragging.yRange[0] + deltaY, app.dragging.yRange[1] + deltaY];
     el("autoFollow").checked = false;
     app.cursor = null;
     drawChart();
-    app.dragging.x = x;
-    app.dragging.start = app.xView.slice();
     return;
   }
   app.cursor = nearestPoint(x, y);
@@ -625,7 +626,7 @@ ui.canvas.addEventListener("pointermove", (event) => {
     const point = app.cursor.point;
     const value = scaledValue(point.y, point.unit || "");
     el("pointCursor").textContent = `t=${timeLabel(point.x)} · ${value.value} ${value.unit} · 原始 ${point.raw || numberText(point.y, 14)} · 点 #${point.id}`;
-  } else el("pointCursor").textContent = "悬停查看读数 · 滚轮缩放 · 拖动平移";
+  } else el("pointCursor").textContent = "滚轮缩放纵轴 · Shift 时间轴 · Ctrl 双轴 · Alt 锚定零点 · 拖动平移";
   drawChart();
 });
 ui.canvas.addEventListener("pointerdown", (event) => {
@@ -634,7 +635,11 @@ ui.canvas.addEventListener("pointerdown", (event) => {
   const x = event.clientX - rect.left, y = event.clientY - rect.top;
   if (x < app.chartScale.left || x > app.chartScale.right || y < app.chartScale.top || y > app.chartScale.bottom) return;
   ui.canvas.setPointerCapture(event.pointerId);
-  app.dragging = { x, start: (app.xView || [app.chartScale.xMin, app.chartScale.xMax]).slice() };
+  app.dragging = {
+    x, y,
+    xRange: (app.xView || [app.chartScale.xMin, app.chartScale.xMax]).slice(),
+    yRange: (app.yView || [app.chartScale.yMin, app.chartScale.yMax]).slice(),
+  };
 });
 ui.canvas.addEventListener("pointerup", () => { app.dragging = null; drawChart(); });
 ui.canvas.addEventListener("pointercancel", () => { app.dragging = null; drawChart(); });
@@ -645,15 +650,37 @@ ui.canvas.addEventListener("wheel", (event) => {
   const scale = app.chartScale;
   const rect = ui.canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
-  const anchor = scale.xMin + Math.max(0, Math.min(1, (x - scale.left) / (scale.right - scale.left))) * (scale.xMax - scale.xMin);
+  const y = event.clientY - rect.top;
+  const xFraction = Math.max(0, Math.min(1, (x - scale.left) / (scale.right - scale.left)));
+  const yFraction = Math.max(0, Math.min(1, (scale.bottom - y) / (scale.bottom - scale.top)));
+  const xAnchor = scale.xMin + xFraction * (scale.xMax - scale.xMin);
+  const yAnchor = event.altKey ? 0 : scale.yMin + yFraction * (scale.yMax - scale.yMin);
   const factor = event.deltaY < 0 ? .8 : 1.25;
-  const newSpan = Math.max(.05, Math.min(1e8, (scale.xMax - scale.xMin) * factor));
-  const relative = (anchor - scale.xMin) / (scale.xMax - scale.xMin);
-  app.xView = [anchor - newSpan * relative, anchor + newSpan * (1 - relative)];
-  el("autoFollow").checked = false;
+  const zoomX = !event.altKey && (event.ctrlKey || event.shiftKey);
+  const zoomY = event.altKey || event.ctrlKey || !event.shiftKey;
+  const zoomRange = (min, max, anchor, minimumSpan, maximumSpan) => {
+    const span = Math.max(minimumSpan, Math.min(maximumSpan, (max - min) * factor));
+    const relative = (anchor - min) / (max - min || 1);
+    return [anchor - span * relative, anchor + span * (1 - relative)];
+  };
+  if (zoomX) {
+    app.xView = zoomRange(scale.xMin, scale.xMax, xAnchor, .05, 1e8);
+    el("autoFollow").checked = false;
+  }
+  if (zoomY) {
+    const span = scale.yMax - scale.yMin;
+    const minSpan = Math.max(Math.abs(yAnchor) * 1e-12, span * 1e-9, 1e-15);
+    app.yView = zoomRange(scale.yMin, scale.yMax, yAnchor, minSpan, Math.max(span, 1e-15) * 1e6);
+  }
   drawChart();
 }, { passive: false });
 el("autoFollow").addEventListener("change", () => { if (el("autoFollow").checked) app.xView = null; drawChart(); });
+el("autoScale").addEventListener("click", () => {
+  app.xView = null;
+  app.yView = null;
+  el("autoFollow").checked = false;
+  drawChart();
+});
 window.addEventListener("resize", drawChart);
 
 function parseCsv(text) {
@@ -706,6 +733,8 @@ async function loadHistory(file) {
     }
     app.imported = rows;
     app.xView = null;
+    app.yView = null;
+    el("autoFollow").checked = false;
     el("restoreLive").classList.remove("hidden");
     el("chartTitle").textContent = `${file.name} · 历史曲线`;
     el("legendName").textContent = "CSV 历史原始读数";
@@ -736,12 +765,14 @@ async function savePlot() {
 }
 
 function bindControls() {
+  el("openSettings").addEventListener("click", () => el("settingsDialog").showModal());
+  el("closeSettings").addEventListener("click", () => el("settingsDialog").close());
   el("scanPorts").addEventListener("click", scanPorts);
   el("portList").addEventListener("change", () => { if (el("portList").value) el("port").value = el("portList").value; });
   el("connectReal").addEventListener("click", connectReal);
   el("connectMock").addEventListener("click", connectMock);
   el("disconnect").addEventListener("click", async () => { const result = await command("disconnect"); if (result.success) serialFormDisabled(false); });
-  el("mode").addEventListener("change", () => { const spec = app.modes.get(el("mode").value); if (spec) populateModeOptions(spec); });
+  el("mode").addEventListener("change", () => { const spec = app.modes.get(el("mode").value); if (spec) { populateModeOptions(spec); app.yView = null; drawChart(); } });
   el("applySettings").addEventListener("click", applySettings);
   el("applySpeed").addEventListener("click", applySpeed);
   el("zero").addEventListener("click", async () => {
@@ -765,7 +796,8 @@ function bindControls() {
   el("savePlot").addEventListener("click", savePlot);
   el("historyFile").addEventListener("change", (event) => loadHistory(event.target.files[0]));
   el("restoreLive").addEventListener("click", () => {
-    app.imported = null; app.xView = null;
+    app.imported = null; app.xView = null; app.yView = null;
+    el("autoFollow").checked = true;
     el("restoreLive").classList.add("hidden");
     const mode = activeMode();
     el("chartTitle").textContent = mode ? `${mode.label} · 随时间变化` : "测量曲线";

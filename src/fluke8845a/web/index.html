@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Fluke 8845A · 实验测量台</title>
+  <title>Fluke 8845A · 精密测量</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
@@ -13,92 +13,129 @@
     <div class="brand-lockup">
       <div class="brand-mark" aria-hidden="true">
         <svg viewBox="0 0 48 40" role="img">
-          <rect x="2" y="3" width="44" height="34" rx="7" fill="#344653"/>
-          <rect x="5" y="6" width="38" height="28" rx="5" fill="#e9e6dc"/>
-          <circle cx="12" cy="15" r="4" fill="#d7494e"/><circle cx="12" cy="26" r="4" fill="#46525c"/>
-          <rect x="19" y="9" width="20" height="16" rx="3" fill="#122631"/>
-          <path d="M22 19c3-7 5 4 8-2s5-3 7-1" fill="none" stroke="#8ee6e0" stroke-width="1.7" stroke-linecap="round"/>
+          <rect x="2" y="3" width="44" height="34" rx="7" fill="#454d50"/>
+          <rect x="5" y="6" width="38" height="28" rx="5" fill="#f1efe6"/>
+          <circle cx="12" cy="15" r="4" fill="#d7494e"/><circle cx="12" cy="26" r="4" fill="#30383c"/>
+          <rect x="19" y="9" width="20" height="16" rx="3" fill="#1d262a"/>
+          <path d="M22 19c3-7 5 4 8-2s5-3 7-1" fill="none" stroke="#73e2e2" stroke-width="1.7" stroke-linecap="round"/>
           <rect x="20" y="28" width="5" height="2" rx="1" fill="#74899a"/>
           <rect x="27" y="28" width="5" height="2" rx="1" fill="#b5b6af"/>
-          <rect x="34" y="28" width="5" height="2" rx="1" fill="#eeaa3f"/>
+          <rect x="34" y="28" width="5" height="2" rx="1" fill="#e6a23a"/>
         </svg>
       </div>
-      <div><strong>8845A</strong><span>实验测量台</span></div>
+      <div><strong>8845A</strong><span>精密测量</span></div>
     </div>
-    <div class="topbar-center"><span class="live-mark"></span><span>本机测量会话</span><span class="topbar-divider"></span><span class="mono">127.0.0.1</span></div>
-    <div class="topbar-right"><span id="connectionBadge" class="connection-badge"><i></i><span>未连接</span></span><span id="versionLabel" class="version-label">本地运行</span><button id="shutdownService" class="service-exit" type="button">退出服务</button></div>
+    <div class="topbar-state"><span class="live-mark"></span><span>本机测量会话</span><span class="mono">127.0.0.1</span><span id="versionLabel" class="version-label">本地运行</span></div>
+    <div class="topbar-right">
+      <span id="connectionBadge" class="connection-badge"><i></i><span>未连接</span></span>
+      <button id="openSettings" class="button button-header" type="button">设置与分析</button>
+      <button id="shutdownService" class="service-exit" type="button">退出服务</button>
+    </div>
   </header>
 
   <main class="workspace">
-    <aside class="control-rail" aria-label="仪器和实验控制">
-      <section class="panel instrument-panel">
-        <div class="section-heading"><div><span class="section-kicker">01 · 仪器</span><h1>连接与测量</h1></div><span class="section-icon" aria-hidden="true">↔</span></div>
-        <div class="field-label-row"><label for="port">串口</label><button id="scanPorts" class="text-button" type="button">扫描</button></div>
-        <div class="port-row"><input id="port" value="COM3" autocomplete="off" spellcheck="false" aria-label="Windows 串口"><select id="portList" aria-label="扫描到的串口"><option value="">选择已发现端口</option></select></div>
-        <div class="serial-grid">
-          <label>波特率<select id="baudrate"><option>1200</option><option>2400</option><option>4800</option><option selected>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option><option>230400</option></select></label>
-          <label>数据位<select id="bytesize"><option>7</option><option selected>8</option></select></label>
-          <label>校验位<select id="parity"><option value="N" selected>无</option><option value="E">偶校验</option><option value="O">奇校验</option></select></label>
-          <label>停止位<select id="stopbits"><option selected>1</option><option>2</option></select></label>
-          <label>结束符<select id="eol"><option>CR</option><option>LF</option><option selected>CRLF</option></select></label>
-          <label>流控制<select id="flow"><option value="none" selected>无</option><option value="xonxoff">XON/XOFF</option><option value="rtscts">RTS/CTS</option></select></label>
-          <label>响应超时<input id="serialTimeout" type="number" min="0.1" max="5" step="0.1" value="2.0"></label>
-        </div>
-        <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="connectMock" class="button button-quiet" type="button">连接模拟器</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button></div>
-        <div id="mockScenarioRow" class="scenario-row hidden"><label for="mockScenario">模拟场景</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
-        <div class="connection-detail"><span class="connection-led"></span><span id="connectionText">串口尚未打开</span></div>
-
-        <div class="rule"></div>
-        <div class="field-label-row"><label for="mode">测量模式</label><span id="modeFunction" class="tiny-status">未配置</span></div>
-        <select id="mode" class="mode-select" aria-label="测量模式"></select>
-        <div id="modeOptions" class="mode-options"></div>
-        <div class="safety-note"><span class="safety-symbol" aria-hidden="true">!</span><div><strong>操作前核对接线</strong><p id="safetyText">请选择测量模式以查看接线说明。</p></div></div>
-        <label class="confirm-row"><input id="safetyConfirm" type="checkbox"><span>我已按上方提示核对接线、极性、保险丝和输入限值</span></label>
-        <div class="button-row"><button id="applySettings" class="button button-primary" type="button">应用仪器参数</button><button id="applySpeed" class="button button-outline" type="button">应用速度</button></div>
-        <button id="zero" class="button button-quiet button-wide" type="button">执行 ZERO 校正…</button>
-      </section>
-
-      <section class="panel experiment-panel">
-        <div class="section-heading"><div><span class="section-kicker">02 · 实验</span><h2>采集与记录</h2></div><span class="section-icon" aria-hidden="true">◷</span></div>
-        <label class="stack-label" for="experimentName">实验名称</label><input id="experimentName" type="text" maxlength="100" spellcheck="false">
-        <label class="stack-label" for="outputRoot">保存目录</label><input id="outputRoot" type="text" spellcheck="false">
-        <div class="interval-row"><label for="interval">目标采样间隔</label><div class="number-with-unit"><input id="interval" type="number" min="0" max="86400" step="0.001" value="1"><span>秒</span></div></div>
-        <p class="field-hint">填 0 表示最快可用；实际速度仍由积分时间、转换和串口决定。</p>
-        <div class="button-grid">
-          <button id="start" class="button button-primary" type="button">开始连续采集</button>
-          <button id="single" class="button button-outline" type="button">单次测量</button>
-          <button id="pause" class="button button-quiet" type="button" disabled>暂停</button>
-          <button id="resume" class="button button-quiet hidden" type="button">继续</button>
-          <button id="stop" class="button button-danger" type="button" disabled>停止并保存</button>
-        </div>
-        <div class="event-entry"><label class="stack-label" for="eventText">实验事件</label><div class="event-row"><input id="eventText" type="text" maxlength="256" placeholder="例如：切换负载、开始恢复…"><button id="markEvent" class="button button-outline" type="button">记录</button></div></div>
-      </section>
-      <div class="rail-footnote"><span class="lock-icon" aria-hidden="true">⌑</span>采集数据由仪器线程逐点写入 CSV。浏览器只读取显示副本。</div>
-    </aside>
-
-    <section class="measurement-area" aria-label="实时测量与分析">
+    <section class="measurement-area" aria-label="实时测量状态与波形图">
       <section class="readout-panel">
-        <div class="readout-main"><div class="readout-meta"><span class="eyebrow">当前读数</span><span id="readingMode" class="reading-mode">等待仪器读数</span></div><div class="reading-line"><span id="readingValue" class="reading-value">—</span><span id="readingUnit" class="reading-unit"></span></div><div id="readingRaw" class="raw-value">原始响应将保存在实验 CSV</div></div>
-        <div class="readout-side"><div class="run-state"><span id="runDot" class="run-dot"></span><span id="runStatus">等待连接</span></div><div class="quick-metrics"><div><span>实际采样</span><strong id="actualRate">— <small>Hz</small></strong></div><div><span>样本序号</span><strong id="sampleCount">0</strong></div><div><span>实验历时</span><strong id="elapsed">—</strong></div></div><div id="experimentPath" class="experiment-path">实验目录尚未创建</div></div>
+        <div class="readout-main">
+          <div class="readout-meta"><span class="eyebrow">当前读数</span><span id="readingMode" class="reading-mode">等待仪器读数</span></div>
+          <div class="reading-line"><span id="readingValue" class="reading-value">—</span><span id="readingUnit" class="reading-unit"></span></div>
+          <div id="readingRaw" class="raw-value">原始响应将保存在实验 CSV</div>
+        </div>
+        <div class="readout-side">
+          <div class="run-state"><span id="runDot" class="run-dot"></span><span id="runStatus">等待连接</span></div>
+          <div class="quick-metrics">
+            <div><span>采样频率</span><strong id="actualRate">— <small>Hz</small></strong></div>
+            <div><span>样本数</span><strong id="sampleCount">0</strong></div>
+            <div><span>实验历时</span><strong id="elapsed">—</strong></div>
+          </div>
+        </div>
       </section>
 
-      <section class="panel chart-panel">
-        <div class="chart-toolbar"><div><span class="section-kicker">实时趋势</span><h2 id="chartTitle">测量曲线</h2></div><div class="chart-actions"><label class="toggle-label"><input id="autoFollow" type="checkbox" checked><span>自动跟随</span></label><button id="restoreLive" class="button button-mini hidden" type="button">回到实时</button><label class="button button-mini file-button">加载 CSV<input id="historyFile" type="file" accept=".csv,text/csv"></label><button id="downloadCsv" class="button button-mini" type="button" disabled>下载原始 CSV</button><button id="savePlot" class="button button-mini" type="button">保存曲线 PNG</button></div></div>
-        <div id="chartContext" class="chart-context"><span><i class="legend-line"></i><span id="legendName">原始读数</span></span><span id="pointCursor">悬停查看读数 · 滚轮缩放 · 拖动平移</span></div>
-        <div class="plot-wrap"><canvas id="plot" aria-label="实时测量曲线"></canvas><div id="plotEmpty" class="plot-empty"><span class="empty-icon" aria-hidden="true">⌁</span><strong>曲线将在采集开始后显示</strong><span>读数按原始数值绘制，不做滤波或平滑</span></div></div>
-        <div class="plot-footer"><span id="plotRange">等待数据</span><span id="bufferNote">显示缓存最多保留 5000 点；完整数据持续写入 CSV</span></div>
+      <section class="action-bar" aria-label="采集控制">
+        <button id="start" class="button button-primary" type="button">开始采集</button>
+        <button id="single" class="button button-outline" type="button">单次测量</button>
+        <button id="pause" class="button button-quiet" type="button" disabled>暂停</button>
+        <button id="resume" class="button button-quiet hidden" type="button">继续</button>
+        <button id="stop" class="button button-danger" type="button" disabled>停止并保存</button>
+        <span class="action-spacer"></span>
+        <span id="experimentPath" class="experiment-path">实验目录尚未创建</span>
       </section>
 
-      <section class="analysis-panel">
-        <div class="analysis-heading"><div><span class="section-kicker">03 · 数据分析</span><h2>变化与统计</h2></div><div class="analysis-context">统计仅使用当前浏览器显示的数据点；原始 CSV 保持不变</div></div>
-        <div class="stats-grid"><div class="stat-card"><span>平均值</span><strong id="statMean">—</strong></div><div class="stat-card"><span>标准差 · 样本</span><strong id="statStd">—</strong></div><div class="stat-card"><span>最小值</span><strong id="statMin">—</strong></div><div class="stat-card"><span>最大值</span><strong id="statMax">—</strong></div></div>
-        <div class="baseline-row"><div class="baseline-label"><span>R₀ / V₀ / I₀</span><strong id="baselineDelta">尚未设置基准</strong></div><input id="baselineValue" type="number" step="any" placeholder="输入基准值"><button id="baselineCurrent" class="button button-mini" type="button">以当前值为基准</button><button id="baselineMean" class="button button-mini" type="button">以均值为基准</button><button id="baselineClear" class="button button-mini button-clear" type="button">清除</button></div>
-        <div class="event-list-wrap"><div class="event-list-heading"><strong>实验标记</strong><span id="eventCount">0 条</span></div><ol id="eventList" class="event-list"><li class="empty-event">实验事件会按实际记录时间显示在这里。</li></ol></div>
+      <section class="chart-panel">
+        <div class="chart-toolbar">
+          <div class="chart-title"><span class="section-kicker">实时趋势</span><h1 id="chartTitle">测量曲线</h1></div>
+          <div class="chart-actions">
+            <label class="toggle-label"><input id="autoFollow" type="checkbox" checked><span>自动跟随</span></label>
+            <button id="autoScale" class="button button-mini" type="button" title="重设时间轴与读数轴，适配当前数据">自动缩放</button>
+            <button id="restoreLive" class="button button-mini hidden" type="button">返回实时</button>
+            <label class="button button-mini file-button">加载 CSV<input id="historyFile" type="file" accept=".csv,text/csv"></label>
+            <button id="downloadCsv" class="button button-mini" type="button" disabled>下载原始 CSV</button>
+            <button id="savePlot" class="button button-mini" type="button">保存 PNG</button>
+          </div>
+        </div>
+        <div id="chartContext" class="chart-context">
+          <span><i class="legend-line"></i><span id="legendName">原始读数</span></span>
+          <span id="pointCursor">悬停读点 · 滚轮缩放纵轴 · Shift 时间轴 · Ctrl 双轴 · Alt 锚定零点 · 拖动平移</span>
+        </div>
+        <div class="plot-wrap"><canvas id="plot" aria-label="实时测量曲线"></canvas><div id="plotEmpty" class="plot-empty"><span class="empty-icon" aria-hidden="true">⌁</span><strong>等待采样</strong><span>开始测量后，原始读数会在此实时绘制</span></div></div>
+        <div class="plot-footer"><span id="plotRange">等待数据</span><span id="bufferNote">完整原始数据逐点保存到 CSV</span></div>
       </section>
-
-      <details class="panel log-panel"><summary><span>SCPI 通信与运行日志</span><span id="logCount" class="log-count">0 条</span></summary><div id="logList" class="log-list"><div class="empty-log">连接设备后显示通信和运行信息。</div></div></details>
-      <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </section>
   </main>
+
+  <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
+    <div class="dialog-shell">
+      <header class="dialog-header"><div><span class="section-kicker">设置 · 分析 · 诊断</span><h2 id="settingsTitle">仪器与实验配置</h2></div><button id="closeSettings" class="button button-quiet" type="button">关闭</button></header>
+      <div class="settings-scroll">
+        <div class="settings-grid">
+          <section class="panel instrument-panel">
+            <div class="section-heading"><div><span class="section-kicker">仪器</span><h3>串口与测量</h3></div></div>
+            <div class="field-label-row"><label for="port">COM 端口</label><button id="scanPorts" class="text-button" type="button">扫描</button></div>
+            <div class="port-row"><input id="port" value="COM3" autocomplete="off" spellcheck="false" aria-label="Windows 串口"><select id="portList" aria-label="扫描到的串口"><option value="">选择已发现端口</option></select></div>
+            <div class="serial-grid">
+              <label>波特率<select id="baudrate"><option>1200</option><option>2400</option><option>4800</option><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option selected>115200</option><option>230400</option></select></label>
+              <label>数据位<select id="bytesize"><option>7</option><option selected>8</option></select></label>
+              <label>校验位<select id="parity"><option value="N" selected>无</option><option value="E">偶校验</option><option value="O">奇校验</option></select></label>
+              <label>停止位<select id="stopbits"><option selected>1</option><option>2</option></select></label>
+              <label>结束符<select id="eol"><option>CR</option><option>LF</option><option selected>CRLF</option></select></label>
+              <label>流控制<select id="flow"><option value="none" selected>无</option><option value="xonxoff">XON/XOFF</option><option value="rtscts">RTS/CTS</option></select></label>
+              <label>响应超时<input id="serialTimeout" type="number" min="0.1" max="5" step="0.1" value="2.0"></label>
+            </div>
+            <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="connectMock" class="button button-quiet" type="button">连接模拟器</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button></div>
+            <div id="mockScenarioRow" class="scenario-row hidden"><label for="mockScenario">模拟场景</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
+            <div class="connection-detail"><span class="connection-led"></span><span id="connectionText">串口尚未打开</span></div>
+            <div class="rule"></div>
+            <div class="field-label-row"><label for="mode">测量模式</label><span id="modeFunction" class="tiny-status">未配置</span></div>
+            <select id="mode" class="mode-select" aria-label="测量模式"></select>
+            <div id="modeOptions" class="mode-options"></div>
+            <div class="safety-note"><span class="safety-symbol" aria-hidden="true">!</span><div><strong>切换前核对接线</strong><p id="safetyText">请选择测量模式以查看接线说明。</p></div></div>
+            <label class="confirm-row"><input id="safetyConfirm" type="checkbox"><span>我已按提示核对接线、极性、保险丝和输入限值</span></label>
+            <div class="button-row"><button id="applySettings" class="button button-primary" type="button">应用仪器参数</button><button id="applySpeed" class="button button-outline" type="button">应用速度</button></div>
+            <button id="zero" class="button button-quiet button-wide" type="button">执行 ZERO 校正…</button>
+          </section>
+
+          <section class="panel experiment-panel">
+            <div class="section-heading"><div><span class="section-kicker">实验</span><h3>采样与文件</h3></div></div>
+            <label class="stack-label" for="experimentName">实验名称</label><input id="experimentName" type="text" maxlength="100" spellcheck="false">
+            <label class="stack-label" for="outputRoot">保存目录</label><input id="outputRoot" type="text" spellcheck="false">
+            <div class="interval-row"><label for="interval">目标采样间隔</label><div class="number-with-unit"><input id="interval" type="number" min="0" max="86400" step="0.001" value="1"><span>秒</span></div></div>
+            <p class="field-hint">0 表示每次仪器读数后不额外等待；实际速度受测量设置与串口影响。</p>
+            <div class="event-entry"><label class="stack-label" for="eventText">实验事件</label><div class="event-row"><input id="eventText" type="text" maxlength="256" placeholder="例如：切换负载、开始恢复…"><button id="markEvent" class="button button-outline" type="button">记录</button></div></div>
+            <div id="experimentPathDetail" class="experiment-path-detail">实验目录将在开始测量后创建</div>
+            <p class="rail-footnote">真实采集由仪器线程执行，原始读数逐点写入 CSV。浏览器只读取显示副本。</p>
+          </section>
+        </div>
+
+        <section class="analysis-panel">
+          <div class="analysis-heading"><div><span class="section-kicker">分析</span><h3>统计与参考值</h3></div><div class="analysis-context">统计使用当前显示数据点；原始 CSV 保持不变</div></div>
+          <div class="stats-grid"><div class="stat-card"><span>平均值</span><strong id="statMean">—</strong></div><div class="stat-card"><span>标准差 · 样本</span><strong id="statStd">—</strong></div><div class="stat-card"><span>最小值</span><strong id="statMin">—</strong></div><div class="stat-card"><span>最大值</span><strong id="statMax">—</strong></div></div>
+          <div class="baseline-row"><div class="baseline-label"><span>R₀ / V₀ / I₀</span><strong id="baselineDelta">尚未设置基准</strong></div><input id="baselineValue" type="number" step="any" placeholder="输入基准值"><button id="baselineCurrent" class="button button-mini" type="button">当前值设为基准</button><button id="baselineMean" class="button button-mini" type="button">均值设为基准</button><button id="baselineClear" class="button button-mini button-clear" type="button">清除</button></div>
+          <div class="event-list-wrap"><div class="event-list-heading"><strong>实验标记</strong><span id="eventCount">0 条</span></div><ol id="eventList" class="event-list"><li class="empty-event">事件会按实际记录时间显示在这里。</li></ol></div>
+        </section>
+        <details class="panel log-panel"><summary><span>SCPI 通信与运行日志</span><span id="logCount" class="log-count">0 条</span></summary><div id="logList" class="log-list"><div class="empty-log">连接设备后显示通信和运行信息。</div></div></details>
+      </div>
+    </div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

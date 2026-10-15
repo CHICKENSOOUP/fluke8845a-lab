@@ -22,7 +22,7 @@ from PySide6.QtGui import QAction, QFont, QFontDatabase, QPainter, QPen, QColor,
 from PySide6.QtWidgets import (
     QBoxLayout, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QSpinBox, QSplitter, QStatusBar, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSpinBox, QStatusBar, QVBoxLayout, QWidget,
     QTabWidget, QToolButton, QStackedLayout,
 )
 
@@ -41,6 +41,40 @@ log = logging.getLogger(__name__)
 _REGISTERED_UI_FONT_IDS: list[int] = []
 AUTO_FOLLOW_WINDOW_S = 120.0
 AUTO_FOLLOW_MIN_WINDOW_S = 10.0
+
+
+def _wheel_zoom_axes(modifiers) -> tuple[bool, bool]:
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        return False, True
+    if modifiers & Qt.KeyboardModifier.ControlModifier:
+        return True, True
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        return True, False
+    return False, True
+
+
+class _MeasurementViewBox(pg.ViewBox):
+    """Wheel zoom: Y by default, Shift=X, Ctrl=both, Alt=Y around zero."""
+
+    userZoomed = Signal(bool, bool)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.delta()
+        if not delta:
+            event.ignore()
+            return
+        modifiers = event.modifiers()
+        factor = math.exp(-float(delta) / 120.0 * 0.18)
+        center = self.mapSceneToView(event.scenePos())
+        zoom_x, zoom_y = _wheel_zoom_axes(modifiers)
+        x_factor = factor if zoom_x else 1.0
+        y_factor = factor if zoom_y else 1.0
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            center.setY(0.0)
+        self.scaleBy((x_factor, y_factor), center=center)
+        self.sigRangeChangedManually.emit([zoom_x, zoom_y])
+        self.userZoomed.emit(zoom_x, zoom_y)
+        event.accept()
 
 
 class _RegionStatisticsSignals(QObject):
@@ -512,18 +546,18 @@ class MainWindow(QMainWindow):
         root = QWidget(self)
         root.setObjectName("appRoot")
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(18, 12, 18, 14)
+        root_layout.setContentsMargins(18, 14, 18, 12)
         root_layout.setSpacing(10)
         self.setCentralWidget(root)
 
         header = QFrame()
         header.setObjectName("appHeader")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(14, 8, 14, 8)
-        header_layout.setSpacing(12)
+        header_layout.setContentsMargins(14, 6, 14, 6)
+        header_layout.setSpacing(10)
         self.brand_icon = QLabel()
         self.brand_icon.setObjectName("brandIcon")
-        self.brand_icon.setFixedSize(70, 46)
+        self.brand_icon.setFixedSize(52, 38)
         icon_candidates = (
             Path(__file__).resolve().parents[2] / "assets" / "fluke8845a_app_icon_v3.png",
             Path(sys.argv[0]).resolve().parent / "assets" / "fluke8845a_app_icon_v3.png",
@@ -544,48 +578,68 @@ class MainWindow(QMainWindow):
             self.brand_icon.setText("8845A")
         title = QLabel("Fluke 8845A")
         title.setObjectName("mainTitle")
-        subtitle = QLabel("精密测量工作台  ·  实时采集与长期记录")
-        subtitle.setObjectName("subtitle")
         title_stack = QVBoxLayout()
-        title_stack.setSpacing(2)
+        title_stack.setSpacing(0)
         title_stack.addWidget(title)
-        title_stack.addWidget(subtitle)
         header_layout.addWidget(self.brand_icon)
         header_layout.addLayout(title_stack)
         header_layout.addStretch(1)
-        self.header_hint = QLabel("RS-232  ·  原始读数逐点记录")
-        self.header_hint.setObjectName("headerHint")
-        header_layout.addWidget(self.header_hint)
         self.connection_badge = QLabel("未连接")
         self.connection_badge.setObjectName("connectionBadge")
-        self.connection_badge.setMinimumHeight(36)
+        self.connection_badge.setMinimumHeight(32)
         header_layout.addWidget(self.connection_badge)
         root_layout.addWidget(header)
 
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.setObjectName("workspaceSplitter")
-        self.splitter.setChildrenCollapsible(False)
-        self.splitter.setHandleWidth(8)
+        setup_panel = self._build_setup_panel()
+        chart_panel = self._build_chart_panel()
+        root_layout.addWidget(chart_panel, 1)
+
+        self.configuration_dialog = QDialog(self)
+        self.configuration_dialog.setObjectName("configurationDialog")
+        self.configuration_dialog.setWindowTitle("仪器与实验设置")
+        self.configuration_dialog.resize(1020, 780)
+        dialog_layout = QVBoxLayout(self.configuration_dialog)
+        dialog_layout.setContentsMargins(16, 12, 16, 14)
+        dialog_layout.setSpacing(10)
+        dialog_heading = QHBoxLayout()
+        dialog_title = QLabel("仪器与实验设置")
+        dialog_title.setObjectName("dialogTitle")
+        dialog_heading.addWidget(dialog_title)
+        dialog_heading.addStretch(1)
+        close_settings = QPushButton("完成")
+        close_settings.setObjectName("secondaryButton")
+        close_settings.clicked.connect(self.configuration_dialog.hide)
+        dialog_heading.addWidget(close_settings)
+        dialog_layout.addLayout(dialog_heading)
+        self.configuration_tabs = QTabWidget()
+        self.configuration_tabs.setObjectName("configurationTabs")
         setup_scroll = QScrollArea()
-        setup_scroll.setObjectName("setupScrollArea")
+        setup_scroll.setObjectName("configurationScrollArea")
         setup_scroll.setWidgetResizable(True)
         setup_scroll.setFrameShape(QFrame.Shape.NoFrame)
         setup_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        setup_scroll.setMinimumWidth(350)
-        setup_scroll.setMaximumWidth(480)
-        setup_scroll.setWidget(self._build_setup_panel())
-        self.splitter.addWidget(setup_scroll)
-        self.splitter.addWidget(self._build_chart_panel())
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setCollapsible(0, False)
-        self.splitter.setCollapsible(1, False)
-        self.splitter.setSizes([460, 1040])
-        self.splitter.splitterMoved.connect(lambda *_: self._update_readout_layout())
-        root_layout.addWidget(self.splitter, 1)
+        setup_scroll.setWidget(setup_panel)
+        self.setup_scroll_area = setup_scroll
+        self.configuration_tabs.addTab(setup_scroll, "连接与采集")
+        self.configuration_tabs.addTab(self.analysis_tabs, "分析与事件")
+        dialog_layout.addWidget(self.configuration_tabs, 1)
 
         self.setStatusBar(QStatusBar(self))
+        self.configuration_button = QPushButton("设置与分析…")
+        self.configuration_button.setObjectName("statusAction")
+        self.configuration_button.setToolTip("打开串口、测量、实验、分析及日志设置")
+        self.configuration_button.clicked.connect(self._show_configuration)
+        self.statusBar().addPermanentWidget(self.configuration_button)
+        self.statusBar().setSizeGripEnabled(False)
+
+        self._build_log_dock()
         self._build_menus()
+        self.log_dock.toggleViewAction().setText("显示通信日志面板")
+
+    def _show_configuration(self) -> None:
+        self.configuration_dialog.show()
+        self.configuration_dialog.raise_()
+        self.configuration_dialog.activateWindow()
 
     def _build_setup_panel(self) -> QWidget:
         panel = QWidget()
@@ -825,6 +879,14 @@ class MainWindow(QMainWindow):
             "实际频率仍受仪器转换与串口限制。"
         )
         self.interval_spin.valueChanged.connect(self._on_sampling_interval_changed)
+        interval_row = QHBoxLayout()
+        interval_row.setContentsMargins(0, 0, 0, 0)
+        interval_row.addWidget(QLabel("目标采样间隔"))
+        self.interval_spin.setMinimumWidth(110)
+        interval_row.addWidget(self.interval_spin)
+        interval_row.addWidget(QLabel("0 = 最快可用"))
+        interval_row.addStretch(1)
+        experiment_layout.addLayout(interval_row)
 
         self.start_button = QPushButton("开始连续采集")
         self.start_button.setObjectName("primaryButton")
@@ -855,7 +917,6 @@ class MainWindow(QMainWindow):
         self.log_box = QLineEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setPlaceholderText("SCPI收发与运行诊断记录显示在日志面板中。")
-        self._build_log_dock()
         return panel
 
     def _build_chart_panel(self) -> QWidget:
@@ -965,16 +1026,6 @@ class MainWindow(QMainWindow):
         action_divider.setObjectName("toolbarDivider")
         action_divider.setFrameShape(QFrame.Shape.VLine)
         action_layout.addWidget(action_divider)
-        interval_caption = QLabel("目标间隔")
-        interval_caption.setObjectName("toolbarLabel")
-        action_layout.addWidget(interval_caption)
-        self.interval_spin.setMinimumWidth(104)
-        self.interval_spin.setMaximumWidth(128)
-        self.interval_spin.setMinimumHeight(38)
-        action_layout.addWidget(self.interval_spin)
-        interval_hint = QLabel("0 = 最快")
-        interval_hint.setObjectName("toolbarHint")
-        action_layout.addWidget(interval_hint)
         action_layout.addStretch(1)
         layout.addWidget(action_bar)
 
@@ -987,16 +1038,16 @@ class MainWindow(QMainWindow):
         self.follow_check.setChecked(True)
         self.follow_check.setToolTip("开启后视图随最新读数滚动；关闭后可以固定查看历史区间")
         plot_toolbar_layout.addWidget(self.follow_check)
-        self.acquisition_hint = QLabel("原始读数逐点写入实验目录")
+        self.acquisition_hint = QLabel("滚轮：纵轴  ·  Shift：时间  ·  Ctrl：双轴  ·  Alt：以零点缩放")
         self.acquisition_hint.setObjectName("secondaryText")
         plot_toolbar_layout.addWidget(self.acquisition_hint)
         plot_toolbar_layout.addStretch(1)
-        self.autoscale_button = QPushButton("视图复位")
+        self.autoscale_button = QPushButton("自动缩放")
         self.autoscale_button.setObjectName("secondaryButton")
         self.autoscale_button.setToolTip("自动缩放坐标轴以显示曲线数据")
         self.autoscale_button.clicked.connect(self._autoscale_plot)
         plot_toolbar_layout.addWidget(self.autoscale_button)
-        self.history_button = QPushButton("加载历史")
+        self.history_button = QPushButton("加载 CSV")
         self.history_button.setObjectName("secondaryButton")
         self.history_button.clicked.connect(self._load_history)
         plot_toolbar_layout.addWidget(self.history_button)
@@ -1012,22 +1063,25 @@ class MainWindow(QMainWindow):
         plot_layout = QStackedLayout(plot_frame)
         plot_layout.setContentsMargins(4, 4, 4, 4)
         plot_layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
-        self.plot_widget = pg.PlotWidget()
+        self.view_box = _MeasurementViewBox()
+        self.plot_widget = pg.PlotWidget(viewBox=self.view_box)
         self.plot_widget.setObjectName("trendPlot")
         self.plot_widget.setMinimumHeight(230)
-        self.plot_widget.setBackground("#fbfcfd")
+        self.plot_widget.setBackground("#fbf9f1")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.11)
-        self.plot_widget.setLabel("bottom", "实验经过时间", units="s")
-        self.plot_widget.setLabel("left", "测量值")
-        self.plot_widget.addLegend(offset=(12, 8))
-        self.curve = self.plot_widget.plot([], [], pen=pg.mkPen("#007f86", width=2.4), name="原始读数")
+        self.plot_widget.setLabel("bottom", "实验经过时间", units="s", color="#697470")
+        self.plot_widget.setLabel("left", "测量值", color="#697470")
+        legend = self.plot_widget.addLegend(offset=(12, 8))
+        legend.setLabelTextColor("#526064")
+        self.curve = self.plot_widget.plot([], [], pen=pg.mkPen("#138b92", width=2.2), name="原始读数")
         plot_item = self.plot_widget.getPlotItem()
         for axis_name in ("left", "bottom"):
             axis = plot_item.getAxis(axis_name)
-            axis.setTextPen(pg.mkPen("#526477"))
-            axis.setPen(pg.mkPen("#b8c5d0"))
-            axis.setTickFont(QFont("Microsoft YaHei UI", 9))
+            axis.setTextPen(pg.mkPen("#526064"))
+            axis.setPen(pg.mkPen("#96a09a"))
+            axis.setTickFont(QFont("Microsoft YaHei UI", 10))
         plot_item.vb.sigRangeChanged.connect(self._position_event_labels)
+        self.view_box.userZoomed.connect(self._on_plot_wheel_zoom)
         plot_item.setMenuEnabled(False)
         plot_item.vb.setMouseEnabled(x=True, y=True)
         plot_item.setClipToView(True)
@@ -1075,8 +1129,8 @@ class MainWindow(QMainWindow):
         self.analysis_tabs = QTabWidget()
         self.analysis_tabs.setObjectName("analysisTabs")
         self.analysis_tabs.setDocumentMode(True)
-        self.analysis_tabs.setMinimumHeight(122)
-        self.analysis_tabs.setMaximumHeight(168)
+        self.analysis_tabs.setMinimumHeight(180)
+        self.analysis_tabs.setMaximumHeight(16777215)
 
         stats_tab = QWidget()
         stats_layout = QVBoxLayout(stats_tab)
@@ -1091,6 +1145,7 @@ class MainWindow(QMainWindow):
         stats_layout.addLayout(stats_header)
         stats_layout.addWidget(self.stats_label)
         stats_layout.addWidget(self._region_stats_label)
+        stats_layout.addStretch(1)
         self.analysis_tabs.addTab(stats_tab, "统计")
 
         baseline_tab = QWidget()
@@ -1132,6 +1187,7 @@ class MainWindow(QMainWindow):
         self.cursor_label = QLabel("游标：移动鼠标到曲线上读取邻近数据点")
         self.cursor_label.setObjectName("secondaryText")
         baseline_layout.addWidget(self.cursor_label)
+        baseline_layout.addStretch(1)
         self.analysis_tabs.addTab(baseline_tab, "基准变化")
 
         event_tab = QWidget()
@@ -1148,8 +1204,8 @@ class MainWindow(QMainWindow):
         event_row.addWidget(self.event_edit, 1)
         event_row.addWidget(self.event_button)
         event_layout.addLayout(event_row)
+        event_layout.addStretch(1)
         self.analysis_tabs.addTab(event_tab, "实验事件")
-        layout.addWidget(self.analysis_tabs)
         return panel
 
     def resizeEvent(self, event) -> None:
@@ -1187,16 +1243,14 @@ class MainWindow(QMainWindow):
         else:
             self._reading_layout.setContentsMargins(18, 14, 18, 14)
         self._reading_text_layout.setSpacing(1 if stacked else 3)
-        self._chart_panel_layout.setSpacing(4 if stacked or short_chart else 10)
+        self._chart_panel_layout.setSpacing(5 if stacked or short_chart else 9)
         if stacked or short_chart:
             self._action_layout.setContentsMargins(10, 4, 10, 4)
         else:
             self._action_layout.setContentsMargins(10, 7, 10, 7)
         compact_chart = stacked or short_chart
-        self.plot_widget.setMinimumHeight(175 if compact_chart else 230)
-        self._plot_frame.setMinimumHeight(177 if compact_chart else 232)
-        self.analysis_tabs.setMinimumHeight(96 if compact_chart else 122)
-        self.analysis_tabs.setMaximumHeight(136 if compact_chart else 168)
+        self.plot_widget.setMinimumHeight(190 if compact_chart else 230)
+        self._plot_frame.setMinimumHeight(192 if compact_chart else 232)
         self._reading_card.style().unpolish(self._reading_card)
         self._reading_card.style().polish(self._reading_card)
         self._reading_card.updateGeometry()
@@ -1208,7 +1262,12 @@ class MainWindow(QMainWindow):
             QFrame.Shape.HLine if mode == "stacked" else QFrame.Shape.VLine
         )
 
+    def _on_plot_wheel_zoom(self, zoom_x: bool, _zoom_y: bool) -> None:
+        if zoom_x:
+            self.follow_check.setChecked(False)
+
     def _autoscale_plot(self) -> None:
+        self.follow_check.setChecked(False)
         self.plot_widget.getPlotItem().enableAutoRange(x=True, y=True)
         self.plot_widget.autoRange(padding=0.04)
 
@@ -1254,122 +1313,84 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self) -> None:
         self.setStyleSheet("""
-            QMainWindow { background: #f2f5f8; color: #172033; }
-            QWidget { background: transparent; color: #172033; }
-            QWidget#appRoot { background: #f2f5f8; }
-            QWidget#setupPanel, QWidget#measurementWorkspace { background: transparent; }
+            QMainWindow { background: #252d31; color: #273136; }
+            QWidget { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; color: #273136; }
+            QWidget#appRoot { background: #252d31; }
+            QFrame#appHeader { background: #30383c; border: 1px solid #465156; border-radius: 9px; }
+            QLabel#brandIcon { background: #f1efe6; border: 1px solid #bdc0b7; border-radius: 6px; color: #176d72; font-weight: 800; }
+            QLabel#mainTitle { color: #f1efe6; font-size: 18px; font-weight: 700; letter-spacing: .03em; }
+            QMenuBar { background: #252d31; color: #e7e8df; padding: 2px 7px; }
+            QMenuBar::item:selected, QMenu::item:selected { background: #414d51; color: #6de1e2; }
+            QMenu { background: #30383c; color: #f1efe6; border: 1px solid #505b5f; padding: 4px; }
+            QDialog#configurationDialog { background: #f1efe6; }
+            QDialog#configurationDialog QWidget { color: #273136; }
+            QLabel#dialogTitle { color: #273136; font-size: 19px; font-weight: 700; }
+            QWidget#setupPanel { background: #f1efe6; }
             QScrollArea { background: transparent; border: 0; }
-            QFrame#appHeader {
-                background: #ffffff; border: 1px solid #dce3ea; border-radius: 12px;
+            QTabWidget#configurationTabs::pane, QTabWidget#setupTabs::pane, QTabWidget#analysisTabs::pane { background: transparent; border: 0; }
+            QTabWidget#configurationTabs QTabBar::tab, QTabWidget#setupTabs QTabBar::tab, QTabWidget#analysisTabs QTabBar::tab {
+                background: transparent; color: #697579; border: 0; border-bottom: 2px solid transparent; padding: 8px 14px; margin-right: 5px;
             }
-            QLabel#brandIcon {
-                background: #f4f6f8; border: 1px solid #e4e9ee; border-radius: 9px;
-                color: #087e88; font-weight: 800; font-size: 12px;
+            QTabWidget#configurationTabs QTabBar::tab:selected, QTabWidget#setupTabs QTabBar::tab:selected, QTabWidget#analysisTabs QTabBar::tab:selected {
+                color: #176d72; font-weight: 700; border-bottom-color: #29aab0;
             }
-            QMenuBar { background: #f2f5f8; color: #334155; padding: 3px 8px; }
-            QMenuBar::item:selected, QMenu::item:selected { background: #e4f1f2; color: #086c78; }
-            QMenu { background: #ffffff; border: 1px solid #d8e0e8; padding: 4px; }
-            QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #14283a; }
-            QTabWidget#setupTabs::pane { background: transparent; border: 0; top: -1px; }
-            QTabWidget#setupTabs QTabBar::tab {
-                background: transparent; color: #68788b; border: 0;
-                padding: 8px 18px; margin-right: 4px; border-bottom: 2px solid transparent;
-            }
-            QTabWidget#setupTabs QTabBar::tab:selected {
-                color: #087e88; font-weight: 700; border-bottom: 2px solid #0c8790;
-            }
-            QGroupBox#sidebarCard {
-                background: #ffffff; border: 1px solid #dce3ea; border-radius: 11px;
-                margin-top: 12px; padding: 11px 8px 9px; font-weight: 600;
-            }
-            QGroupBox#sidebarCard::title {
-                subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #334155;
-                background: #ffffff;
-            }
+            QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #273136; }
+            QLabel#subtitle, QLabel#secondaryText { color: #677277; }
+            QWidget#measurementWorkspace QLabel#secondaryText { color: #b7c2bc; }
+            QGroupBox#sidebarCard { background: #faf9f4; border: 1px solid #cbd0c9; border-radius: 8px; margin-top: 12px; padding: 11px 8px 9px; font-weight: 650; }
+            QGroupBox#sidebarCard::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #394448; background: #faf9f4; }
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {
-                background: #ffffff; color: #1f2937; border: 1px solid #cbd5df;
-                border-radius: 7px; padding: 6px 9px; selection-background-color: #0c8790;
-                min-height: 25px;
+                background: #fffefa; color: #273136; border: 1px solid #bfc7c4; border-radius: 5px; padding: 5px 8px; selection-background-color: #17858b; min-height: 25px;
             }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-                border: 1px solid #0c8790;
-            }
-            QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
-                background: #edf1f4; color: #94a0ad; border-color: #e0e6ec;
-            }
-            QComboBox::drop-down { border: 0; width: 22px; }
-            QPushButton {
-                background: #ffffff; color: #334155; border: 1px solid #ccd6df;
-                border-radius: 7px; padding: 7px 11px; min-height: 25px;
-            }
-            QPushButton:hover { background: #f2f7f8; border-color: #9aadb9; }
-            QPushButton:disabled { color: #9aa5b1; background: #edf1f4; border-color: #dce2e8; }
-            QPushButton#primaryButton {
-                background: #087e88; border-color: #087e88; color: #ffffff; font-weight: 700;
-            }
-            QPushButton#primaryButton:hover { background: #066c75; border-color: #066c75; }
-            QPushButton#dangerButton { color: #a33e3b; border-color: #e4b9b8; background: #fffafa; }
-            QPushButton#dangerButton:hover { background: #fff0ef; }
-            QPushButton#secondaryButton { color: #334155; }
-            QToolButton#disclosureButton { color: #536579; border: 0; text-align: left; padding: 4px 2px; }
-            QToolButton#disclosureButton:hover { color: #087e88; }
-            QCheckBox { spacing: 7px; color: #334155; }
-            QCheckBox:disabled { color: #98a3ae; }
-            QLabel#mainTitle { font-size: 21px; font-weight: 700; color: #14283a; }
-            QLabel#subtitle, QLabel#secondaryText { color: #5f7183; }
-            QLabel#headerHint { color: #5f7183; padding-right: 8px; }
-            QLabel#connectionBadge {
-                padding: 7px 12px; background: #e9eef3; border: 1px solid #d4dde6;
-                border-radius: 10px; color: #475569; font-weight: 700;
-            }
-            QLabel#connectionBadge[state="connected"] { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
-            QLabel#connectionBadge[state="mock"] { color: #92400e; background: #fffbeb; border-color: #fde68a; }
-            QFrame#readingCard { background: #142334; border: 1px solid #1c3449; border-radius: 14px; }
-            QFrame#readingCard QLabel#eyebrow { color: #9cafc0; font-size: 10px; font-weight: 600; }
-            QLabel#readingMode { color: #c2d2df; font-size: 12px; font-weight: 600; }
-            QLabel#readingValue { font-family: Consolas, 'Cascadia Mono'; font-size: 38px; font-weight: 700; color: #8ce7e4; }
-            QFrame#readingCard[compact="true"] QLabel#readingValue { font-size: 30px; }
-            QFrame#readingCard[stacked="true"] QLabel#readingValue { font-size: 22px; }
-            QFrame#readingCard[stacked="true"] QLabel#readingMode { font-size: 11px; }
-            QFrame#metricCell {
-                background: #1b2b3a; border: 1px solid #2a4052; border-radius: 9px;
-            }
-            QFrame#readingCard QFrame#metricCell QLabel#eyebrow { color: #91a8b9; font-size: 9px; }
-            QFrame#readingCard[compact="true"] QLabel#metricValue,
-            QFrame#readingCard[compact="true"] QLabel#statusValue { font-size: 11px; }
-            QFrame#readingCard QLabel#metricValue, QFrame#readingCard QLabel#statusValue { font-size: 13px; font-weight: 700; color: #edf5fa; }
-            QLabel#statusDot[state="running"] { color: #16a34a; }
-            QLabel#statusDot[state="paused"] { color: #d97706; }
-            QFrame#readingCard QLabel#statusDot[state="running"] { color: #5fdfa0; }
-            QFrame#readingCard QLabel#statusDot[state="paused"] { color: #ffc767; }
-            QFrame#readingCard QLabel#statusDot[state="idle"] { color: #8999aa; }
-            QFrame#cardDivider { color: #375064; }
-            QFrame#toolbarDivider { color: #e0e6ec; }
-            QFrame#actionBar { background: #ffffff; border: 1px solid #dce3ea; border-radius: 11px; }
-            QFrame#plotCard { background: #ffffff; border: 1px solid #dce3ea; border-radius: 11px; }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #17858b; }
+            QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { background: #e8e8e0; color: #919895; border-color: #d5d8d1; }
+            QPushButton { background: #faf9f4; color: #334045; border: 1px solid #bfc7c4; border-radius: 5px; padding: 6px 10px; min-height: 25px; }
+            QPushButton:hover { background: #e8f1ed; border-color: #7a9a96; }
+            QPushButton:disabled { color: #99a09e; background: #e7e8e1; border-color: #d1d4cd; }
+            QPushButton#primaryButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; }
+            QPushButton#primaryButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#dangerButton { color: #982f2b; border-color: #d6aaa3; background: #fff8f4; }
+            QPushButton#secondaryButton { color: #344247; }
+            QPushButton#statusAction { background: #414b4f; color: #e9e9df; border: 1px solid #596468; padding: 3px 12px; min-height: 22px; }
+            QPushButton#statusAction:hover { color: #6de1e2; border-color: #42aeb1; }
+            QToolButton#disclosureButton { color: #536166; border: 0; text-align: left; padding: 4px 2px; }
+            QCheckBox { spacing: 7px; color: #3e4a4f; }
+            QLabel#connectionBadge { padding: 6px 10px; background: #424c50; border: 1px solid #5b6669; border-radius: 6px; color: #d7ded9; font-size: 11px; font-weight: 700; }
+            QLabel#connectionBadge[state="connected"] { color: #a9efce; background: #29433c; border-color: #47705f; }
+            QLabel#connectionBadge[state="mock"] { color: #f4c579; background: #51412a; border-color: #8c6d3c; }
+            QFrame#readingCard { background: #1d262a; border: 1px solid #4b585a; border-radius: 8px; }
+            QFrame#readingCard QLabel#eyebrow { color: #a5b2ad; font-size: 10px; font-weight: 600; }
+            QLabel#readingMode { color: #c7d2cc; font-size: 12px; font-weight: 600; }
+            QLabel#readingValue { color: #73e2e2; font-family: "Cascadia Mono", Consolas, monospace; font-size: 42px; font-weight: 650; }
+            QFrame#readingCard[compact="true"] QLabel#readingValue { font-size: 32px; }
+            QFrame#readingCard[stacked="true"] QLabel#readingValue { font-size: 27px; }
+            QFrame#metricCell { background: #303b3e; border: 1px solid #465458; border-radius: 6px; }
+            QFrame#readingCard QFrame#metricCell QLabel#eyebrow { color: #a8b5ae; font-size: 9px; }
+            QFrame#readingCard QLabel#metricValue, QFrame#readingCard QLabel#statusValue { color: #f0f0e7; font-size: 13px; font-weight: 700; }
+            QFrame#readingCard[compact="true"] QLabel#metricValue, QFrame#readingCard[compact="true"] QLabel#statusValue { font-size: 11px; }
+            QFrame#readingCard QLabel#statusDot[state="running"] { color: #69d8a4; }
+            QFrame#readingCard QLabel#statusDot[state="paused"] { color: #e6a23a; }
+            QFrame#readingCard QLabel#statusDot[state="idle"] { color: #8e9b98; }
+            QFrame#cardDivider { color: #46565a; }
+            QFrame#toolbarDivider { color: #596367; }
+            QFrame#actionBar { background: #30383c; border: 1px solid #465156; border-radius: 7px; }
+            QFrame#actionBar QPushButton { min-height: 30px; }
+            QFrame#plotCard { background: #f1efe6; border: 1px solid #8d9690; border-radius: 8px; }
             QWidget#plotEmptyOverlay { background: transparent; }
-            QLabel#plotEmptyTitle { color: #627488; font-size: 18px; font-weight: 700; }
-            QLabel#plotEmptyHint { color: #8795a5; font-size: 11px; }
-            QLabel#toolbarLabel { color: #425367; font-weight: 700; }
-            QLabel#toolbarHint { color: #8190a1; font-size: 9px; }
-            QTabWidget#analysisTabs::pane { background: #ffffff; border: 1px solid #dce3ea; border-radius: 9px; top: -1px; }
-            QTabWidget#analysisTabs QTabBar::tab {
-                background: transparent; color: #718096; border: 0;
-                border-bottom: 2px solid transparent; padding: 7px 14px; margin-right: 5px;
-            }
-            QTabWidget#analysisTabs QTabBar::tab:selected { color: #087e88; font-weight: 700; border-bottom: 2px solid #0c8790; }
-            QLabel#safetyBox { background: #fff7e8; color: #87571c; border: 1px solid #f2d8aa; border-radius: 8px; padding: 9px; }
-            QLabel#changeLabel { color: #a45a0a; font-weight: 700; }
-            QStatusBar { background: #e9eef3; color: #526173; border-top: 1px solid #d8e0e8; }
-            QDockWidget { color: #334155; }
-            QDockWidget::title { background: #e9eef3; padding: 7px 10px; border-top: 1px solid #d8e0e8; }
-            QScrollBar:vertical { background: #f2f5f8; width: 10px; margin: 1px; }
-            QScrollBar::handle:vertical { background: #c4ced8; min-height: 26px; border-radius: 5px; }
+            QLabel#plotEmptyTitle { color: #465457; font-size: 18px; font-weight: 700; }
+            QLabel#plotEmptyHint { color: #7c8782; font-size: 11px; }
+            QLabel#toolbarLabel { color: #d6ded8; font-weight: 700; }
+            QLabel#toolbarHint { color: #9ca8a2; font-size: 9px; }
+            QLabel#safetyBox { background: #fff3d7; color: #75551e; border: 1px solid #e5c27d; border-radius: 6px; padding: 9px; }
+            QLabel#changeLabel { color: #966219; font-weight: 700; }
+            QStatusBar { background: #252d31; color: #c1cbc5; border-top: 1px solid #414c50; }
+            QDockWidget { color: #e2e7df; }
+            QDockWidget::title { background: #30383c; padding: 6px 10px; border-top: 1px solid #465156; }
+            QScrollBar:vertical { background: #e7e7de; width: 10px; margin: 1px; }
+            QScrollBar::handle:vertical { background: #aab4ae; min-height: 26px; border-radius: 5px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
-        # Qt's stylesheet metrics can grow the spin box after its construction.
-        self.interval_spin.setMinimumHeight(max(40, self.interval_spin.sizeHint().height()))
-
+        self.interval_spin.setMinimumHeight(max(38, self.interval_spin.sizeHint().height()))
     def _load_profiles(self) -> dict:
         profiles = {}
         if self._profile_path.exists():
@@ -1701,7 +1722,7 @@ class MainWindow(QMainWindow):
         baseline = stored.get("baseline")
         self._baseline = float(baseline) if baseline is not None else None
         self.baseline_edit.setText("" if self._baseline is None else repr(self._baseline))
-        self.plot_widget.setLabel("left", spec.display_quantity, units=spec.unit_si)
+        self.plot_widget.setLabel("left", spec.display_quantity, units=spec.unit_si, color="#697470")
         self.latest_value_label.setText("等待读数")
         self._update_range_enabled()
         self._loading_mode_controls = False
@@ -2530,7 +2551,7 @@ class MainWindow(QMainWindow):
             for event_elapsed, event_text in history_events:
                 self._add_event_marker(event_text, elapsed_s=event_elapsed)
             spec = descriptor(self._current_mode)
-            self.plot_widget.setLabel("left", f"历史数据 · {spec.display_quantity}", units=spec.unit_si)
+            self.plot_widget.setLabel("left", f"历史数据 · {spec.display_quantity}", units=spec.unit_si, color="#697470")
             displayed, unit = engineering_value(last_value, spec.unit_si)
             self.latest_value_label.setText(f"{displayed:.10g} {unit}")
             rate_span = last_elapsed - first_elapsed

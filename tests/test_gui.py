@@ -31,7 +31,7 @@ def qt_app():
     return app
 
 
-def test_gui_uses_separate_setup_tabs_and_keeps_the_plot_workspace_clear(
+def test_main_window_is_a_single_plot_with_settings_in_a_separate_window(
     qt_app, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
@@ -39,6 +39,12 @@ def test_gui_uses_separate_setup_tabs_and_keeps_the_plot_workspace_clear(
     try:
         assert [window.setup_tabs.tabText(i) for i in range(window.setup_tabs.count())] == ["仪器", "实验"]
         assert window.log_dock.isHidden()
+        assert window.configuration_dialog.isHidden()
+        assert window.configuration_tabs.count() == 2
+        assert window.configuration_tabs.tabText(0) == "连接与采集"
+        assert window.configuration_tabs.tabText(1) == "分析与事件"
+        assert window.configuration_button.text() == "设置与分析…"
+        assert window.setup_scroll_area.objectName() == "configurationScrollArea"
         assert window.port_combo.minimumContentsLength() == 14
         assert window.nplc_combo.isEnabled()
         assert not window.bandwidth_combo.isEnabled()
@@ -48,6 +54,11 @@ def test_gui_uses_separate_setup_tabs_and_keeps_the_plot_workspace_clear(
         assert window.latest_value_label.text() == "等待读数"
         assert "DCV" in window.reading_mode_label.text()
         assert not window.plot_empty_overlay.isHidden()
+        assert window.plot_widget.parent() is not None
+        assert all(window._chart_panel_layout.itemAt(i).widget() is not window.analysis_tabs
+                   for i in range(window._chart_panel_layout.count()))
+        assert window.autoscale_button.text() == "自动缩放"
+        assert "Shift" in window.acquisition_hint.text()
 
         window._on_status("连续采集中 · 目标间隔 0 s")
         assert window.experiment_status.text() == "连续采集中"
@@ -81,10 +92,12 @@ def test_minimum_window_size_does_not_clip_the_readout_or_analysis(qt_app, monke
     try:
         window.resize(1040, 700)
         window.show()
+        window._show_configuration()
+        window.configuration_tabs.setCurrentIndex(1)
         qt_app.processEvents()
         qt_app.processEvents()
 
-        assert window._reading_layout_mode == "stacked"
+        assert window.configuration_dialog.isVisible()
         assert window.measurement_workspace.height() >= window.measurement_workspace.minimumSizeHint().height()
         assert window.latest_value_label.height() >= window.latest_value_label.minimumSizeHint().height()
         assert not window.reading_mode_label.geometry().intersects(window.latest_value_label.geometry())
@@ -122,10 +135,17 @@ def test_high_dpi_layout_keeps_readout_chart_and_controls_separate(tmp_path):
         window = MainWindow()
         window.resize(1280, 720)
         window.show()
+        window._show_configuration()
         app.processEvents()
         app.processEvents()
 
         controls = (window.nplc_combo, window.apply_speed_button, window.interval_spin)
+        window.configuration_tabs.setCurrentIndex(1)
+        app.processEvents()
+        analysis_height = window.analysis_tabs.height()
+        analysis_minimum_height = window.analysis_tabs.minimumHeight()
+        window.configuration_tabs.setCurrentIndex(0)
+        app.processEvents()
         panel_items = []
         for index in range(window._chart_panel_layout.count()):
             widget = window._chart_panel_layout.itemAt(index).widget()
@@ -138,6 +158,12 @@ def test_high_dpi_layout_keeps_readout_chart_and_controls_separate(tmp_path):
                     if widget is not None else []
                 ),
             })
+        window.setup_tabs.setCurrentIndex(1)
+        app.processEvents()
+        interval_visible = controls[2].isVisible()
+        interval_fits = controls[2].height() >= controls[2].sizeHint().height()
+        window.setup_tabs.setCurrentIndex(0)
+        app.processEvents()
         snapshot = {
             "device_pixel_ratio": window.devicePixelRatioF(),
             "reading_labels_overlap": window.reading_mode_label.geometry().intersects(
@@ -145,11 +171,14 @@ def test_high_dpi_layout_keeps_readout_chart_and_controls_separate(tmp_path):
             ),
             "plot_height": window.plot_widget.height(),
             "plot_minimum_height": window.plot_widget.minimumHeight(),
-            "analysis_height": window.analysis_tabs.height(),
-            "analysis_minimum_height": window.analysis_tabs.minimumHeight(),
-            "setup_scroll_area": window.splitter.widget(0).objectName(),
-            "controls_visible": [control.isVisible() for control in controls],
-            "controls_fit": [control.height() >= control.sizeHint().height() for control in controls],
+            "analysis_height": analysis_height,
+            "analysis_minimum_height": analysis_minimum_height,
+            "setup_scroll_area": window.setup_scroll_area.objectName(),
+            "configuration_visible": window.configuration_dialog.isVisible(),
+            "instrument_controls_visible": [control.isVisible() for control in controls[:2]],
+            "instrument_controls_fit": [control.height() >= control.sizeHint().height() for control in controls[:2]],
+            "interval_visible": interval_visible,
+            "interval_fits": interval_fits,
             "panel_items": panel_items,
             "panel_items_ordered": all(
                 current["geometry"][1] + current["geometry"][3] <= following["geometry"][1]
@@ -177,9 +206,12 @@ def test_high_dpi_layout_keeps_readout_chart_and_controls_separate(tmp_path):
     assert not snapshot["reading_labels_overlap"]
     assert snapshot["plot_height"] >= snapshot["plot_minimum_height"]
     assert snapshot["analysis_height"] >= snapshot["analysis_minimum_height"]
-    assert snapshot["setup_scroll_area"] == "setupScrollArea"
-    assert all(snapshot["controls_visible"])
-    assert all(snapshot["controls_fit"])
+    assert snapshot["setup_scroll_area"] == "configurationScrollArea"
+    assert snapshot["configuration_visible"]
+    assert all(snapshot["instrument_controls_visible"])
+    assert all(snapshot["instrument_controls_fit"])
+    assert snapshot["interval_visible"]
+    assert snapshot["interval_fits"]
     assert snapshot["panel_items_ordered"], snapshot["panel_items"]
     assert snapshot["worker_shutdown"]
 
@@ -885,13 +917,46 @@ def test_speed_and_interval_controls_remain_readable_at_minimum_window_size(
     try:
         window.resize(1120, 720)
         window.show()
+        window._show_configuration()
         qt_app.processEvents()
 
-        assert window.splitter.widget(0).objectName() == "setupScrollArea"
-        for control in (window.nplc_combo, window.apply_speed_button, window.interval_spin):
+        assert window.setup_scroll_area.objectName() == "configurationScrollArea"
+        for control in (window.nplc_combo, window.apply_speed_button):
             assert control.height() >= control.sizeHint().height()
             assert control.isVisible()
+        window.setup_tabs.setCurrentIndex(1)
+        qt_app.processEvents()
+        assert window.interval_spin.height() >= window.interval_spin.sizeHint().height()
+        assert window.interval_spin.isVisible()
         assert window.plot_widget.height() >= 120
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("modifiers", "expected"),
+    [
+        (gui_module.Qt.KeyboardModifier.NoModifier, (False, True)),
+        (gui_module.Qt.KeyboardModifier.ShiftModifier, (True, False)),
+        (gui_module.Qt.KeyboardModifier.ControlModifier, (True, True)),
+        (gui_module.Qt.KeyboardModifier.AltModifier, (False, True)),
+        (gui_module.Qt.KeyboardModifier.AltModifier | gui_module.Qt.KeyboardModifier.ShiftModifier, (False, True)),
+    ],
+)
+def test_wheel_zoom_modifier_mapping(modifiers, expected):
+    assert gui_module._wheel_zoom_axes(modifiers) == expected
+
+
+def test_manual_vertical_zoom_keeps_live_follow_but_time_zoom_stops_it(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.follow_check.setChecked(True)
+        window._on_plot_wheel_zoom(False, True)
+        assert window.follow_check.isChecked()
+        window._on_plot_wheel_zoom(True, False)
+        assert not window.follow_check.isChecked()
     finally:
         window.close()
         qt_app.processEvents()
