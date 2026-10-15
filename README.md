@@ -61,6 +61,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 - [SCPI 命令与技术依据](docs/scpi-reference.md)
 - [使用指南](docs/user-guide.md)
+- [短时真机 GUI 探测](docs/hardware-probes.md)
 - [已知限制](docs/known-limitations.md)
 - [v1.0.1 发布说明](docs/release-notes-v1.0.1.md)
 - [v1.0.0 发布说明](docs/release-notes-v1.0.0.md)
@@ -134,6 +135,7 @@ This source release does not bundle Qt libraries. Do not treat the project MIT l
 
 - [SCPI commands and technical basis](docs/scpi-reference.md)
 - [Usage guide](docs/user-guide.md)
+- [Short hardware GUI probes](docs/hardware-probes.md)
 - [Known limitations](docs/known-limitations.md)
 - [v1.0.1 release notes](docs/release-notes-v1.0.1.md)
 - [v1.0.0 release notes](docs/release-notes-v1.0.0.md)

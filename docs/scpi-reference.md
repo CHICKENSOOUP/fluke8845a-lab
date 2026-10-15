@@ -65,7 +65,7 @@ The application does not configure capacitance, RTD temperature, source output, 
 ### Conservative implementation boundaries
 
 - Parameters are validated against documented discrete values. A non-zero instrument error queue aborts configuration and acquisition.
-- The 400 mA DCI/ACI ranges check documented firmware thresholds. If firmware cannot be identified, the fixed range and potentially crossing autorange are disabled.
+- The 400 mA DCI/ACI ranges enforce the documented firmware threshold when the reported version is identifiable and demonstrably too old. An unparseable date-style `*IDN?` field alone does not block the range; verify firmware on the front panel when the version is not readable from SCPI.
 - 1/3/10 A ranges are exposed only when front-panel terminals are confirmed; rear-terminal operation blocks these fixed ranges and current autorange.
 - `READ?` timestamps are host timestamps taken before sending the command. The meter supplies no hardware timestamp per sample; `read_duration_s` records the read and range-query interval. Published typical maximum speeds are not treated as guarantees.
 - The configured serial timeout is the floor for ordinary SCPI commands. The host allows a longer `READ?` response window based on NPLC/autozero or the selected AC bandwidth; this is a conservative host timeout, not a Fluke conversion-time guarantee. An incomplete `READ?` response is saved as a blank timeout attempt, then acquisition stops and the serial session closes before another query can consume a delayed response.

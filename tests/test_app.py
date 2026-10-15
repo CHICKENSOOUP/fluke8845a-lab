@@ -355,6 +355,135 @@ def test_visible_gui_probe_cli_routes_visible_window_flag(tmp_path, monkeypatch)
     }
 
 
+@pytest.mark.parametrize(
+    ("mode_flag", "confirmation", "expected_mode", "expected_confirmation"),
+    [
+        ("--probe-real-gui-dcv", "--confirm-front-voltage-source", Mode.DCV, "voltage_source_confirmed"),
+        ("--probe-real-gui-dci", "--confirm-front-dci-5ma-series", Mode.DCI, "dci_current_source_confirmed"),
+    ],
+)
+def test_gui_probe_cli_routes_legacy_voltage_and_current_modes(
+    tmp_path, monkeypatch, mode_flag, confirmation, expected_mode, expected_confirmation
+):
+    captured = {}
+
+    def fake_probe(port, report_path, **kwargs):
+        captured.update(port=port, report_path=report_path, **kwargs)
+        return 0
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", fake_probe)
+    report = tmp_path / f"{expected_mode.value}.json"
+
+    assert app_module.main([
+        mode_flag, "--port", "COM3", "--baudrate", "115200", "--duration", "8",
+        "--report", str(report), confirmation,
+    ]) == 0
+
+    assert captured["measurement_mode"] == expected_mode
+    assert captured[expected_confirmation] is True
+    assert captured["report_path"] == report
+    assert captured["duration_s"] == 8.0
+    assert not any("outguard" in key or "inguard" in key for key in captured)
+
+
+def test_aci_gui_probe_cli_routes_explicit_source_and_supported_settings(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_probe(port, report_path, **kwargs):
+        captured.update(port=port, report_path=report_path, **kwargs)
+        return 0
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", fake_probe)
+    report = tmp_path / "aci.json"
+    assert app_module.main([
+        "--probe-real-gui-aci", "--report", str(report), "--duration", "8",
+        "--confirm-front-aci-current-series", "--aci-current-arms", "0.005",
+        "--aci-frequency-hz", "60", "--aci-range-a", "0.01", "--ac-bandwidth-hz", "20",
+    ]) == 0
+
+    assert captured["measurement_mode"] == Mode.ACI
+    assert captured["aci_current_source_confirmed"] is True
+    assert captured["aci_source_current_arms"] == 0.005
+    assert captured["aci_source_frequency_hz"] == 60
+    assert captured["aci_range_a"] == 0.01
+    assert captured["ac_bandwidth_hz"] == 20
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        [],
+        ["--confirm-front-aci-current-series"],
+        [
+            "--confirm-front-aci-current-series", "--aci-current-arms", "0.01",
+            "--aci-frequency-hz", "60", "--aci-range-a", "0.01", "--ac-bandwidth-hz", "20",
+        ],
+    ],
+)
+def test_aci_gui_probe_rejects_missing_confirmation_or_invalid_source_before_connect(
+    tmp_path, monkeypatch, extra_args
+):
+    def forbidden_probe(*_args, **_kwargs):
+        pytest.fail("invalid ACI request must be rejected before opening the serial port")
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", forbidden_probe)
+    args = ["--probe-real-gui-aci", "--report", str(tmp_path / "aci.json"), *extra_args]
+    with pytest.raises(SystemExit) as exit_info:
+        app_module.main(args)
+    assert exit_info.value.code == 2
+
+
+def test_real_dci_gui_probe_refuses_to_switch_a_different_live_instrument_mode(monkeypatch, tmp_path):
+    class ReadOnlySnapshot:
+        def __init__(self, *_args):
+            self.closed = False
+
+        def connect(self):
+            return InstrumentInfo("FLUKE", "8845A", "PRIVATE", "02/14/08-08:54", "FLUKE,8845A,PRIVATE,02/14/08-08:54")
+
+        def read_mode_state(self):
+            return {"function": '"VOLT:DC"', "input_terminals": '"FRON"'}
+
+        def read_settings(self, _mode):
+            pytest.fail("probe must refuse before reading or changing settings")
+
+        def close(self):
+            self.closed = True
+
+    snapshots = []
+
+    def factory(*args):
+        snapshot = ReadOnlySnapshot(*args)
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(app_module, "Serial8845A", factory)
+    report_path = tmp_path / "wrong-live-mode.json"
+    assert app_module.run_real_gui_speed_probe(
+        "COM3", report_path, wiring_confirmed=False,
+        dci_current_source_confirmed=True, measurement_mode=Mode.DCI,
+    ) == 1
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "error"
+    assert "拒绝切换仪表功能" in report["error"]
+    assert snapshots[0].closed
+
+
+@pytest.mark.parametrize(
+    ("mode", "bandwidth", "expected"),
+    [
+        (Mode.DCV, None, (0.2, 1)),
+        (Mode.DCI, None, (0.2, 1)),
+        (Mode.RES2, None, (0.2, 1)),
+        (Mode.ACI, 3, (200, 3)),
+        (Mode.ACI, 200, (20, 200)),
+    ],
+)
+def test_hardware_probe_speed_changes_use_documented_parameters(mode, bandwidth, expected):
+    assert app_module._probe_speed_change_values(mode, bandwidth) == expected
+
+
 def test_mock_e2e_cli_requires_report(capsys):
     with pytest.raises(SystemExit) as exit_info:
         app_module.main(["--mock-e2e"])
