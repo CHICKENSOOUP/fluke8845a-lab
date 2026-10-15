@@ -8,6 +8,8 @@
 
 ### 已验证的源码与软件包快照
 
+- 2026-10-15 提交 [`5f8c97562e3161d53d976b26c7af038084d01619`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/5f8c97562e3161d53d976b26c7af038084d01619) 的 [GitHub Actions 运行 38657828293](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38657828293) 全部成功；Python 3.11/3.12 测试、解压源码 ZIP 后 Mock 首次启动及发布步骤均通过，每个测试/冒烟步骤限制为 60 秒。
+- [该提交的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-5f8c97562e31) 含源码 ZIP 与 `SHA256SUMS.txt`。ZIP SHA-256：`441a89c9d3c04d70f7757b878ac20437960bbaff854da4c676cd13fa14df60b6`。公开 GHCR 包 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-5f8c97562e31` 匿名 manifest 返回 HTTP 200，摘要为 `sha256:7600c986bd0fdc35eb8d58a25fec0e098019655cf988940175283340d0f74d40`。
 - 2026-10-15 提交 [`7e286c0ce9577e4a82e7b34ab51dd5ac6839d4a2`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/7e286c0ce9577e4a82e7b34ab51dd5ac6839d4a2) 的 [GitHub Actions 运行 38655819220](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38655819220) 全部成功；包含有 60 秒上限的测试和解压源码 ZIP 后 Mock 首次启动。
 - [该提交的 Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-7e286c0ce957) 含源码 ZIP 与 `SHA256SUMS.txt`。ZIP SHA-256：`5bd8719375111b4c4c39960bc3a22ee279940434f89045b33d716dbb20818d41`。公开 GHCR 包 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-7e286c0ce957` 匿名 manifest 返回 HTTP 200，摘要为 `sha256:72988357c57a6145cfb47e728f61d495edc5405a661d0370f8418edf7b792091`。
 - 2026-10-15 提交 [`0dc0ba9db589df3fed56be43367fdeebf8aa0c35`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/0dc0ba9db589df3fed56be43367fdeebf8aa0c35) 的 [GitHub Actions 运行 38654683150](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38654683150) 中 Python 3.11/3.12 测试、源码 ZIP 首次 Mock 启动及两个发布步骤均成功；pytest 和首次启动各自限制为 60 秒。
@@ -22,7 +24,7 @@
 
 ### 真机验证与发布限制
 
-- 2026-10-15 对 COM3 进行了两次短状态核对，串口设为 115200、8N1、无流控、CRLF。`*IDN?` 识别为 8845A；两次 `SENS:FUNC?` 均返回 `"CURR:AC"`，`ROUT:TERM?` 返回 `FRON`。第二次核对前，用户确认面板已显示直流电流挡，但 SCPI 仍报告交流电流挡。为避免把模式不符的读数当作 DCI，未发送 `READ?`，没有生成测量数据；断开时通过 `SYST:LOC` 交还本地控制。这只是连接/状态核对，不是真机测量验证。
+- 2026-10-15 对 COM3 的前两次状态核对使用 115200、8N1、无流控、CRLF；`*IDN?` 识别为 8845A，`ROUT:TERM?` 为 `FRON`，但 `SENS:FUNC?` 返回 `"CURR:AC"`，与用户报告的面板 DCI 不一致，因此当时未发送 `READ?`。随后基于用户已确认的 5 mA 直流电流源串联接线（前面板 mA/400 mA 与 LO），软件配置 DCI、固定 10 mA 量程、1 NPLC；配置回读为 `"CURR"` 和 `FRON` 后执行一次 `READ?`。原始响应、SI 数值及仪器/PC 时间戳保存在本机忽略目录 `build/hardware-dci-single-20261015T000725759351Z.json`，未发布原始测量值；整个探测约 0.8 秒，断开时通过 `SYST:LOC` 交还本地控制。这是一条真实 DCI 样本，不构成精度验证；电流源仅确认设定为标称 5 mA，未独立校准。
 - 六种模式的真机逐项通信、接线和读数验证，以及测量准确度验证仍未完成。Mock 结果不能替代这些验证。
 - 当前公开 Release 仅含源码 ZIP。Windows 便携程序尚未发布；Qt/PySide LGPL 替换与重新链接验证、完整第三方声明核对，以及 Microsoft Visual C++ 运行库的再分发来源/条款审查仍未关闭。相关审查记录见 [Windows 便携包许可证审查](licenses/windows-portable-review-2026-10-15.md)。
 - 本项目不宣称已经校准、通过安全认证、完成六种模式真机验收，或证明当前构建可在真机上连续稳定运行数小时/数天。
@@ -47,7 +49,7 @@ This record reports only evidence that was obtained. It does not publish worksta
 
 ### Hardware validation and release limits
 
-- On 2026-10-15, two brief COM3 status probes used 115200 baud, 8N1, no flow control, and CRLF. `*IDN?` identified an 8845A; both `SENS:FUNC?` queries returned `"CURR:AC"`, and `ROUT:TERM?` returned `FRON`. Before the second probe, the user confirmed the front panel displayed DC current, but SCPI still reported AC current. To avoid treating a mode-mismatched reading as DCI, no `READ?` was sent and no measurement data was produced. Disconnect used `SYST:LOC` to return control to the front panel. This was a connection/status check, not a hardware measurement validation.
+- The first two brief COM3 status probes on 2026-10-15 used 115200 baud, 8N1, no flow control, and CRLF. `*IDN?` identified an 8845A and `ROUT:TERM?` returned `FRON`, but `SENS:FUNC?` returned `"CURR:AC"`, inconsistent with the user's report that the panel showed DC current, so no `READ?` was sent at that stage. Using the user's previously confirmed 5 mA DC source in series with the front-panel mA/400 mA and LO terminals, the software then configured DCI at a fixed 10 mA range and 1 NPLC. Readback returned `"CURR"` and `FRON`, after which one `READ?` was taken. The raw response, SI value, and instrument/host timestamps are retained locally in the ignored `build/hardware-dci-single-20261015T000725759351Z.json`; raw measurement data is not published. The probe took about 0.8 seconds, and disconnect used `SYST:LOC` to return control to the front panel. This is one real DCI sample, not an accuracy validation; the source was set to a nominal 5 mA and was not independently calibrated.
 - Mode-by-mode hardware communication, wiring, and reading checks across all six modes, as well as measurement-accuracy validation, remain incomplete. Mock results do not replace those checks.
 - The current public Release contains only the source ZIP. A Windows portable application has not been released. Qt/PySide LGPL replacement and relinking verification, full third-party attribution review, and review of Microsoft Visual C++ runtime redistribution sources and terms remain open. See the [Windows portable package license review](licenses/windows-portable-review-2026-10-15.md).
 - The project does not claim calibration, safety certification, six-mode hardware acceptance, or hours-to-days stability of the current build on a real meter.
