@@ -1749,7 +1749,7 @@ class MainWindow(QMainWindow):
         )
         if requires_safety_check:
             transition_steps = []
-            if old_spec.wiring_group == "current":
+            if old_spec.wiring_group == "current" and new_spec.wiring_group != "current":
                 transition_steps.append("先关闭被测回路，并将测试线从独立的mA/400 mA或10 A电流插孔移回V/Ω插孔，再切换离开电流模式。")
             transition_steps.append(self._mode_safety_instructions(mode))
             target_profile = self._profiles[mode.value]

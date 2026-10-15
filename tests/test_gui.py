@@ -1248,6 +1248,40 @@ def test_mode_switch_requires_current_wiring_confirmation(qt_app, monkeypatch, t
         qt_app.processEvents()
 
 
+def test_switching_between_current_modes_does_not_instruct_moving_leads_to_voltage_jacks(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    dialogs = []
+
+    def accept_dialog(dialog):
+        dialogs.append(dialog)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(gui_module.WiringConfirmationDialog, "exec", accept_dialog)
+    try:
+        window._current_mode = Mode.DCI
+        old_block = window.mode_combo.blockSignals(True)
+        window.mode_combo.setCurrentIndex(window.mode_combo.findData(Mode.DCI.value))
+        window.mode_combo.blockSignals(old_block)
+        window._load_mode_controls(Mode.DCI)
+
+        window.mode_combo.setCurrentIndex(window.mode_combo.findData(Mode.ACI.value))
+
+        assert len(dialogs) == 1
+        instructions = dialogs[0].instructions
+        assert "关闭回路电源" in instructions
+        assert "串联" in instructions
+        assert "移回V/Ω插孔" not in instructions
+        assert "mA/400 mA孔" in instructions
+        assert "10 A孔" in instructions
+        assert window._current_mode is Mode.ACI
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_entering_high_current_mode_shows_the_10a_jack_for_saved_range(
     qt_app, monkeypatch, tmp_path
 ):
