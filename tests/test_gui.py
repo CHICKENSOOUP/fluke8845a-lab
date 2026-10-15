@@ -13,7 +13,9 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QFontInfo, QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFrame
 
 from fluke8845a import gui as gui_module
@@ -546,6 +548,85 @@ def test_local_region_statistics_use_raw_csv_then_track_new_samples(qt_app, monk
         window.close()
         qt_app.processEvents()
         stream.close()
+
+
+def test_local_statistics_interval_accepts_typed_bounds_and_syncs_chart(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window.region_start_spin.setValue(2.5)
+        window.region_end_spin.setValue(8.0)
+        window.region_apply_button.click()
+        qt_app.processEvents()
+
+        assert tuple(window._region.getRegion()) == pytest.approx((2.5, 8.0))
+        assert window.region_check.isChecked()
+        assert window.region_start_spin.value() == pytest.approx(2.5)
+        assert window.region_end_spin.value() == pytest.approx(8.0)
+
+        window._region.setRegion((10.0, 20.0))
+        qt_app.processEvents()
+        assert window.region_start_spin.value() == pytest.approx(10.0)
+        assert window.region_end_spin.value() == pytest.approx(20.0)
+
+        window.region_start_spin.setValue(20.0)
+        window.region_end_spin.setValue(20.0)
+        previous_region = tuple(window._region.getRegion())
+        window.region_apply_button.click()
+        assert tuple(window._region.getRegion()) == pytest.approx(previous_region)
+        assert "起点必须早于终点" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_locked_curve_point_stays_fixed_when_mouse_preview_moves(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend((10.0, 20.0, 30.0))
+        window.curve.setData(list(window._plot_x), list(window._plot_y))
+        window.plot_widget.setRange(xRange=(0.0, 2.0), yRange=(0.0, 30.0), padding=0)
+        qt_app.processEvents()
+
+        vb = window.plot_widget.getPlotItem().vb
+        scene_pos = vb.mapViewToScene(QPointF(1.0, 20.0))
+        QTest.mouseClick(
+            window.plot_widget.viewport(), Qt.MouseButton.LeftButton,
+            pos=window.plot_widget.mapFromScene(scene_pos),
+        )
+        qt_app.processEvents()
+        locked_point = window._selected_plot_point
+        assert locked_point == (1.0, 20.0, 2)
+        window._on_mouse_moved(vb.mapViewToScene(QPointF(2.0, 30.0)))
+        assert window._selected_plot_point == locked_point
+        assert "预览" in window.cursor_label.text()
+        assert "已锁定" in window.cursor_label.text()
+
+        window._last_value = 999.0
+        window._set_selected_point_as_baseline()
+        assert window._baseline == 20.0
+        assert window._locked_cursor_marker.isVisible()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_zero_controls_explain_one_shot_and_automatic_zero(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        assert "不会把被测输入的读数强制改成 0" in window.autozero_check.toolTip()
+        assert "ZERO:AUTO ONCE" in window.zero_button.toolTip()
+        assert "不会把当前显示值清零" in window.zero_button.toolTip()
+        assert "不是校准调整" in window.zero_explanation.text()
+    finally:
+        window.close()
+        qt_app.processEvents()
 
 
 @pytest.mark.parametrize("mode", list(Mode))

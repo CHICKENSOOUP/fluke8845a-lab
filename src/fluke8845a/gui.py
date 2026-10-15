@@ -492,6 +492,7 @@ class MainWindow(QMainWindow):
         self._global_stats = {"count": 0, "minimum": None, "maximum": None, "mean": None, "sample_stddev": None}
         self._crosshair_x = None
         self._crosshair_y = None
+        self._selected_plot_point: tuple[float, float, int] | None = None
         self._shutdown_started = False
         self._shutdown_finished = False
 
@@ -814,6 +815,10 @@ class MainWindow(QMainWindow):
         mode_form.addRow("模拟滤波", self.analog_filter_check)
         self.autozero_check = QCheckBox("自动零点校正")
         self.autozero_check.setChecked(True)
+        self.autozero_check.setToolTip(
+            "启用后，仪表按自动零点流程测量内部零点并补偿偏移，有助于稳定读数；"
+            "额外零点测量会增加读数时间。它不会把被测输入的读数强制改成 0。"
+        )
         self.autozero_check.toggled.connect(self._settings_changed)
         mode_form.addRow("零点校正", self.autozero_check)
 
@@ -831,8 +836,20 @@ class MainWindow(QMainWindow):
         mode_form.addRow("仪器速度", self.apply_speed_button)
         self.zero_button = QPushButton("执行 ZERO 校正")
         self.zero_button.setObjectName("secondaryButton")
+        self.zero_button.setToolTip(
+            "向仪表发送 ZERO:AUTO ONCE，立即启动一次零点测量并更新零点补偿。"
+            "这不是校准调整，也不会把当前显示值清零。停止采集后执行；使用模拟滤波时，"
+            "请保持量程、NPLC和触发条件与零点测量要求一致。"
+        )
         self.zero_button.clicked.connect(self._request_zero)
         mode_form.addRow("", self.zero_button)
+        self.zero_explanation = QLabel(
+            "自动零点：随测量自动补偿内部偏移，可能降低读数速度。\n"
+            "执行 ZERO：立即做一次内部零点测量并更新补偿；不是校准调整或去皮，也不会强制显示 0。"
+        )
+        self.zero_explanation.setObjectName("secondaryText")
+        self.zero_explanation.setWordWrap(True)
+        mode_form.addRow("作用说明", self.zero_explanation)
         self.safety_text = QLabel()
         self.safety_text.setObjectName("safetyBox")
         self.safety_text.setWordWrap(True)
@@ -1121,10 +1138,20 @@ class MainWindow(QMainWindow):
         self._region.hide()
         self.region_check = QCheckBox("显示局部统计区间")
         self.region_check.toggled.connect(self._on_region_visibility_changed)
-        self._region.sigRegionChangeFinished.connect(self._update_region_stats)
-        self._region_stats_label = QLabel("拖动图中区间手柄选择时间范围")
+        self._region.sigRegionChanged.connect(self._sync_region_inputs)
+        self._region.sigRegionChangeFinished.connect(self._on_region_change_finished)
+        self._region_stats_label = QLabel("输入起止时间，或拖动图中的区间手柄")
         self._region_stats_label.setObjectName("secondaryText")
-        self.plot_widget.getPlotItem().vb.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        plot_scene = self.plot_widget.getPlotItem().vb.scene()
+        plot_scene.sigMouseMoved.connect(self._on_mouse_moved)
+        plot_scene.sigMouseClicked.connect(self._on_plot_clicked)
+        self._locked_cursor_marker = pg.ScatterPlotItem(
+            size=12, symbol="o", pen=pg.mkPen("#f7c948", width=2),
+            brush=pg.mkBrush("#192536"),
+        )
+        self._locked_cursor_marker.setZValue(20)
+        self.plot_widget.addItem(self._locked_cursor_marker, ignoreBounds=True)
+        self._locked_cursor_marker.hide()
 
         self.analysis_tabs = QTabWidget()
         self.analysis_tabs.setObjectName("analysisTabs")
@@ -1143,6 +1170,28 @@ class MainWindow(QMainWindow):
         stats_header.addWidget(self.region_check)
         stats_header.addStretch(1)
         stats_layout.addLayout(stats_header)
+        region_input_row = QHBoxLayout()
+        region_input_row.addWidget(QLabel("起点"))
+        self.region_start_spin = QDoubleSpinBox()
+        self.region_end_spin = QDoubleSpinBox()
+        for spin in (self.region_start_spin, self.region_end_spin):
+            spin.setRange(-1e9, 1e12)
+            spin.setDecimals(6)
+            spin.setSingleStep(1.0)
+            spin.setSuffix(" s")
+            spin.setKeyboardTracking(False)
+            spin.setMaximumWidth(150)
+        self.region_start_spin.setValue(0.0)
+        self.region_end_spin.setValue(60.0)
+        region_input_row.addWidget(self.region_start_spin)
+        region_input_row.addWidget(QLabel("终点"))
+        region_input_row.addWidget(self.region_end_spin)
+        self.region_apply_button = QPushButton("应用区间")
+        self.region_apply_button.setObjectName("secondaryButton")
+        self.region_apply_button.clicked.connect(self._apply_region_inputs)
+        region_input_row.addWidget(self.region_apply_button)
+        region_input_row.addStretch(1)
+        stats_layout.addLayout(region_input_row)
         stats_layout.addWidget(self.stats_label)
         stats_layout.addWidget(self._region_stats_label)
         stats_layout.addStretch(1)
@@ -1161,14 +1210,22 @@ class MainWindow(QMainWindow):
         baseline_row.addWidget(self.baseline_edit)
         self.set_baseline_button = QPushButton("当前值设为基准")
         self.set_baseline_button.setObjectName("secondaryButton")
+        self.set_selected_baseline_button = QPushButton("锁定点设为基准")
+        self.set_selected_baseline_button.setObjectName("secondaryButton")
+        self.set_selected_baseline_button.setToolTip(
+            "先在曲线上单击要用作基准的读数点。黄色圆圈是已锁定点；"
+            "鼠标悬停不会改变它。"
+        )
         self.mean_baseline_button = QPushButton("可见均值设为基准")
         self.mean_baseline_button.setObjectName("secondaryButton")
         self.clear_baseline_button = QPushButton("清除")
         self.clear_baseline_button.setObjectName("secondaryButton")
         self.set_baseline_button.clicked.connect(self._set_current_as_baseline)
+        self.set_selected_baseline_button.clicked.connect(self._set_selected_point_as_baseline)
         self.mean_baseline_button.clicked.connect(self._set_mean_as_baseline)
         self.clear_baseline_button.clicked.connect(self._clear_baseline)
         baseline_row.addWidget(self.set_baseline_button)
+        baseline_row.addWidget(self.set_selected_baseline_button)
         baseline_row.addWidget(self.mean_baseline_button)
         baseline_row.addWidget(self.clear_baseline_button)
         baseline_row.addStretch(1)
@@ -1184,7 +1241,7 @@ class MainWindow(QMainWindow):
         self.change_label.setObjectName("changeLabel")
         change_row.addWidget(self.change_label, 1)
         baseline_layout.addLayout(change_row)
-        self.cursor_label = QLabel("游标：移动鼠标到曲线上读取邻近数据点")
+        self.cursor_label = QLabel("鼠标悬停预览读数；单击曲线锁定一个基准点")
         self.cursor_label.setObjectName("secondaryText")
         baseline_layout.addWidget(self.cursor_label)
         baseline_layout.addStretch(1)
@@ -1891,7 +1948,13 @@ class MainWindow(QMainWindow):
         if self._acquiring:
             self._show_error("请停止采集后再执行ZERO。模拟滤波条件下，ZERO应与当前量程、NPLC和触发设置一致。")
             return
-        answer = QMessageBox.question(self, "执行仪器 ZERO", "将对真实仪器执行 ZERO:AUTO ONCE。请确认输入条件与当前量程、NPLC及触发方法匹配。是否继续？")
+        answer = QMessageBox.question(
+            self,
+            "执行仪器 ZERO",
+            "ZERO:AUTO ONCE 会立即启动一次仪表零点测量并更新零点补偿；它不会把当前被测读数强制清零，也不是校准调整。\n\n"
+            "请确认当前量程、测量速度与触发条件稳定。使用模拟滤波时，ZERO条件应与量程、NPLC和触发设置匹配。\n\n"
+            "现在执行一次吗？",
+        )
         if answer == QMessageBox.StandardButton.Yes:
             self._bridge.zero.emit()
 
@@ -2165,6 +2228,30 @@ class MainWindow(QMainWindow):
         values = [y for x, y in zip(self._plot_x, self._plot_y) if left <= x <= right]
         self._show_region_stats(summarize(values), "图中缓存点（非全量）")
 
+    def _sync_region_inputs(self, *_args) -> None:
+        left, right = sorted(self._region.getRegion())
+        for spin, value in ((self.region_start_spin, left), (self.region_end_spin, right)):
+            previous = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(previous)
+
+    def _on_region_change_finished(self) -> None:
+        self._sync_region_inputs()
+        self._update_region_stats()
+
+    def _apply_region_inputs(self) -> None:
+        left = self.region_start_spin.value()
+        right = self.region_end_spin.value()
+        if not math.isfinite(left) or not math.isfinite(right) or left >= right:
+            self.statusBar().showMessage("统计区间无效：起点必须早于终点。", 5000)
+            return
+        self._region.setRegion((left, right))
+        self._sync_region_inputs()
+        if not self.region_check.isChecked():
+            self.region_check.setChecked(True)
+        else:
+            self._update_region_stats()
+
     def _on_region_visibility_changed(self, visible: bool) -> None:
         self._region.setVisible(visible)
         if visible:
@@ -2259,21 +2346,55 @@ class MainWindow(QMainWindow):
             f" · {source}"
         )
 
-    def _on_mouse_moved(self, pos) -> None:
-        vb = self.plot_widget.getPlotItem().vb
-        if not self.plot_widget.sceneBoundingRect().contains(pos):
-            return
-        point = vb.mapSceneToView(pos)
-        x = point.x()
+    def _nearest_plot_index(self, x: float) -> int | None:
         if not self._plot_x:
-            return
+            return None
         xs = list(self._plot_x)
         idx = min(max(bisect.bisect_left(xs, x), 0), len(xs) - 1)
         if idx > 0 and abs(xs[idx - 1] - x) < abs(xs[idx] - x):
             idx -= 1
+        return idx
+
+    def _describe_plot_point(self, x: float, y: float, sample_number: int) -> str:
+        shown, unit = engineering_value(y, descriptor(self._current_mode).unit_si)
+        return f"t={x:.7g} s · {shown:.10g} {unit} · 点序号≈{sample_number}"
+
+    def _lock_plot_point_at(self, x: float) -> bool:
+        idx = self._nearest_plot_index(x)
+        if idx is None:
+            return False
+        xs = list(self._plot_x)
+        selected_x = float(xs[idx])
+        selected_y = float(self._plot_y[idx])
+        sample_number = idx + 1
+        self._selected_plot_point = (selected_x, selected_y, sample_number)
+        self._locked_cursor_marker.setData([selected_x], [selected_y])
+        self._locked_cursor_marker.show()
+        self.cursor_label.setText(
+            f"已锁定：{self._describe_plot_point(selected_x, selected_y, sample_number)} · 单击曲线可重新选点"
+        )
+        return True
+
+    def _on_plot_clicked(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        vb = self.plot_widget.getPlotItem().vb
+        pos = event.scenePos()
+        if not vb.sceneBoundingRect().contains(pos):
+            return
+        point = vb.mapSceneToView(pos)
+        self._lock_plot_point_at(point.x())
+
+    def _on_mouse_moved(self, pos) -> None:
+        vb = self.plot_widget.getPlotItem().vb
+        if not vb.sceneBoundingRect().contains(pos):
+            return
+        point = vb.mapSceneToView(pos)
+        idx = self._nearest_plot_index(point.x())
+        if idx is None:
+            return
+        xs = list(self._plot_x)
         y = self._plot_y[idx]
-        spec = descriptor(self._current_mode)
-        shown, unit = engineering_value(y, spec.unit_si)
         if self._crosshair_x is None:
             self._crosshair_x = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#d7e2ec", style=Qt.PenStyle.DotLine))
             self._crosshair_y = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#d7e2ec", style=Qt.PenStyle.DotLine))
@@ -2281,7 +2402,13 @@ class MainWindow(QMainWindow):
             self.plot_widget.addItem(self._crosshair_y, ignoreBounds=True)
         self._crosshair_x.setPos(xs[idx])
         self._crosshair_y.setPos(y)
-        self.cursor_label.setText(f"t={xs[idx]:.7g} s · {shown:.10g} {unit} · 点序号≈{idx + 1}")
+        preview = self._describe_plot_point(float(xs[idx]), float(y), idx + 1)
+        if self._selected_plot_point is None:
+            self.cursor_label.setText(f"预览：{preview} · 单击曲线锁定选点")
+        else:
+            locked_x, locked_y, locked_number = self._selected_plot_point
+            locked = self._describe_plot_point(locked_x, locked_y, locked_number)
+            self.cursor_label.setText(f"预览：{preview}  |  已锁定：{locked}")
 
     def _parse_threshold(self) -> float:
         try:
@@ -2316,6 +2443,15 @@ class MainWindow(QMainWindow):
         self._baseline = self._last_value
         self.baseline_edit.setText(repr(self._baseline))
         self._store_baseline("当前读数设为基准")
+
+    def _set_selected_point_as_baseline(self) -> None:
+        if self._selected_plot_point is None:
+            self._show_error("请先在曲线上单击一个读数点，锁定后再设为基准")
+            return
+        elapsed, value, sample_number = self._selected_plot_point
+        self._baseline = value
+        self.baseline_edit.setText(repr(self._baseline))
+        self._store_baseline(f"图上锁定点设为基准（t={elapsed:.7g} s，点序号≈{sample_number}）")
 
     def _set_mean_as_baseline(self) -> None:
         stats = summarize(self._plot_y)
@@ -2443,6 +2579,10 @@ class MainWindow(QMainWindow):
         self._experiment_csv_path = None
         self._plot_x.clear()
         self._plot_y.clear()
+        self._selected_plot_point = None
+        self._locked_cursor_marker.hide()
+        self._crosshair_x = None
+        self._crosshair_y = None
         self._clear_event_markers()
         self._last_value = None
         self._last_elapsed = 0.0
@@ -2454,7 +2594,8 @@ class MainWindow(QMainWindow):
                 self.plot_widget.removeItem(item)
         self.latest_value_label.setText("等待读数")
         self.actual_rate_label.setText("— Hz")
-        self._region_stats_label.setText("局部统计：拖动图中区间手柄选择时间范围")
+        self._region_stats_label.setText("输入起止时间，或拖动图中的区间手柄")
+        self.cursor_label.setText("鼠标悬停预览读数；单击曲线锁定一个基准点")
         self._update_stats()
 
     def _clear_event_markers(self) -> None:
