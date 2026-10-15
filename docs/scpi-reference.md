@@ -33,7 +33,7 @@
 
 - 模式参数先按手册的离散枚举验证。仪器错误队列非零时配置失败并中止，不继续保存看似有效的读数。
 - `LOCAL`面板控制时软件不发送配置、诊断、ZERO或采集命令；采集停止后可切回`COMPUTER`，并从仪表重新读取面板操作后当前的模式和参数。
-- 400 mA的DCI/ACI分别检查资料所列固件门槛；只有`*IDN?`字段含可解析的软件版本且该版本低于门槛时，才禁用固定400 mA档。其它固定量程不因400 mA版本门槛而禁用；若固件已知过旧，自动量程会被阻止，因为仪器可能自动切入不支持的400 mA档。8845A/8846A模式的`*IDN?`第四字段通常是日期/时间修订标记；`SYST:VERS?`查询的是SCPI命令版本，不是仪器软件版本。软件版本应从仪表面板核实。日期/时间标记不能作为旧固件证据。
+- 400 mA的DCI/ACI分别检查资料所列固件门槛；优先使用`*IDN?`内可解析的软件版本；若该字段只是日期/时间修订标记，可用按序列号保存的人工核对 OutG SW 作为备用。InG SW只作元数据记录。只有选中的版本证据可解析且明确低于门槛时，才禁用固定400 mA档；未知或无法解析不触发拒绝。其它固定档不受此固件门槛影响；若固件明确过旧，自动量程会被阻止，因为仪器可能进入400 mA档。`SYST:VERS?`返回SCPI命令版本，不是仪器软件版本。
 - 1/3/10 A档按规格仅在前面板端子显示可用；后端子下固定档被禁用且电流自动量程被阻止。
 - `READ?`的时间戳是PC写命令前时间，仪器转换并无逐样本硬件时间戳。读数周期与range-query耗时一并保存在`read_duration_s`。并未使用资料中有额外条件的典型高速度作为保证。
 - 用户设置的串口响应超时是普通SCPI命令的下限。程序按NPLC/自动零点或交流带宽为`READ?`增加主机等待时间；这是保守通信保护，不是Fluke转换时间保证。若响应不完整，软件记录一条空值超时行后停止采集并关闭串口，避免后续请求误读迟到数据。
@@ -67,9 +67,8 @@ The application does not configure capacitance, RTD temperature, source output, 
 
 - Parameters are validated against documented discrete values. A non-zero instrument error queue aborts configuration and acquisition.
 - In `LOCAL` panel-control mode, the application sends no configuration, diagnostic, ZERO, or acquisition commands. After panel operation, switching back to `COMPUTER` re-reads the current function and settings.
-- The fixed 400 mA DCI/ACI ranges enforce the documented firmware threshold only when `*IDN?` contains a parseable semantic version that is below the threshold. Other fixed ranges are not blocked by this 400 mA gate. If firmware is known to be too old, autorange is blocked because the meter could enter 400 mA. The 8845A `*IDN?` date/time revision marker is not firmware, and `SYST:VERS?` returns the SCPI command version. Verify software version on the front panel.
+- The fixed 400 mA DCI/ACI ranges enforce the documented firmware threshold only when selected version evidence is parseable and explicitly below the threshold. A semantic `*IDN?` version takes priority; manually verified OutG SW is the fallback when IDN contains only a date/time marker. InG SW is metadata only. Unknown or unparseable values do not block the range; other fixed ranges are unaffected by this firmware gate. Autorange is blocked only when a known old version could let the meter enter 400 mA. `SYST:VERS?` returns the SCPI command version, not instrument software. Manual panel entries are distinguished from SCPI data in experiment metadata.
 - 1/3/10 A ranges are exposed only when front-panel terminals are confirmed; rear-terminal operation blocks these fixed ranges and current autorange.
 - `READ?` timestamps are host timestamps taken before sending the command. The meter supplies no hardware timestamp per sample; `read_duration_s` records the read and range-query interval. Published typical maximum speeds are not treated as guarantees.
 - The configured serial timeout is the floor for ordinary SCPI commands. The host allows a longer `READ?` response window based on NPLC/autozero or the selected AC bandwidth; this is a conservative host timeout, not a Fluke conversion-time guarantee. An incomplete `READ?` response is saved as a blank timeout attempt, then acquisition stops and the serial session closes before another query can consume a delayed response.
 - The manual shows separate mA/400 mA and 10 A jacks. `ROUT:TERM?` reports only FRONT/REAR, and range readback cannot identify the physical red jack. The operator must verify the lead and front-panel input selection.
-

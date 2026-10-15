@@ -7,6 +7,7 @@ from fluke8845a.scpi import (
     FlowControl, InstrumentError, InstrumentIdentityError, InstrumentLocalModeError, ModeSettings, PySerialTransport, ReadingError, Rs232TerminalModeError,
     ScpiClient, ScpiProtocolError, ScpiTimeout, Serial8845A, SerialSettings,
     UnsupportedRange, compare_firmware, measurement_read_timeout_s, parse_idn, parse_reading,
+    select_range_firmware,
 )
 from tests.fakes import FakeTransport
 
@@ -521,6 +522,18 @@ def test_firmware_compare_returns_unknown_instead_of_guessing():
     assert compare_firmware("1.0.700.18", (2, 0)) is False
 
 
+@pytest.mark.parametrize(
+    ("idn_firmware", "outguard_version", "expected"),
+    [
+        ("2.0", "1.0", ("2.0", "*IDN?")),
+        ("", "2.10.882.24", ("2.10.882.24", "面板核对的 OutG SW")),
+        ("02/14/08-08:54", "ad300210", ("", "未知")),
+    ],
+)
+def test_range_firmware_selection_preserves_evidence_priority(idn_firmware, outguard_version, expected):
+    assert select_range_firmware(idn_firmware, outguard_version) == expected
+
+
 def test_date_coded_idn_firmware_does_not_block_400ma_range():
     transport = FakeTransport("FLUKE,8845A,1234567,02/14/08-08:54")
     instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
@@ -529,6 +542,36 @@ def test_date_coded_idn_firmware_does_not_block_400ma_range():
     assert info.idn_revision == "02/14/08-08:54"
     instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.4))
     assert "SENS:CURR:DC:RANG 0.4" in transport.commands
+    instrument.close()
+
+
+def test_verified_front_panel_outguard_firmware_is_used_only_when_idn_version_is_unknown():
+    transport = FakeTransport("FLUKE,8845A,9383035,02/14/08-08:54", terminals="FRONT")
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    info = instrument.connect()
+    assert info.firmware == ""
+
+    instrument.set_firmware_versions("2.10.882.24", "ad300210")
+    assert instrument.range_firmware == ("2.10.882.24", "面板核对的 OutG SW")
+    instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.4))
+    assert "SENS:CURR:DC:RANG 0.4" in transport.commands
+    instrument.close()
+
+
+def test_known_old_outguard_blocks_only_400ma_and_inguard_never_satisfies_gate():
+    transport = FakeTransport("FLUKE,8845A,9383035,02/14/08-08:54", terminals="FRONT")
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.set_firmware_versions("1.9.0.0", "ad300210")
+
+    for range_si in (0.01, 0.1, 10.0):
+        instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=range_si))
+    with pytest.raises(UnsupportedRange, match="400 mA"):
+        instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.4))
+    assert "SENS:CURR:DC:RANG 0.01" in transport.commands
+    assert "SENS:CURR:DC:RANG 0.1" in transport.commands
+    assert "SENS:CURR:DC:RANG 10" in transport.commands
+    assert not any(command.endswith("RANG 0.4") for command in transport.commands)
     instrument.close()
 
 

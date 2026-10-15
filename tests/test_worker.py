@@ -87,6 +87,35 @@ def test_worker_one_shot_persists_valid_or_failed_attempt_without_fabricating_va
     worker.shutdown()
 
 
+def test_worker_experiment_config_distinguishes_front_panel_software_from_idn(tmp_path):
+    worker = MeasurementWorker()
+    transport = FakeTransport("FLUKE,8845A,9383035,02/14/08-08:54", terminals="FRONT")
+    instrument = Serial8845A(
+        "COM3", SerialSettings(), transport_factory=lambda *_: transport
+    )
+    worker.instrument = instrument
+    worker.info = instrument.connect()
+    worker.control_mode = "computer"
+    worker.set_firmware_versions("2.10.882.24", "ad300210")
+
+    settings = ModeSettings(Mode.DCI, autorange=False, range_si=0.1)
+    worker.start_experiment(settings, "front panel metadata", str(tmp_path), 60, False)
+    directory = worker._recorder.directory
+    worker.shutdown()
+
+    metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    device = metadata["device"]
+    assert device["firmware"] is None
+    assert device["firmware_source"] is None
+    assert device["idn_revision"] == "02/14/08-08:54"
+    assert device["front_panel_software"] == {
+        "outguard_sw": "2.10.882.24", "inguard_sw": "ad300210",
+    }
+    assert device["range_firmware"] == "2.10.882.24"
+    assert device["range_firmware_source"] == "面板核对的 OutG SW"
+    assert metadata["simulation"] is False
+
+
 @pytest.mark.parametrize("mode", list(Mode))
 def test_worker_one_shot_records_each_mock_mode_with_correct_unit(tmp_path, mode):
     worker = MeasurementWorker()

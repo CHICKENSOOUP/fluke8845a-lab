@@ -339,6 +339,15 @@ def compare_firmware(firmware: str, minimum: tuple[int, ...]) -> bool | None:
     return found + (0,) * (size - len(found)) >= minimum + (0,) * (size - len(minimum))
 
 
+def select_range_firmware(idn_firmware: str, outguard_version: str) -> tuple[str, str]:
+    """Select parseable version evidence for range gating without losing provenance."""
+    if compare_firmware(idn_firmware, (0, 0)) is not None:
+        return str(idn_firmware).strip(), "*IDN?"
+    if compare_firmware(outguard_version, (0, 0)) is not None:
+        return str(outguard_version).strip(), "面板核对的 OutG SW"
+    return "", "未知"
+
+
 CURRENT_RANGE_FIRMWARE_MINIMUM = {
     Mode.DCI: (2, 0),
     Mode.ACI: (1, 0, 700, 18),
@@ -470,6 +479,18 @@ class Serial8845A:
         self.info: InstrumentInfo | None = None
         self._mode: Mode | None = None
         self._active_settings: ModeSettings | None = None
+        self.outguard_version = ""
+        self.inguard_version = ""
+
+    def set_firmware_versions(self, outguard_version: str = "", inguard_version: str = "") -> None:
+        """Store software revisions manually read from this meter's front panel."""
+        self.outguard_version = str(outguard_version or "").strip()
+        self.inguard_version = str(inguard_version or "").strip()
+
+    @property
+    def range_firmware(self) -> tuple[str, str]:
+        info_firmware = self.info.firmware if self.info else ""
+        return select_range_firmware(info_firmware, self.outguard_version)
 
     @property
     def connected(self) -> bool:
@@ -638,9 +659,10 @@ class Serial8845A:
         assert self.info is not None
         self._drain_errors("配置前仪器错误", fail=False)
         terminals = self._client.query("ROUT:TERM?") if spec.quantity == "current" else None
-        unsupported = unsupported_current_ranges(settings.mode, self.info.firmware, terminals)
+        range_firmware, firmware_source = self.range_firmware
+        unsupported = unsupported_current_ranges(settings.mode, range_firmware, terminals)
         if spec.quantity == "current" and settings.autorange:
-            reason = current_autorange_block_reason(settings.mode, self.info.firmware, terminals)
+            reason = current_autorange_block_reason(settings.mode, range_firmware, terminals)
             if reason:
                 raise UnsupportedRange(
                     f"8845A {spec.label}：{reason}。请关闭自动量程并选用已确认支持的固定量程。"
@@ -648,7 +670,7 @@ class Serial8845A:
         if not settings.autorange and settings.range_si in unsupported:
             if settings.range_si == 0.4:
                 need = "2.0" if settings.mode == Mode.DCI else "1.0.700.18"
-                detail = f"仪器回报的软件版本低于400 mA档要求的{need}"
+                detail = f"{firmware_source}版本{range_firmware}低于400 mA档要求的{need}"
             else:
                 detail = "1 A、3 A和10 A量程仅在前面板电流端子支持"
             raise UnsupportedRange(f"8845A {spec.label}：{detail}，为避免无效/危险配置已拒绝。")

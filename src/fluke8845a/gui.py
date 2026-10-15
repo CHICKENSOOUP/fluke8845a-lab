@@ -33,7 +33,7 @@ from .modes import DESCRIPTORS, Mode, descriptor, mode_from_scpi_function, range
 from .mock import MockScenario
 from .scpi import (
     FlowControl, InstrumentIdentityError, ModeSettings, SerialSettings,
-    current_autorange_block_reason, parse_idn,
+    current_autorange_block_reason, parse_idn, select_range_firmware,
     unsupported_current_ranges,
 )
 from .worker import MeasurementWorker
@@ -431,6 +431,7 @@ class WorkerBridge(QObject):
     connect_real = Signal(str, object, object, bool)
     connect_mock = Signal(object, object)
     set_control_mode = Signal(str)
+    set_firmware_versions = Signal(str, str)
     configure = Signal(object)
     start_experiment = Signal(object, str, str, object, bool)
     set_sampling_interval = Signal(object)
@@ -464,6 +465,8 @@ class MainWindow(QMainWindow):
             self._config_fallback = True
         self._profile_path = self._app_config_dir / "profiles.json"
         self._profiles = self._load_profiles()
+        firmware_profiles = self._profiles.get("instrument_firmware_by_serial", {})
+        self._firmware_profiles = firmware_profiles if isinstance(firmware_profiles, dict) else {}
         self._current_mode = Mode.DCV
         self._connected = False
         self._control_mode = "disconnected"
@@ -472,6 +475,8 @@ class MainWindow(QMainWindow):
         self._instrument_mode_known = False
         self._active_settings_by_mode: dict[str, dict] = {}
         self._firmware = ""
+        self._idn_firmware = ""
+        self._device_serial = ""
         self._terminals = ""
         self._loading_mode_controls = False
         self._acquiring = False
@@ -523,6 +528,7 @@ class MainWindow(QMainWindow):
         self._bridge.connect_real.connect(self._worker.connect_real)
         self._bridge.connect_mock.connect(self._worker.connect_mock)
         self._bridge.set_control_mode.connect(self._worker.set_control_mode)
+        self._bridge.set_firmware_versions.connect(self._worker.set_firmware_versions)
         self._bridge.configure.connect(self._worker.configure_mode)
         self._bridge.start_experiment.connect(self._worker.start_experiment)
         self._bridge.set_sampling_interval.connect(self._worker.set_target_interval)
@@ -716,6 +722,25 @@ class MainWindow(QMainWindow):
             "SYST:VERS?返回SCPI命令版本，不是仪器固件。请在仪表面板查看软件版本。"
         )
         form.addRow("识别结果", self.idn_label)
+        self.outguard_sw_edit = QLineEdit()
+        self.outguard_sw_edit.setMaxLength(64)
+        self.outguard_sw_edit.setPlaceholderText("面板核对，例如 2.10.882.24")
+        self.outguard_sw_edit.setToolTip(
+            "从仪器前面板 INSTR SETUP → SYSTEM → VERSIONS + SN 读取，并按仪器序列号保存在本机。"
+            "只有*IDN?没有可解析的软件版本时，才用此 OutG SW 判断400 mA门槛；未知或无法解析不会限制量程。"
+            "这是人工核对记录，不是通过SCPI读取。"
+        )
+        self.inguard_sw_edit = QLineEdit()
+        self.inguard_sw_edit.setMaxLength(64)
+        self.inguard_sw_edit.setPlaceholderText("可选记录，例如 ad300210")
+        self.inguard_sw_edit.setToolTip(
+            "可选记录同一前面板版本页显示的 InG SW，并随实验配置保存。"
+            "400 mA固件门槛只依据*IDN?或已核对的 OutG SW，不依据 InG SW。"
+        )
+        self.outguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
+        self.inguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
+        form.addRow("OutG SW（面板核对）", self.outguard_sw_edit)
+        form.addRow("InG SW（可选记录）", self.inguard_sw_edit)
         self.control_mode_combo = QComboBox()
         self.control_mode_combo.addItem("未连接", "disconnected")
         self.control_mode_combo.addItem("Computer · 软件控制", "computer")
@@ -1520,6 +1545,7 @@ class MainWindow(QMainWindow):
                        "flow_control": self.flow_combo.currentData(), "eol": self.eol_combo.currentData(),
                        "timeout_s": self.timeout_spin.value()},
             "sampling_interval_s": self.interval_spin.value(),
+            "instrument_firmware_by_serial": self._firmware_profiles,
             **{mode: data for mode, data in self._profiles.items() if mode in {m.value for m in Mode}},
         }
         try:
@@ -1650,6 +1676,9 @@ class MainWindow(QMainWindow):
             self._load_mode_controls(self._current_mode)
         else:
             self._firmware = ""
+            self._idn_firmware = ""
+            self._device_serial = ""
+            self._set_firmware_fields("", "")
             self._terminals = ""
             self._instrument_mode_known = False
         self._update_readout_context()
@@ -1707,9 +1736,30 @@ class MainWindow(QMainWindow):
         self._terminals = str(details.get("input_terminals") or "")
         idn = str(details.get("idn") or "")
         try:
-            self._firmware = parse_idn(idn).firmware
+            info = parse_idn(idn)
+            self._idn_firmware = info.firmware
+            self._device_serial = info.serial_number
         except (csv.Error, IndexError, InstrumentIdentityError, StopIteration, ValueError):
-            self._firmware = ""
+            self._idn_firmware = ""
+            self._device_serial = ""
+        if self._simulation:
+            self._set_firmware_fields("", "")
+            self._firmware = self._idn_firmware
+        else:
+            saved_versions = self._firmware_profiles.get(self._device_serial, {})
+            if not isinstance(saved_versions, dict):
+                saved_versions = {}
+            self._set_firmware_fields(
+                str(saved_versions.get("outguard_sw", "")),
+                str(saved_versions.get("inguard_sw", "")),
+            )
+            self._firmware = select_range_firmware(
+                self._idn_firmware, self.outguard_sw_edit.text().strip()
+            )[0]
+            # The worker keeps manual front-panel evidence separate from *IDN?.
+            self._bridge.set_firmware_versions.emit(
+                self.outguard_sw_edit.text().strip(), self.inguard_sw_edit.text().strip()
+            )
         function = str(details.get("function") or "")
         detected_mode = mode_from_scpi_function(function)
         self._instrument_mode_known = detected_mode is not None
@@ -1722,6 +1772,34 @@ class MainWindow(QMainWindow):
             self.mode_combo.blockSignals(old_block)
         if self._connected:
             self._load_mode_controls(self._current_mode)
+
+    def _set_firmware_fields(self, outguard_version: str, inguard_version: str) -> None:
+        outguard_blocked = self.outguard_sw_edit.blockSignals(True)
+        inguard_blocked = self.inguard_sw_edit.blockSignals(True)
+        try:
+            self.outguard_sw_edit.setText(outguard_version)
+            self.inguard_sw_edit.setText(inguard_version)
+        finally:
+            self.outguard_sw_edit.blockSignals(outguard_blocked)
+            self.inguard_sw_edit.blockSignals(inguard_blocked)
+
+    def _firmware_version_changed(self) -> None:
+        outguard_version = self.outguard_sw_edit.text().strip()
+        inguard_version = self.inguard_sw_edit.text().strip()
+        if not self._simulation and self._device_serial:
+            if outguard_version or inguard_version:
+                self._firmware_profiles[self._device_serial] = {
+                    "outguard_sw": outguard_version,
+                    "inguard_sw": inguard_version,
+                }
+            else:
+                self._firmware_profiles.pop(self._device_serial, None)
+        self._firmware = select_range_firmware(self._idn_firmware, outguard_version)[0]
+        if self._connected and not self._simulation:
+            self._bridge.set_firmware_versions.emit(outguard_version, inguard_version)
+            self._save_profiles()
+            if not self._acquiring:
+                self._load_mode_controls(self._current_mode)
 
     @Slot(object)
     def _on_active_settings(self, payload: dict) -> None:
@@ -2259,6 +2337,8 @@ class MainWindow(QMainWindow):
         self.control_mode_combo.setEnabled(
             self._connected and not self._simulation and idle and not self._control_mode_switch_pending
         )
+        self.outguard_sw_edit.setEnabled(self._connected and not self._simulation and idle)
+        self.inguard_sw_edit.setEnabled(self._connected and not self._simulation and idle)
         self.set_control_mode_button.setEnabled(
             self._connected and not self._simulation and idle and not self._control_mode_switch_pending
         )

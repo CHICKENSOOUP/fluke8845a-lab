@@ -279,9 +279,16 @@ def test_web_real_meter_can_switch_local_and_computer_and_refresh_front_panel_st
     status, _headers, body = _api_command(app, base_url, "connect_real", {
         "port": "COM3", "serial": {"eol": "CRLF"},
         "settings": {"mode": "DCV", "autorange": True, "nplc": 1},
+        "front_panel_software_by_serial": {
+            "12345678": {"outguard_sw": "2.10.882.24", "inguard_sw": "ad300210"},
+        },
     })
     assert status == 200, body
-    assert _read_state(app, base_url)["control_mode"] == "computer"
+    connected_state = _read_state(app, base_url)
+    assert connected_state["control_mode"] == "computer"
+    assert connected_state["device"]["front_panel_software"] == {
+        "outguard_sw": "2.10.882.24", "inguard_sw": "ad300210",
+    }
 
     status, _headers, body = _api_command(app, base_url, "control_mode", {"mode": "local"})
     assert status == 200, body
@@ -303,6 +310,59 @@ def test_web_real_meter_can_switch_local_and_computer_and_refresh_front_panel_st
     state = _read_state(app, base_url)
     assert state["control_mode"] == "computer"
     assert state["configuration"]["function"] == "CURR:DC"
+
+    status, _headers, body = _api_command(app, base_url, "disconnect")
+    assert status == 200, body
+
+
+def test_web_uses_verified_outguard_fallback_and_only_blocks_old_400ma(local_service, monkeypatch):
+    app, runtime, server = local_service
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    transport = FakeTransport("FLUKE,8845A,9383035,02/14/08-08:54", terminals="FRONT")
+    from fluke8845a import worker as worker_module
+    from fluke8845a.scpi import Serial8845A
+
+    real_instrument_type = Serial8845A
+    monkeypatch.setattr(
+        worker_module,
+        "Serial8845A",
+        lambda port, settings, callback: real_instrument_type(
+            port, settings, callback, transport_factory=lambda *_: transport
+        ),
+    )
+
+    status, _headers, body = _api_command(app, base_url, "connect_real", {
+        "port": "COM3", "serial": {"eol": "CRLF"},
+        "settings": {"mode": "DCV", "autorange": True, "nplc": 1},
+        "front_panel_software_by_serial": {
+            "9383035": {"outguard_sw": "2.10.882.24", "inguard_sw": "ad300210"},
+        },
+    })
+    assert status == 200, body
+    state = _read_state(app, base_url)
+    assert state["device"]["firmware"] is None
+    assert state["device"]["range_firmware"] == "2.10.882.24"
+    assert state["device"]["range_firmware_source"] == "面板核对的 OutG SW"
+
+    def configure(range_si):
+        return _api_command(app, base_url, "configure", {
+            "safety_confirmed": True,
+            "settings": {"mode": "DCI", "autorange": False, "range_si": range_si, "nplc": 1},
+        })
+
+    status, _headers, body = configure(0.4)
+    assert status == 200, body
+
+    status, _headers, body = _api_command(app, base_url, "firmware_versions", {
+        "outguard_sw": "1.9.0.0", "inguard_sw": "ad300210",
+    })
+    assert status == 200, body
+    for range_si in (0.01, 0.1, 10.0):
+        status, _headers, body = configure(range_si)
+        assert status == 200, body
+    status, _headers, body = configure(0.4)
+    assert status == 400
+    assert "400 mA" in json.loads(body)["message"]
 
     status, _headers, body = _api_command(app, base_url, "disconnect")
     assert status == 200, body

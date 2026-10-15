@@ -9,6 +9,7 @@ const ui = {
 const app = {
   meta: null, state: null, points: [], imported: null, generation: null, lastSample: 0, lastLog: 0,
   modes: new Map(), selectedMode: "DCV", baseline: null, toastTimer: 0, pollTimer: 0,
+  activeDeviceSerial: "",
   xView: null, yView: null, dragging: null, cursor: null, bufferTruncated: false,
   awaitInitialSettings: false, awaitSettingsReadback: false, awaitSpeedReadback: false,
 };
@@ -122,11 +123,41 @@ function serialFormDisabled(disabled) {
   for (const id of ["port", "portList", "baudrate", "bytesize", "parity", "stopbits", "eol", "flow", "serialTimeout", "scanPorts", "connectReal", "connectMock"]) el(id).disabled = disabled;
 }
 
+function manualSoftwareProfiles() {
+  try {
+    const value = JSON.parse(localStorage.getItem("8845a-front-panel-software") || "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).slice(0, 100).flatMap(([serial, versions]) => {
+      if (!serial || serial.length > 64 || !versions || typeof versions !== "object") return [];
+      return [[serial, {
+        outguard_sw: String(versions.outguard_sw || "").slice(0, 64),
+        inguard_sw: String(versions.inguard_sw || "").slice(0, 64),
+      }]];
+    }));
+  } catch (_) { return {}; }
+}
+
+async function saveManualSoftware() {
+  if (!app.state?.connected || app.state.simulation) return;
+  const versions = {
+    outguard_sw: el("outguardSoftware").value.trim(),
+    inguard_sw: el("inguardSoftware").value.trim(),
+  };
+  const result = await command("firmware_versions", versions);
+  if (!result.success || !app.activeDeviceSerial) return;
+  const profiles = manualSoftwareProfiles();
+  if (versions.outguard_sw || versions.inguard_sw) profiles[app.activeDeviceSerial] = versions;
+  else delete profiles[app.activeDeviceSerial];
+  try { localStorage.setItem("8845a-front-panel-software", JSON.stringify(profiles)); }
+  catch (_) { toast("已发送面板版本记录，但浏览器无法保存到本机", true); }
+}
+
 function safetyPayload() { return { safety_confirmed: ui.confirm.checked }; }
 
 async function connectReal() {
   const result = await command("connect_real", {
     port: el("port").value.trim(), serial: serialPayload(), settings: settingsPayload(),
+    front_panel_software_by_serial: manualSoftwareProfiles(),
   });
   if (result.success) { serialFormDisabled(true); app.awaitInitialSettings = true; }
 }
@@ -247,6 +278,14 @@ async function pollState() {
 
 function updateStateDisplay(state) {
   syncSettingsReadback(state);
+  const device = state.device || {};
+  const serialNumber = state.connected && !state.simulation ? String(device.serial_number || "") : "";
+  if (serialNumber !== app.activeDeviceSerial) {
+    app.activeDeviceSerial = serialNumber;
+    const stored = serialNumber ? manualSoftwareProfiles()[serialNumber] || device.front_panel_software || {} : {};
+    el("outguardSoftware").value = String(stored.outguard_sw || "");
+    el("inguardSoftware").value = String(stored.inguard_sw || "");
+  }
   const badge = el("connectionBadge");
   const badgeText = badge.querySelector("span");
   badge.classList.toggle("connected", state.connected && !state.simulation);
@@ -296,6 +335,8 @@ function updateStateDisplay(state) {
   const running = /采集中|测量中/.test(state.status || "");
   const paused = String(state.status || "").includes("暂停");
   const acquiring = running || paused;
+  el("outguardSoftware").disabled = !state.connected || state.simulation || acquiring;
+  el("inguardSoftware").disabled = !state.connected || state.simulation || acquiring;
   const computerControl = !state.connected || state.simulation || state.control_mode === "computer";
   el("controlMode").disabled = !state.connected || state.simulation || acquiring;
   el("applyControlMode").disabled = !state.connected || state.simulation || acquiring;
@@ -778,6 +819,8 @@ function bindControls() {
   el("connectMock").addEventListener("click", connectMock);
   el("disconnect").addEventListener("click", async () => { const result = await command("disconnect"); if (result.success) serialFormDisabled(false); });
   el("applyControlMode").addEventListener("click", () => command("control_mode", { mode: el("controlMode").value }));
+  el("outguardSoftware").addEventListener("change", saveManualSoftware);
+  el("inguardSoftware").addEventListener("change", saveManualSoftware);
   el("mode").addEventListener("change", () => { const spec = app.modes.get(el("mode").value); if (spec) { populateModeOptions(spec); app.yView = null; drawChart(); } });
   el("applySettings").addEventListener("click", applySettings);
   el("applySpeed").addEventListener("click", applySpeed);

@@ -16,7 +16,7 @@ from PySide6.QtCore import QCoreApplication, QObject, QThread, Qt, Signal, Slot
 
 from .mock import MockScenario
 from .modes import DESCRIPTORS, Mode, descriptor
-from .scpi import FlowControl, ModeSettings, SerialSettings
+from .scpi import FlowControl, ModeSettings, SerialSettings, select_range_firmware
 from .state import AcquisitionState
 from .worker import MeasurementWorker
 
@@ -290,7 +290,7 @@ class WebCommandRouter(QObject):
             connection_text=str(message),
             simulation=bool(self.worker.simulation) if connected else False,
             control_mode=str(self.worker.control_mode),
-            device={"idn": self.worker.info.idn_raw} if connected and self.worker.info else {},
+            device=self._current_device_state() if connected else {},
         )
 
     @Slot(str)
@@ -339,6 +339,39 @@ class WebCommandRouter(QObject):
         previous = self.store.snapshot()["speed_seq"]
         self.store.update(speed_result={"success": success, "message": message}, speed_seq=previous + 1)
 
+    def _current_device_state(self) -> dict:
+        info = self.worker.info
+        if info is None:
+            return {}
+        instrument = self.worker.instrument
+        outguard = str(getattr(instrument, "outguard_version", "") or "")
+        inguard = str(getattr(instrument, "inguard_version", "") or "")
+        if hasattr(instrument, "range_firmware"):
+            range_firmware, range_source = instrument.range_firmware
+        else:
+            range_firmware, range_source = select_range_firmware(info.firmware, "")
+        return {
+            "idn": info.idn_raw,
+            "serial_number": info.serial_number,
+            "firmware": info.firmware or None,
+            "idn_revision": info.idn_revision,
+            "front_panel_software": {
+                "outguard_sw": outguard or None,
+                "inguard_sw": inguard or None,
+            },
+            "range_firmware": range_firmware or None,
+            "range_firmware_source": range_source,
+        }
+
+    @staticmethod
+    def _version_text(value, label: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{label}必须是文本")
+        text = value.strip()
+        if len(text) > 64:
+            raise ValueError(f"{label}最多64个字符")
+        return text
+
     @Slot(str, str, object)
     def execute(self, request_id: str, action: str, payload: dict) -> None:
         try:
@@ -373,6 +406,15 @@ class WebCommandRouter(QObject):
             error = check_worker_error("仪器连接失败")
             if error:
                 return error
+            profiles = payload.get("front_panel_software_by_serial", {})
+            if isinstance(profiles, dict) and worker.info is not None:
+                versions = profiles.get(worker.info.serial_number, {})
+                if isinstance(versions, dict):
+                    outguard = self._version_text(versions.get("outguard_sw", ""), "OutG SW")
+                    inguard = self._version_text(versions.get("inguard_sw", ""), "InG SW")
+                    if outguard or inguard:
+                        worker.set_firmware_versions(outguard, inguard)
+            self.store.update(device=self._current_device_state())
             return {"success": True, "message": "仪器已连接；连接过程只读取现有模式，没有改变仪器设置"}
 
         if action == "connect_mock":
@@ -403,6 +445,20 @@ class WebCommandRouter(QObject):
             if error:
                 return error
             return {"success": True, "message": self.store.snapshot()["status"]}
+
+        if action == "firmware_versions":
+            if worker.state != AcquisitionState.STOPPED:
+                raise ValueError("采集中不能修改面板软件版本记录")
+            if worker.simulation or worker.instrument is None or not worker.instrument.connected:
+                raise ValueError("请先连接真实的 Fluke 8845A，再记录面板软件版本")
+            outguard = self._version_text(payload.get("outguard_sw", ""), "OutG SW")
+            inguard = self._version_text(payload.get("inguard_sw", ""), "InG SW")
+            worker.set_firmware_versions(outguard, inguard)
+            error = check_worker_error("记录面板软件版本失败")
+            if error:
+                return error
+            self.store.update(device=self._current_device_state())
+            return {"success": True, "message": "已记录面板核对的软件版本；这些版本不是通过SCPI读取"}
 
         if action == "shutdown":
             worker.shutdown()

@@ -104,6 +104,10 @@
             <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="connectMock" class="button button-quiet" type="button">连接模拟器</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button></div>
             <div id="mockScenarioRow" class="scenario-row hidden"><label for="mockScenario">模拟场景</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
             <div class="connection-detail"><span class="connection-led"></span><span id="connectionText">串口尚未打开</span></div>
+            <div class="serial-grid firmware-grid">
+              <label title="从仪表前面板 VERSIONS + SN 页人工核对。只有 *IDN? 没有可解析版本时，才用 OutG SW 判断 400 mA 门槛；无法解析不会限制量程。此记录按序列号保存在当前浏览器，不是 SCPI 读取。">OutG SW（面板核对）<input id="outguardSoftware" maxlength="64" placeholder="例如 2.10.882.24" disabled></label>
+              <label title="可选记录前面板显示的 InG SW，随实验配置保存。400 mA 门槛不依据 InG SW。">InG SW（可选记录）<input id="inguardSoftware" maxlength="64" placeholder="例如 ad300210" disabled></label>
+            </div>
             <div class="control-mode-row">
               <label for="controlMode" title="Computer：软件可发送SCPI命令、配置与采集；仪表RS-232协议仍须设为COMPUTER。Local：仪表面板获得控制权；软件不发送测量、配置、诊断和ZERO命令，串口连接保留。只能在停止采集后切换。">仪表操作方式</label>
               <select id="controlMode" title="Computer：软件可发送SCPI命令、配置与采集；仪表RS-232协议仍须设为COMPUTER。Local：仪表面板获得控制权；软件不发送测量、配置、诊断和ZERO命令，串口连接保留。只能在停止采集后切换。">

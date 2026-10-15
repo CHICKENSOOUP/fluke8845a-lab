@@ -121,6 +121,7 @@ input:not([type="checkbox"]):not([type="file"]), select { width: 100%; height: 3
 input:focus, select:focus { border-color: #25878a; box-shadow: 0 0 0 2px #2baeb21c; }
 input::placeholder { color: #99a39d; }
 .serial-grid { margin-top: 9px; display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px 7px; }
+  .firmware-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 .serial-grid label, .mode-options label { display: grid; gap: 4px; color: #64716f; font-size: 9px; }
 .serial-grid select, .serial-grid input { height: 30px; font-size: 10px; }
 .button-row { display: flex; align-items: center; gap: 7px; }

@@ -948,6 +948,42 @@ def test_date_coded_idn_firmware_keeps_400ma_and_autorange_available_in_gui(qt_a
         qt_app.processEvents()
 
 
+def test_front_panel_firmware_profile_is_restored_by_serial_and_controls_only_400ma(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._firmware_profiles["9383035"] = {
+            "outguard_sw": "2.10.882.24", "inguard_sw": "ad300210",
+        }
+        window._on_configuration({
+            "idn": "FLUKE,8845A,9383035,02/14/08-08:54",
+            "function": "CURR:DC", "input_terminals": "FRONT", "simulation": False,
+        })
+        assert window._firmware == "2.10.882.24"
+        assert window.outguard_sw_edit.text() == "2.10.882.24"
+        assert window.inguard_sw_edit.text() == "ad300210"
+
+        window._connected = True
+        window._load_mode_controls(Mode.DCI)
+        assert window.range_combo.model().item(window.range_combo.findData(0.4)).isEnabled()
+        assert window.outguard_sw_edit.isEnabled()
+
+        window.outguard_sw_edit.setText("1.9.0.0")
+        window._firmware_version_changed()
+        saved = json.loads(window._profile_path.read_text(encoding="utf-8"))
+        assert saved["instrument_firmware_by_serial"]["9383035"] == {
+            "outguard_sw": "1.9.0.0", "inguard_sw": "ad300210",
+        }
+        assert not window.range_combo.model().item(window.range_combo.findData(0.4)).isEnabled()
+        assert window.range_combo.model().item(window.range_combo.findData(0.1)).isEnabled()
+        assert window.range_combo.model().item(window.range_combo.findData(10.0)).isEnabled()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 @pytest.mark.parametrize("mode", list(Mode))
 def test_gui_exposes_only_parameters_supported_by_selected_mode(qt_app, monkeypatch, tmp_path, mode):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))

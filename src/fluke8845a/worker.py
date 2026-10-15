@@ -143,6 +143,27 @@ class MeasurementWorker(QObject):
     def connect_mock(self, mode_settings: ModeSettings, scenario: MockScenario) -> None:
         self._connect("MOCK", SerialSettings(), mode_settings, True, scenario)
 
+    @Slot(str, str)
+    def set_firmware_versions(self, outguard_version: str, inguard_version: str) -> None:
+        """Store operator-verified front-panel software versions without SCPI writes."""
+        if self.state != AcquisitionState.STOPPED:
+            self.error.emit("采集中不能修改面板软件版本记录")
+            return
+        if (
+            self.simulation or self.instrument is None
+            or not getattr(self.instrument, "connected", False)
+            or not hasattr(self.instrument, "set_firmware_versions")
+        ):
+            return
+        outguard_version = str(outguard_version or "").strip()
+        inguard_version = str(inguard_version or "").strip()
+        self.instrument.set_firmware_versions(outguard_version, inguard_version)
+        self.log_line.emit(
+            "已记录操作员从仪表面板核对的软件版本："
+            f"OutG SW={outguard_version.strip() or '未核对'}，"
+            f"InG SW={inguard_version.strip() or '未核对'}；未通过SCPI读取"
+        )
+
     def _connect(self, port, serial_settings, mode_settings, use_mock, scenario) -> None:
         if self.instrument is not None and self.instrument.connected:
             self.error.emit("请先断开当前仪器连接")
@@ -315,6 +336,16 @@ class MeasurementWorker(QObject):
             self._one_shot = one_shot
             self._stop_requested.clear()
             info = self.info
+            panel_software = {
+                "outguard_sw": getattr(self.instrument, "outguard_version", "") or None,
+                "inguard_sw": getattr(self.instrument, "inguard_version", "") or None,
+            }
+            if hasattr(self.instrument, "range_firmware"):
+                range_firmware, range_firmware_source = self.instrument.range_firmware
+            else:
+                range_firmware, range_firmware_source = (
+                    info.firmware or "", "*IDN?" if info.firmware else "未知"
+                )
             metadata = {
                 "simulation": self.simulation,
                 "control_mode": self.control_mode,
@@ -323,6 +354,9 @@ class MeasurementWorker(QObject):
                            "firmware": info.firmware or None,
                            "idn_revision": info.idn_revision,
                            "firmware_source": "*IDN? semantic version" if info.firmware else None,
+                           "front_panel_software": panel_software,
+                           "range_firmware": range_firmware or None,
+                           "range_firmware_source": range_firmware_source,
                            "idn_raw": info.idn_raw},
                 "connection": {"port": "MOCK" if self.simulation else getattr(self.instrument, "port", ""),
                                "serial_settings": asdict(getattr(self.instrument, "settings", SerialSettings()))},
