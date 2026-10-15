@@ -1002,7 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     wiring.add_argument("--confirm-front-aci-current-series", action="store_true",
                         help="确认交流电流源串联，红线接mA/400 mA、黑线接LO；只用于ACI短测")
     parser.add_argument("--duration", type=float, default=12.0,
-                        help="GUI硬件短测采集秒数（8至30秒；程序总运行硬上限55秒，默认12秒）")
+                        help="GUI硬件短测采集秒数（8至50秒；程序总运行硬上限55秒，默认12秒）")
     parser.add_argument("--aci-current-arms", type=float, help="ACI交流源标称RMS电流（A）")
     parser.add_argument("--aci-frequency-hz", type=float, help="ACI交流源频率（Hz）")
     parser.add_argument("--aci-range-a", type=float, choices=(10e-3, 100e-3, 400e-3),
@@ -1079,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             not math.isfinite(args.duration)
             or not MIN_HARDWARE_PROBE_DURATION_S <= args.duration <= MAX_HARDWARE_PROBE_DURATION_S
         ):
-            parser.error(f"--duration must be between 8 and 30 seconds for {probe_name}; total probe wall limit is 55 seconds")
+            parser.error(f"--duration must be between 8 and 50 seconds for {probe_name}; total probe wall limit is 55 seconds")
         if gui_probe_mode == Mode.RES2:
             if not args.confirm_front_2w_30mohm and not args.confirm_front_2w_short:
                 parser.error(f"{probe_name} requires --confirm-front-2w-30mohm or --confirm-front-2w-short")

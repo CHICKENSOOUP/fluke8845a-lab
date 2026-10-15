@@ -247,7 +247,7 @@ def test_gui_probe_cli_requires_explicit_wiring_confirmation(tmp_path, capsys):
     assert "--confirm-front-2w-short" in error
 
 
-def test_gui_probe_cli_caps_test_duration_at_one_minute_without_opening_hardware(tmp_path, monkeypatch):
+def test_gui_probe_cli_caps_test_duration_at_one_minute_without_opening_hardware(tmp_path, monkeypatch, capsys):
     captured = {}
 
     def fake_probe(port, report_path, *, wiring_confirmed, shorted_leads_confirmed, baudrate, duration_s, visible_window):
@@ -285,6 +285,7 @@ def test_gui_probe_cli_caps_test_duration_at_one_minute_without_opening_hardware
             "--report", str(tmp_path / "too-long.json"), "--confirm-front-2w-30mohm",
         ])
     assert exit_info.value.code == 2
+    assert "--duration must be between 8 and 50 seconds" in capsys.readouterr().err
 
 
 def test_gui_probe_cli_routes_confirmed_short_and_baudrate(tmp_path, monkeypatch):
