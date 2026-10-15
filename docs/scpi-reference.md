@@ -9,7 +9,7 @@
 | 软件行为或事实 | 依据位置 |
 |---|---|
 | RS-232出厂为9600、无校验、8位、1停止位、无流控；所有设置可配；波特率1200–230400；校验/数据位组合、停止位、流控和CR/LF/CRLF | `Fluke 8845A/8846A Programmers Manual, Rev. 3`：PDF页16–17，印刷页6–7 |
-| COMPUTER/TERMINAL方式、RS-232 `SYST:REM`/`SYST:LOC`、`*IDN?` 安装测试及SCPI终止符；TERMINAL会回显命令/返回提示符，COMPUTER不回显/不返回提示符 | 同上：PDF页18–19和28，印刷页8–9和18；软件据命令回显识别并提示切换Computer |
+| COMPUTER/TERMINAL方式、RS-232 `SYST:REM`/`SYST:LOC`、`*IDN?` 安装测试及SCPI终止符；8845A/8846A模式的`*IDN?`第四字段通常为日期/时间修订标记，不应当作软件版本；`SYST:VERS?`只返回SCPI命令版本 | 同上：PDF页18–19、28、46和70，印刷页8–9、18、36和60；软件据命令回显识别并提示切换Computer |
 | `MEASure?` 是配置预设后测量，等价于CONFigure + READ?；`CONFigure`本身不触发，须后跟READ?或INIT/FETCh；`READ?`在下一触发条件满足时返回，且读取每次响应后再继续 | 同上：PDF页48–52，印刷页38–42 |
 | 六种量测的CONF function；D/SENS:FILT/NPLC、AC带宽3/20/200、ZERO:AUTO、ROUT:TERM?、SYST:ERR? | 同上：PDF页41–47，印刷页31–37；具体量测配置为PDF页42–44、印刷页32–34 |
 | 8845A与8846A区分；DCV范围100 mV至1000 V，ACV最高750 V；电阻8845A从100 Ω档起（10 Ω为8846A专属） | `Fluke 8845A/8846A Extended Specifications`：PDF页3–6，印刷页2–5；型号专属能力摘要PDF页1 |
@@ -33,7 +33,7 @@
 
 - 模式参数先按手册的离散枚举验证。仪器错误队列非零时配置失败并中止，不继续保存看似有效的读数。
 - `LOCAL`面板控制时软件不发送配置、诊断、ZERO或采集命令；采集停止后可切回`COMPUTER`，并从仪表重新读取面板操作后当前的模式和参数。
-- 400 mA的DCI/ACI分别检查资料所列固件门槛；只有仪器回报了可识别且低于门槛的版本时才禁用固定档/自动量程。部分8845A的`*IDN?`返回日期格式，无法据此读取软件版本；本机面板已确认软件版本高于2.0，因此日期格式不再触发拒绝。连接其他仪表时应先在面板核实软件版本。
+- 400 mA的DCI/ACI分别检查资料所列固件门槛；只有`*IDN?`字段含可解析的软件版本且该版本低于门槛时，才禁用固定400 mA档。其它固定量程不因400 mA版本门槛而禁用；若固件已知过旧，自动量程会被阻止，因为仪器可能自动切入不支持的400 mA档。8845A/8846A模式的`*IDN?`第四字段通常是日期/时间修订标记；`SYST:VERS?`查询的是SCPI命令版本，不是仪器软件版本。软件版本应从仪表面板核实。日期/时间标记不能作为旧固件证据。
 - 1/3/10 A档按规格仅在前面板端子显示可用；后端子下固定档被禁用且电流自动量程被阻止。
 - `READ?`的时间戳是PC写命令前时间，仪器转换并无逐样本硬件时间戳。读数周期与range-query耗时一并保存在`read_duration_s`。并未使用资料中有额外条件的典型高速度作为保证。
 - 用户设置的串口响应超时是普通SCPI命令的下限。程序按NPLC/自动零点或交流带宽为`READ?`增加主机等待时间；这是保守通信保护，不是Fluke转换时间保证。若响应不完整，软件记录一条空值超时行后停止采集并关闭串口，避免后续请求误读迟到数据。
@@ -47,7 +47,7 @@ This reference maps application behavior to the Fluke 8845A documentation consul
 | Topic | Fluke reference |
 |---|---|
 | RS-232 defaults and configurable serial parameters | *8845A/8846A Programmers Manual*, Rev. 3, PDF pp. 16–17 (printed pp. 6–7) |
-| COMPUTER/TERMINAL modes, `SYST:REM`, `SYST:LOC`, `*IDN?`, and terminators | Same manual, PDF pp. 18–19, 28 (printed pp. 8–9, 18) |
+| COMPUTER/TERMINAL modes, `SYST:REM`, `SYST:LOC`, `*IDN?`, and terminators; in 8845A/8846A mode the fourth `*IDN?` field is commonly a date/time revision marker, while `SYST:VERS?` returns the SCPI command version | Same manual, PDF pp. 18–19, 28, 46, 70 (printed pp. 8–9, 18, 36, 60) |
 | `MEASure?`, `CONFigure`, `READ?`, `INIT/FETCh`, and trigger behavior | Same manual, PDF pp. 48–52 (printed pp. 38–42) |
 | Six measurement functions, range, NPLC, filter, bandwidth, auto-zero, terminal and error queries | Same manual, PDF pp. 41–47 (printed pp. 31–37) |
 | 8845A/8846A differences; voltage and resistance ranges | *Extended Specifications*, PDF pp. 1–6 (printed pp. 2–5) |
@@ -67,7 +67,7 @@ The application does not configure capacitance, RTD temperature, source output, 
 
 - Parameters are validated against documented discrete values. A non-zero instrument error queue aborts configuration and acquisition.
 - In `LOCAL` panel-control mode, the application sends no configuration, diagnostic, ZERO, or acquisition commands. After panel operation, switching back to `COMPUTER` re-reads the current function and settings.
-- The 400 mA DCI/ACI ranges enforce the documented firmware threshold when the reported version is identifiable and demonstrably too old. An unparseable date-style `*IDN?` field alone does not block the range; verify firmware on the front panel when the version is not readable from SCPI.
+- The fixed 400 mA DCI/ACI ranges enforce the documented firmware threshold only when `*IDN?` contains a parseable semantic version that is below the threshold. Other fixed ranges are not blocked by this 400 mA gate. If firmware is known to be too old, autorange is blocked because the meter could enter 400 mA. The 8845A `*IDN?` date/time revision marker is not firmware, and `SYST:VERS?` returns the SCPI command version. Verify software version on the front panel.
 - 1/3/10 A ranges are exposed only when front-panel terminals are confirmed; rear-terminal operation blocks these fixed ranges and current autorange.
 - `READ?` timestamps are host timestamps taken before sending the command. The meter supplies no hardware timestamp per sample; `read_duration_s` records the read and range-query interval. Published typical maximum speeds are not treated as guarantees.
 - The configured serial timeout is the floor for ordinary SCPI commands. The host allows a longer `READ?` response window based on NPLC/autozero or the selected AC bandwidth; this is a conservative host timeout, not a Fluke conversion-time guarantee. An incomplete `READ?` response is saved as a blank timeout attempt, then acquisition stops and the serial session closes before another query can consume a delayed response.

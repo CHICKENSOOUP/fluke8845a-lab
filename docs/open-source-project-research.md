@@ -76,7 +76,7 @@
 若将上述设计思想应用于此项目，需要保持以下具体条件：
 
 1. 直接使用 PySerial 打开 Windows `COM 端口`；本次已验证的串口设置为 115200 baud、8 数据位、无校验、1 停止位、无流控、CRLF。其他电脑或仪表串口菜单变更后仍应从界面核对。不能发送 Prologix `++help`/`++addr`，也不能按 TCP 端口 3490建立 socket。
-2. 用 `*IDN?`解析厂牌、型号、序列号与固件，只接受 Fluke 8845A；不能因上游代码或说明把 8846A 的模式、量程、速度或固件能力带进来。
+2. 用 `*IDN?`解析厂牌、型号、序列号，并保留第四字段原文；它在8845A/8846A模式下通常是日期/时间修订标记，不能直接称作固件。`SYST:VERS?`查询的是SCPI命令版本。仅接受 Fluke 8845A；不能因上游代码或说明把 8846A 的模式、量程、速度或固件能力带进来。
 3. 六种模式、量程、NPLC、交流滤波、端子和固件条件必须逐项按本项目官方资料配置及核验；模式不适用的参数应隐藏或禁用。尤其电流模式仍需提醒用户断电、检查保险丝和物理串联接线，软件不能识别表笔插孔。
 4. 串口收发只能由采集工作线程独占；通信超时、断线和仪器 LOCAL 状态应保存为空数值的异常行，不得填零或沿用上次读数。重连必须在错误状态被记录后进行。
 5. 曲线绘制和统计不能阻塞原始数据写入。每次实验独立目录，记录逐点刷新；原始响应与数值分开保存，历史图可抽稀而不能改写原始 CSV。
@@ -114,7 +114,7 @@ These findings apply to the frozen revisions examined on the research date and a
 
 ### Application-specific boundaries
 
-This application uses direct Windows COM serial communication through PySerial; it must not send Prologix `++help`/`++addr` commands or use a TCP socket. `*IDN?` must identify a Fluke 8845A; 8846A behavior must not be assumed. Mode, range, NPLC, AC filter, terminal, and firmware support are validated against Fluke references. Serial I/O is owned by the acquisition worker; failed attempts are stored with an empty value and explicit status. Plot downsampling must not change raw CSV records or block acquisition.
+This application uses direct Windows COM serial communication through PySerial; it must not send Prologix `++help`/`++addr` commands or use a TCP socket. `*IDN?` must identify a Fluke 8845A; its fourth field is preserved as an IDN revision and is treated as firmware only when it contains a recognized semantic version. The 8845A manual defines `SYST:VERS?` as the SCPI command version query, not a firmware query. 8846A behavior must not be assumed. Mode, range, NPLC, AC filter, terminal, and firmware support are validated against Fluke references. Serial I/O is owned by the acquisition worker; failed attempts are stored with an empty value and explicit status. Plot downsampling must not change raw CSV records or block acquisition.
 
 The implementation maps those responsibilities to `scpi.py` (serial and SCPI), `worker.py` (acquisition thread and state), `storage.py` (CSV/config/events/logging), and `gui.py` (PySide6 UI and plotting). This research did not modify command behavior or instrument capability claims. Reuse permissions and technical correctness are separate checks.
 

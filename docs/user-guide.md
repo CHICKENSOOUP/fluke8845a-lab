@@ -28,7 +28,7 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 - **四线电阻**：被测电路断电；SOURCE/FORCE 线和 SENSE HI/LO 线接到正确端子。
 - **电流**：必须先关闭被测电路电源，再将仪器串联接入回路。前面板的 mA/400 mA 与 10 A 是两个独立红色插孔：预期电流不超过 400 mA 时红表笔接 mA/400 mA、黑表笔接 LO；预期电流大于 400 mA 且不超过 10 A 时，红表笔接 10 A、黑表笔接 LO；两个红色电流孔不能同时连接。应用会按当前固定量程显示应选的插孔；自动量程时必须按最大预期电流选孔，并核对仪表显示的 mA/10 A 输入选择。绝不可将电流输入并联到电压源。
 
-8845A 的 mA 输入有 440 mA 保险丝，10 A 输入有 11 A 保险丝；资料列出的允许值为 400 mA 连续、550 mA 最多2分钟后停1分钟。保险丝额定值不代表可连续测量值。1 A、3 A、10 A测量量程只适用于前面板端子；已确认低于支持门槛的固件或当前端子不支持时，软件会禁用相应量程及可能跨越这些量程的电流自动量程。400 mA 功能有固件版本条件：DCI要求软件至少2.0，ACI要求至少1.0.700.18。部分8845A的`*IDN?`返回日期格式而非可比较的软件版本；此时软件不再仅因版本字符串无法解析而拦截400 mA。对其他仪表，请先在面板核实软件版本。当前已核实仪表的面板软件版本高于2.0。
+8845A 的 mA 输入有 440 mA 保险丝，10 A 输入有 11 A 保险丝；资料列出的允许值为 400 mA 连续、550 mA 最多2分钟后停1分钟。保险丝额定值不代表可连续测量值。1 A、3 A、10 A测量量程只适用于前面板端子；当前端子不支持时，软件会禁用这些高电流量程及可能跨入这些档位的电流自动量程。400 mA 功能有固件版本条件：DCI要求软件至少2.0，ACI要求至少1.0.700.18。8845A/8846A模式的`*IDN?`第四字段通常为日期/时间修订标记，不是可比较的软件版本；`SYST:VERS?`返回SCPI命令版本，也不是仪器软件版本。因此软件只在`*IDN?`实际含可解析版本且明确低于门槛时禁用固定400 mA量程，日期/时间格式不会触发拒绝。若已知固件低于门槛，自动量程也会被阻止，因为自动量程可能进入400 mA档。请在仪表面板查看软件版本；当前已核实仪表的面板软件版本高于2.0。
 
 改变模式或固定量程不会移动测试线或切换物理插孔。手册列出的 mA/10 A 前面板输入选择应与实际表笔插孔一致。`ROUT:TERM?`只报告FRONT/REAR，量程回读也不能识别红表笔接在mA/400 mA孔还是10 A孔；软件无法替操作者验证。量程切换跨越400 mA分界时，请再次断电、检查端子和保险丝。
 
@@ -81,7 +81,7 @@ CSV的PC本地/UTC时间和`elapsed_s`记录主机发送单次`READ?`前的时�
 每次实验在根目录下新建唯一时间戳目录，包含：
 
 - `measurements.csv`：每次测量/失败尝试一行。`raw_reading`保留仪器响应文本，`value_si`保存未经滤波/舍入的SI值；`voltage_v`、`current_a`、`resistance_ohm`三列供常见工具直接筛选。无效值为空字符串，状态列写`timeout`、`overflow`、`invalid`、`instrument_local`或其他通信错误。
-- `config.json`：仪器身份和固件、串口、请求的模式设置、仪器回读、数据是真机还是模拟、采样时间语义及最终状态。
+- `config.json`：原始仪器身份、IDN修订字段、可识别的软件版本（若仪器通过IDN字段提供）、串口、请求的模式设置、仪器回读、数据是真机还是模拟、采样时间语义及最终状态。
 - `events.csv`：人工事件、暂停/继续和相对基准变更。
 - `run.log`：实验启动/停止、SCPI配置命令和异常。逐点原始响应在CSV；为避免长期高速采集产生巨型日志，测量响应不重复写入run.log。实时SCPI发送/接收在GUI日志面板可见；显示队列有界，界面跟不上时会提示丢弃的旧日志行。
 
@@ -118,9 +118,9 @@ The application scans serial ports at startup and also accepts a manually entere
 
 ### 2. Measurement modes and safe wiring
 
-Supported modes are DCV, ACV, DCI, ACI, 2-wire resistance, and 4-wire resistance. AC readings are RMS values, not peak values or waveform samples. The application cannot inspect the circuit, test leads, terminals, or fuses. Connect voltage inputs in parallel. De-energize the circuit before resistance measurements. For current, de-energize first and connect the meter in series. Select the appropriate mA/400 mA or 10 A input, never connect both red current inputs simultaneously, and never place a current input in parallel with a voltage source. Check wiring, range, front-panel input selection, and fuses before each measurement. Software cannot identify which physical red jack contains a lead. A 400 mA range is rejected when the instrument explicitly reports firmware below its documented threshold; an unparseable `*IDN?` firmware field alone does not cause rejection.
+Supported modes are DCV, ACV, DCI, ACI, 2-wire resistance, and 4-wire resistance. AC readings are RMS values, not peak values or waveform samples. The application cannot inspect the circuit, test leads, terminals, or fuses. Connect voltage inputs in parallel. De-energize the circuit before resistance measurements. For current, de-energize first and connect the meter in series. Select the appropriate mA/400 mA or 10 A input, never connect both red current inputs simultaneously, and never place a current input in parallel with a voltage source. Check wiring, range, front-panel input selection, and fuses before each measurement. Software cannot identify which physical red jack contains a lead. A fixed 400 mA range is rejected only when `*IDN?` contains a parseable software version below its documented threshold. A date/time revision marker does not trigger rejection. If firmware is known to be too old, current autorange is blocked because it could enter 400 mA.
 
-The mA input has a 440 mA fuse and the 10 A input an 11 A fuse. The documented limit is 400 mA continuous; 550 mA is limited to two minutes followed by one minute off. Fuse ratings are not continuous operating limits. Ranges documented as unsupported for the model or active terminals are disabled. A firmware-sensitive 400 mA range is blocked only when the reported firmware is identifiable and explicitly below its documented threshold; an unparseable `*IDN?` date field alone does not block it.
+The mA input has a 440 mA fuse and the 10 A input an 11 A fuse. The documented limit is 400 mA continuous; 550 mA is limited to two minutes followed by one minute off. Fuse ratings are not continuous operating limits. Ranges documented as unsupported for the model or active terminals are disabled. The firmware-sensitive fixed 400 mA range is blocked only when `*IDN?` contains a parseable software version below that mode's threshold; other fixed ranges are unaffected by this gate. In 8845A/8846A mode the fourth `*IDN?` field is commonly a date/time revision marker, not the firmware version. `SYST:VERS?` returns the SCPI command version. Check the instrument's software version on its front panel.
 
 ### 3. Measurement settings and speed
 
@@ -136,7 +136,7 @@ Enter an experiment name and output directory, then start a single reading or co
 
 The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Timestamps are host-side: the CSV records the time before `READ?`, and `read_duration_s` records the read and range-query communication period. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
 
-Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, sample notifications are coalesced and at most the latest 10,000 pending display points are kept; the SCPI display-log mailbox also stays bounded at 5,000 lines and reports when earlier display entries are dropped. The curve may skip intermediate display points while the CSV and full-run statistics remain complete.
+Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. `config.json` preserves the raw instrument identity and IDN revision field, plus a semantic firmware version only when the instrument actually supplies one in that field. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, sample notifications are coalesced and at most the latest 10,000 pending display points are kept; the SCPI display-log mailbox also stays bounded at 5,000 lines and reports when earlier display entries are dropped. The curve may skip intermediate display points while the CSV and full-run statistics remain complete.
 
 ### 5. Analysis, events, and history
 

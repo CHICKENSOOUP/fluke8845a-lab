@@ -439,7 +439,10 @@ def test_real_dci_gui_probe_refuses_to_switch_a_different_live_instrument_mode(m
             self.closed = False
 
         def connect(self):
-            return InstrumentInfo("FLUKE", "8845A", "PRIVATE", "02/14/08-08:54", "FLUKE,8845A,PRIVATE,02/14/08-08:54")
+            return InstrumentInfo(
+                "FLUKE", "8845A", "PRIVATE", "", "FLUKE,8845A,PRIVATE,02/14/08-08:54",
+                idn_revision="02/14/08-08:54",
+            )
 
         def read_mode_state(self):
             return {"function": '"VOLT:DC"', "input_terminals": '"FRON"'}

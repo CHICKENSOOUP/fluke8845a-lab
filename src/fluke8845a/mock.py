@@ -33,7 +33,10 @@ class Mock8845A:
     def __init__(self, scenario: MockScenario | None = None, log_callback=None) -> None:
         self.scenario = scenario or MockScenario()
         self._log = log_callback or (lambda _line: None)
-        self.info = InstrumentInfo("MOCK FLUKE", "8845A-MOCK", "SIM-0001", "MOCK", "MOCK,8845A-MOCK,SIM-0001,MOCK")
+        self.info = InstrumentInfo(
+            "MOCK FLUKE", "8845A-MOCK", "SIM-0001", "",
+            "MOCK,8845A-MOCK,SIM-0001,MOCK", idn_revision="MOCK",
+        )
         self.connected = False
         self._settings: ModeSettings | None = None
         self._started_ns = 0

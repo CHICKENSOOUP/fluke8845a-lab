@@ -31,6 +31,18 @@ def test_idn_parser_keeps_firmware_and_model():
     assert info.model == "8845A"
     assert info.serial_number == "SN,42"
     assert info.firmware == "2.0"
+    assert info.idn_revision == "2.0"
+
+
+def test_idn_date_time_revision_is_not_misreported_as_firmware():
+    info = parse_idn("FLUKE,8845A,9383035,02/14/08-08:54")
+    assert info.idn_revision == "02/14/08-08:54"
+    assert info.firmware == ""
+
+
+def test_idn_multi_component_software_version_is_preserved():
+    info = parse_idn("FLUKE,8845A,9383035,OutG SW 2.10.882.24")
+    assert info.firmware == "2.10.882.24"
 
 
 def test_control_mode_switches_use_only_documented_remote_and_local_commands():
@@ -512,9 +524,38 @@ def test_firmware_compare_returns_unknown_instead_of_guessing():
 def test_date_coded_idn_firmware_does_not_block_400ma_range():
     transport = FakeTransport("FLUKE,8845A,1234567,02/14/08-08:54")
     instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
-    instrument.connect()
+    info = instrument.connect()
+    assert info.firmware == ""
+    assert info.idn_revision == "02/14/08-08:54"
     instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.4))
     assert "SENS:CURR:DC:RANG 0.4" in transport.commands
+    instrument.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "firmware", "range_si"),
+    [
+        (Mode.DCI, "1.0.700.18", 0.01),
+        (Mode.DCI, "1.0.700.18", 0.1),
+        (Mode.DCI, "1.0.700.18", 1.0),
+        (Mode.DCI, "1.0.700.18", 3.0),
+        (Mode.DCI, "1.0.700.18", 10.0),
+        (Mode.ACI, "1.0.700.17", 0.01),
+        (Mode.ACI, "1.0.700.17", 0.1),
+        (Mode.ACI, "1.0.700.17", 1.0),
+        (Mode.ACI, "1.0.700.17", 3.0),
+        (Mode.ACI, "1.0.700.17", 10.0),
+    ],
+)
+def test_old_firmware_only_blocks_fixed_400ma_range(mode, firmware, range_si):
+    transport = FakeTransport(f"FLUKE,8845A,123,{firmware}", terminals="FRONT")
+    instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+
+    instrument.configure(ModeSettings(mode, autorange=False, range_si=range_si))
+
+    function = "CURR:DC" if mode == Mode.DCI else "CURR:AC"
+    assert f"SENS:{function}:RANG {range_si:g}" in transport.commands
     instrument.close()
 
 

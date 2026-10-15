@@ -117,8 +117,11 @@ class InstrumentInfo:
     manufacturer: str
     model: str
     serial_number: str
+    # A semantic software version when the *IDN? revision field actually
+    # contains one. For 8845A mode the field is commonly a date/time marker.
     firmware: str
     idn_raw: str
+    idn_revision: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,11 +308,19 @@ def parse_idn(response: str) -> InstrumentInfo:
     if len(fields) < 2:
         raise InstrumentIdentityError(f"*IDN?响应格式无效：{response!r}")
     fields = [field.strip() for field in fields]
+    revision = fields[3] if len(fields) > 3 else ""
+    version_match = re.search(r"(?<![\d.])(?:v\s*)?(\d+(?:\.\d+){1,3})(?![\d.])", revision, re.I)
+    firmware = ""
+    if version_match:
+        candidate = version_match.group(1)
+        if len(candidate.split(".")) in (2, 4):
+            firmware = candidate
     return InstrumentInfo(
         manufacturer=fields[0], model=fields[1].upper(),
         serial_number=fields[2] if len(fields) > 2 else "",
-        firmware=fields[3] if len(fields) > 3 else "",
+        firmware=firmware,
         idn_raw=response.strip(),
+        idn_revision=revision,
     )
 
 

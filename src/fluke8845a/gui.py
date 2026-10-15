@@ -32,7 +32,8 @@ from .analysis import RunningStats, engineering_value, relative_change_percent, 
 from .modes import DESCRIPTORS, Mode, descriptor, mode_from_scpi_function, range_label
 from .mock import MockScenario
 from .scpi import (
-    FlowControl, ModeSettings, SerialSettings, current_autorange_block_reason,
+    FlowControl, InstrumentIdentityError, ModeSettings, SerialSettings,
+    current_autorange_block_reason, parse_idn,
     unsupported_current_ranges,
 )
 from .worker import MeasurementWorker
@@ -710,6 +711,10 @@ class MainWindow(QMainWindow):
         self.idn_label = QLabel("设备身份：未读取")
         self.idn_label.setWordWrap(True)
         self.idn_label.setObjectName("secondaryText")
+        self.idn_label.setToolTip(
+            "8845A/8846A模式的*IDN?第四字段常为日期/时间修订标记，不一定是软件版本。"
+            "SYST:VERS?返回SCPI命令版本，不是仪器固件。请在仪表面板查看软件版本。"
+        )
         form.addRow("识别结果", self.idn_label)
         self.control_mode_combo = QComboBox()
         self.control_mode_combo.addItem("未连接", "disconnected")
@@ -1702,9 +1707,8 @@ class MainWindow(QMainWindow):
         self._terminals = str(details.get("input_terminals") or "")
         idn = str(details.get("idn") or "")
         try:
-            fields = next(csv.reader([idn]))
-            self._firmware = fields[3].strip() if len(fields) > 3 else ""
-        except (csv.Error, IndexError):
+            self._firmware = parse_idn(idn).firmware
+        except (csv.Error, IndexError, InstrumentIdentityError, StopIteration, ValueError):
             self._firmware = ""
         function = str(details.get("function") or "")
         detected_mode = mode_from_scpi_function(function)
