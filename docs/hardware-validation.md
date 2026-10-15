@@ -23,6 +23,7 @@
 - 同一提交的公开 GHCR OCI 包为 `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-676db181ced9`。匿名 manifest 请求返回 HTTP 200，摘要为 `sha256:b285f6a4e20942c312631d4fb846273b85ccf42673adce539f5563fd631a41ef`。
 - 更早的 [运行 38651276730](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38651276730) 也在 Python 3.11/3.12 及源码 ZIP 首次启动检查中通过，并发布了对应 Release 和 GHCR 包。
 - 更早的本地便携候选包由源码树 `bc51e64a0a8ab33fcaf4d1757c08364dc78d6827` 构建，包含 277 个文件；其 ZIP SHA-256 为 `a637dc1b92f19132e7342ae4266ff17e8fbd66116ecf4af4c69ce15442b9a374`。它不是公开 Release 的资产。Qt/PySide 和其他运行库审查门槛仍未关闭，因此公开 Release 仅发布源码。
+- 在 Windows 本机从 `main` 提交 `79ecd6e1b94dbf98c221be209058952492b7239f` 按 `requirements-lock.txt` 构建了新版桌面与 localhost 冻结程序。完整 pytest 通过：289 项、15.28 秒；打包脚本的冻结启动、串口枚举、六模式 Mock 采集和解压 ZIP 校验均成功。六种模拟模式各保存 9/9 条有效样本，并核验 `measurements.csv`、`config.json`、`events.csv`、`run.log`。便携 ZIP 共 278 个文件，SHA-256 为 `37752fe5542296fd52e9e8323d16cd87037c36bffdde1d58144a942afb154162`；桌面 EXE SHA-256 为 `9e291a079fc8458e4a4139c7bef59393d926972a3e907f51b311ada1a32b93b7`。构建解释器是 CPython 3.12.10 x64。产物保存在本机 `dist/Fluke8845A_79ecd6e_20261015_Windows_x64.zip`，没有上传到 Release；这是软件与 Mock 验证，不是真机验收，也未关闭二进制发布的许可证审查门槛。
 
 ### 真机验证与发布限制
 
@@ -52,6 +53,7 @@ This record reports only evidence that was obtained. It does not publish worksta
 - The public GHCR OCI package for that commit is `ghcr.io/chickensooup/fluke8845a-lab-source:main-build-676db181ced9`. An anonymous manifest request returned HTTP 200 with digest `sha256:b285f6a4e20942c312631d4fb846273b85ccf42673adce539f5563fd631a41ef`.
 - The earlier [run 38651276730](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38651276730) also passed on Python 3.11/3.12 and the extracted-source first-launch check, and published its matching Release and GHCR package.
 - An earlier local portable candidate was built from source tree `bc51e64a0a8ab33fcaf4d1757c08364dc78d6827` and contains 277 files. Its ZIP SHA-256 is `a637dc1b92f19132e7342ae4266ff17e8fbd66116ecf4af4c69ce15442b9a374`. It is not an asset of the public Release. Qt/PySide and other runtime redistribution review gates remain open, so the public Release contains source only.
+- On Windows, the desktop and localhost frozen programs were rebuilt from `main` commit `79ecd6e1b94dbf98c221be209058952492b7239f` using `requirements-lock.txt`. The full pytest suite passed: 289 tests in 15.28 seconds. The build script's frozen startup, serial enumeration, six-mode Mock acquisition, and extracted-ZIP verification all succeeded. Each simulated mode saved 9/9 valid samples and verified `measurements.csv`, `config.json`, `events.csv`, and `run.log`. The portable ZIP has 278 files and SHA-256 `37752fe5542296fd52e9e8323d16cd87037c36bffdde1d58144a942afb154162`; the desktop EXE SHA-256 is `9e291a079fc8458e4a4139c7bef59393d926972a3e907f51b311ada1a32b93b7`. The build interpreter was 64-bit CPython 3.12.10. The artifact is local at `dist/Fluke8845A_79ecd6e_20261015_Windows_x64.zip` and was not uploaded to a Release. These are software and Mock checks, not hardware acceptance, and they do not close the binary license-review gates.
 
 ### Hardware validation and release limits
 
