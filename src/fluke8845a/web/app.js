@@ -76,7 +76,7 @@ function populateModeOptions(spec) {
     html += `<label>交流响应带宽<select id="bandwidth">${spec.bandwidths.map((value) => `<option value="${value}" ${value === 20 ? "selected" : ""}>${value} Hz</option>`).join("")}</select></label>`;
   }
   if (spec.analog_filter) html += `<label class="option-check"><input id="analogFilter" type="checkbox"> 启用直流模拟滤波</label>`;
-  html += `<label class="option-check"><input id="autozero" type="checkbox" checked> 自动零点校正</label>`;
+  html += `<label class="option-check" title="仪表自动测量内部零点并补偿偏移，可提升稳定性但会增加测量时间；不会把被测读数强制改成0。"><input id="autozero" type="checkbox" checked> 自动零点校正</label>`;
   ui.options.innerHTML = html;
   el("autorange").addEventListener("change", () => { el("range").disabled = el("autorange").checked; });
   ui.safety.textContent = spec.safety;
@@ -251,7 +251,7 @@ function updateStateDisplay(state) {
   const badgeText = badge.querySelector("span");
   badge.classList.toggle("connected", state.connected && !state.simulation);
   badge.classList.toggle("mock", state.connected && state.simulation);
-  badgeText.textContent = !state.connected ? "未连接" : state.simulation ? "MOCK 模拟" : "已连接 · 8845A";
+  badgeText.textContent = !state.connected ? "未连接" : state.simulation ? "MOCK 模拟" : `已连接 · 8845A / ${state.control_mode === "local" ? "LOCAL" : "COMPUTER"}`;
   el("connectionText").textContent = state.connection_text || "串口尚未打开";
   el("connectionText").parentElement.classList.toggle("is-connected", !!state.connected);
   el("disconnect").classList.toggle("hidden", !state.connected);
@@ -259,6 +259,7 @@ function updateStateDisplay(state) {
   el("connectMock").classList.toggle("hidden", !!state.connected);
   el("mockScenarioRow").classList.toggle("hidden", !state.simulation);
   serialFormDisabled(!!state.connected);
+  el("controlMode").value = state.control_mode || "disconnected";
   const activeMode = state.active_settings?.mode;
   const modeApplied = !state.connected || !activeMode || activeMode === app.selectedMode;
   const badgeName = state.configuration?.function || activeMode || "未应用";
@@ -295,25 +296,29 @@ function updateStateDisplay(state) {
   const running = /采集中|测量中/.test(state.status || "");
   const paused = String(state.status || "").includes("暂停");
   const acquiring = running || paused;
-  el("start").disabled = !state.connected || running || paused;
-  el("single").disabled = !state.connected || running || paused;
+  const computerControl = !state.connected || state.simulation || state.control_mode === "computer";
+  el("controlMode").disabled = !state.connected || state.simulation || acquiring;
+  el("applyControlMode").disabled = !state.connected || state.simulation || acquiring;
+  el("start").disabled = !state.connected || !computerControl || acquiring;
+  el("single").disabled = !state.connected || !computerControl || acquiring;
   el("pause").disabled = !running;
   el("pause").classList.toggle("hidden", paused);
   el("resume").classList.toggle("hidden", !paused);
   el("stop").disabled = !running && !paused;
-  el("applySettings").disabled = !state.connected || running || paused;
+  el("applySettings").disabled = !state.connected || !computerControl || acquiring;
   el("disconnect").disabled = acquiring;
-  el("mode").disabled = acquiring;
-  el("autorange").disabled = acquiring;
-  el("range").disabled = acquiring || el("autorange").checked;
-  if (el("analogFilter")) el("analogFilter").disabled = acquiring;
-  el("autozero").disabled = acquiring;
-  if (el("nplc")) el("nplc").disabled = !acquiring;
-  if (el("bandwidth")) el("bandwidth").disabled = !acquiring;
+  const settingsDisabled = acquiring || !computerControl;
+  el("mode").disabled = settingsDisabled;
+  el("autorange").disabled = settingsDisabled;
+  el("range").disabled = settingsDisabled || el("autorange").checked;
+  if (el("analogFilter")) el("analogFilter").disabled = settingsDisabled;
+  el("autozero").disabled = settingsDisabled;
+  if (el("nplc")) el("nplc").disabled = !acquiring || !computerControl;
+  if (el("bandwidth")) el("bandwidth").disabled = !acquiring || !computerControl;
   const active = activeMode();
   const canTune = active && (active.nplc.length || active.bandwidths.length);
-  el("applySpeed").disabled = !state.connected || !canTune || !acquiring;
-  el("zero").disabled = !state.connected || running || paused;
+  el("applySpeed").disabled = !state.connected || !computerControl || !canTune || !acquiring;
+  el("zero").disabled = !state.connected || !computerControl || acquiring;
   if (state.last_error && state.last_error !== app.lastShownError) {
     app.lastShownError = state.last_error;
     // Errors stay visible inline and in the log, without interrupting long sessions.
@@ -772,6 +777,7 @@ function bindControls() {
   el("connectReal").addEventListener("click", connectReal);
   el("connectMock").addEventListener("click", connectMock);
   el("disconnect").addEventListener("click", async () => { const result = await command("disconnect"); if (result.success) serialFormDisabled(false); });
+  el("applyControlMode").addEventListener("click", () => command("control_mode", { mode: el("controlMode").value }));
   el("mode").addEventListener("change", () => { const spec = app.modes.get(el("mode").value); if (spec) { populateModeOptions(spec); app.yView = null; drawChart(); } });
   el("applySettings").addEventListener("click", applySettings);
   el("applySpeed").addEventListener("click", applySpeed);

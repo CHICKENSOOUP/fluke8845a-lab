@@ -104,6 +104,15 @@
             <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="connectMock" class="button button-quiet" type="button">连接模拟器</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button></div>
             <div id="mockScenarioRow" class="scenario-row hidden"><label for="mockScenario">模拟场景</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
             <div class="connection-detail"><span class="connection-led"></span><span id="connectionText">串口尚未打开</span></div>
+            <div class="control-mode-row">
+              <label for="controlMode" title="Computer：软件可发送SCPI命令、配置与采集；仪表RS-232协议仍须设为COMPUTER。Local：仪表面板获得控制权；软件不发送测量、配置、诊断和ZERO命令，串口连接保留。只能在停止采集后切换。">仪表操作方式</label>
+              <select id="controlMode" title="Computer：软件可发送SCPI命令、配置与采集；仪表RS-232协议仍须设为COMPUTER。Local：仪表面板获得控制权；软件不发送测量、配置、诊断和ZERO命令，串口连接保留。只能在停止采集后切换。">
+                <option value="disconnected">未连接</option>
+                <option value="computer">Computer · 软件控制</option>
+                <option value="local">Local · 面板操作</option>
+              </select>
+              <button id="applyControlMode" class="button button-outline" type="button" title="停止采集后应用所选的Local或Computer控制方式。切回Computer时会重新读取仪表当前设置。">切换</button>
+            </div>
             <div class="rule"></div>
             <div class="field-label-row"><label for="mode">测量模式</label><span id="modeFunction" class="tiny-status">未配置</span></div>
             <select id="mode" class="mode-select" aria-label="测量模式"></select>
@@ -111,7 +120,7 @@
             <div class="safety-note"><span class="safety-symbol" aria-hidden="true">!</span><div><strong>切换前核对接线</strong><p id="safetyText">请选择测量模式以查看接线说明。</p></div></div>
             <label class="confirm-row"><input id="safetyConfirm" type="checkbox"><span>我已按提示核对接线、极性、保险丝和输入限值</span></label>
             <div class="button-row"><button id="applySettings" class="button button-primary" type="button">应用仪器参数</button><button id="applySpeed" class="button button-outline" type="button">应用速度</button></div>
-            <button id="zero" class="button button-quiet button-wide" type="button">执行 ZERO 校正…</button>
+            <button id="zero" class="button button-quiet button-wide" type="button" title="执行一次内部零点测量并更新补偿，不是校准调整或去皮，也不会强制显示0。停止采集后执行；启用模拟滤波时，量程、NPLC和触发条件应符合ZERO要求。">执行 ZERO 校正…</button>
           </section>
 
           <section class="panel experiment-panel">

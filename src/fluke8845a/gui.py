@@ -429,6 +429,7 @@ class WiringConfirmationDialog(QDialog):
 class WorkerBridge(QObject):
     connect_real = Signal(str, object, object, bool)
     connect_mock = Signal(object, object)
+    set_control_mode = Signal(str)
     configure = Signal(object)
     start_experiment = Signal(object, str, str, object, bool)
     set_sampling_interval = Signal(object)
@@ -464,6 +465,8 @@ class MainWindow(QMainWindow):
         self._profiles = self._load_profiles()
         self._current_mode = Mode.DCV
         self._connected = False
+        self._control_mode = "disconnected"
+        self._control_mode_switch_pending = False
         self._simulation = False
         self._instrument_mode_known = False
         self._active_settings_by_mode: dict[str, dict] = {}
@@ -518,6 +521,7 @@ class MainWindow(QMainWindow):
     def _wire_worker(self) -> None:
         self._bridge.connect_real.connect(self._worker.connect_real)
         self._bridge.connect_mock.connect(self._worker.connect_mock)
+        self._bridge.set_control_mode.connect(self._worker.set_control_mode)
         self._bridge.configure.connect(self._worker.configure_mode)
         self._bridge.start_experiment.connect(self._worker.start_experiment)
         self._bridge.set_sampling_interval.connect(self._worker.set_target_interval)
@@ -531,6 +535,8 @@ class MainWindow(QMainWindow):
         self._bridge.shutdown.connect(self._worker.shutdown)
         self._bridge.close_app.connect(self._worker.shutdown_app)
         self._worker.connected_changed.connect(self._on_connected)
+        self._worker.control_mode_changed.connect(self._on_control_mode_changed)
+        self._worker.control_mode_result.connect(self._on_control_mode_result)
         self._worker.status_changed.connect(self._on_status)
         self._worker.log_line.connect(self._append_log)
         self._worker.scpi_logs_ready.connect(self._on_scpi_logs_ready)
@@ -705,6 +711,27 @@ class MainWindow(QMainWindow):
         self.idn_label.setWordWrap(True)
         self.idn_label.setObjectName("secondaryText")
         form.addRow("识别结果", self.idn_label)
+        self.control_mode_combo = QComboBox()
+        self.control_mode_combo.addItem("未连接", "disconnected")
+        self.control_mode_combo.addItem("Computer · 软件控制", "computer")
+        self.control_mode_combo.addItem("Local · 面板操作", "local")
+        control_mode_help = (
+            "Computer：软件可发送SCPI命令、设置仪表并采集；仪表的RS-232接口协议仍须单独设为COMPUTER。\n"
+            "Local：把控制权交给仪表面板；软件停用测量、参数设置、诊断和ZERO，串口连接保留。"
+            "只能在停止采集后切换；面板操作完成后可切回Computer。"
+        )
+        self.control_mode_combo.setToolTip(control_mode_help)
+        self.control_mode_label = QLabel("控制方式")
+        self.control_mode_label.setToolTip(control_mode_help)
+        self.set_control_mode_button = QPushButton("切换")
+        self.set_control_mode_button.setObjectName("secondaryButton")
+        self.set_control_mode_button.setToolTip(control_mode_help)
+        self.set_control_mode_button.clicked.connect(self._request_control_mode_change)
+        control_mode_row = QHBoxLayout()
+        control_mode_row.setSpacing(6)
+        control_mode_row.addWidget(self.control_mode_combo, 1)
+        control_mode_row.addWidget(self.set_control_mode_button)
+        form.addRow(self.control_mode_label, control_mode_row)
 
         self.serial_advanced_button = QToolButton()
         self.serial_advanced_button.setObjectName("disclosureButton")
@@ -815,12 +842,15 @@ class MainWindow(QMainWindow):
         mode_form.addRow("模拟滤波", self.analog_filter_check)
         self.autozero_check = QCheckBox("自动零点校正")
         self.autozero_check.setChecked(True)
-        self.autozero_check.setToolTip(
+        autozero_help = (
             "启用后，仪表按自动零点流程测量内部零点并补偿偏移，有助于稳定读数；"
             "额外零点测量会增加读数时间。它不会把被测输入的读数强制改成 0。"
         )
+        self.autozero_check.setToolTip(autozero_help)
         self.autozero_check.toggled.connect(self._settings_changed)
-        mode_form.addRow("零点校正", self.autozero_check)
+        self.autozero_label = QLabel("零点校正")
+        self.autozero_label.setToolTip(autozero_help)
+        mode_form.addRow(self.autozero_label, self.autozero_check)
 
         self.apply_button = QPushButton("应用仪器参数")
         self.apply_button.setObjectName("primaryButton")
@@ -854,13 +884,6 @@ class MainWindow(QMainWindow):
         )
         self.zero_button.clicked.connect(self._request_zero)
         mode_form.addRow("", self.zero_button)
-        self.zero_explanation = QLabel(
-            "自动零点：随测量自动补偿内部偏移，可能降低读数速度。\n"
-            "执行 ZERO：立即做一次内部零点测量并更新补偿；不是校准调整或去皮，也不会强制显示 0。"
-        )
-        self.zero_explanation.setObjectName("secondaryText")
-        self.zero_explanation.setWordWrap(True)
-        mode_form.addRow("作用说明", self.zero_explanation)
         self.safety_text = QLabel()
         self.safety_text.setObjectName("safetyBox")
         self.safety_text.setWordWrap(True)
@@ -1594,20 +1617,20 @@ class MainWindow(QMainWindow):
         self._connected = connected
         self._simulation = "模拟" in text or "MOCK" in text
         if not connected:
+            self._control_mode = "disconnected"
+            self._control_mode_switch_pending = False
             self._active_settings_by_mode.clear()
+        self._set_combo_data(self.control_mode_combo, self._control_mode)
         if self._simulation:
             badge_text = "MOCK 模拟模式"
         elif connected:
-            badge_text = "已连接 · 8845A / REMOTE"
+            badge_text = "已连接 · 8845A / LOCAL" if self._control_mode == "local" else "已连接 · 8845A / COMPUTER · REMOTE"
         else:
             badge_text = text if text and text != "未读取" else "未连接"
         self.connection_badge.setText(badge_text)
         tooltip = text
         if connected and not self._simulation:
-            tooltip = (
-                f"{text}\nREMOTE远程控制已启用：除LOCAL键外，仪表面板按键不可用。"
-                "若需用面板改挡，请先断开软件连接；采集中不要按LOCAL。"
-            )
+            tooltip = self._control_mode_tooltip()
         self.connection_badge.setToolTip(tooltip)
         self.connection_badge.setProperty(
             "state", "mock" if self._simulation else "connected" if connected else "disconnected"
@@ -1626,6 +1649,52 @@ class MainWindow(QMainWindow):
             self._instrument_mode_known = False
         self._update_readout_context()
         self._update_controls()
+
+    def _control_mode_tooltip(self) -> str:
+        if self._control_mode == "local":
+            return (
+                "LOCAL：仪表面板获得控制权。软件不发送设置、诊断、ZERO或测量命令，串口连接保留；"
+                "面板操作完成后可切回Computer。"
+            )
+        return (
+            "COMPUTER：软件通过SCPI控制仪表，除LOCAL键外，面板按键不可用。"
+            "仪表的RS-232接口协议仍须单独设为COMPUTER；采集中请勿按LOCAL。"
+        )
+
+    @Slot(str)
+    def _on_control_mode_changed(self, mode: str) -> None:
+        self._control_mode = mode if mode in {"computer", "local", "disconnected"} else "disconnected"
+        self._set_combo_data(self.control_mode_combo, self._control_mode)
+        if self._connected and not self._simulation:
+            suffix = "LOCAL" if self._control_mode == "local" else "COMPUTER · REMOTE"
+            self.connection_badge.setText(f"已连接 · 8845A / {suffix}")
+            self.connection_badge.setToolTip(self._control_mode_tooltip())
+        self._update_controls()
+
+    @Slot(bool, str)
+    def _on_control_mode_result(self, success: bool, message: str) -> None:
+        self._control_mode_switch_pending = False
+        self._set_combo_data(self.control_mode_combo, self._control_mode)
+        self.statusBar().showMessage(message, 12000 if success else 20000)
+        self._update_controls()
+
+    def _request_control_mode_change(self) -> None:
+        if not self._connected or self._simulation:
+            self.statusBar().showMessage("请先连接真实的 Fluke 8845A。", 8000)
+            return
+        if self._acquiring:
+            self.statusBar().showMessage("请先停止采集，再切换控制方式。", 8000)
+            self._set_combo_data(self.control_mode_combo, self._control_mode)
+            return
+        requested = str(self.control_mode_combo.currentData() or "")
+        if requested not in {"computer", "local"}:
+            self._set_combo_data(self.control_mode_combo, self._control_mode)
+            return
+        if requested == self._control_mode:
+            return
+        self._control_mode_switch_pending = True
+        self._update_controls()
+        self._bridge.set_control_mode.emit(requested)
 
     @Slot(object)
     def _on_configuration(self, details: dict) -> None:
@@ -2152,36 +2221,43 @@ class MainWindow(QMainWindow):
 
     def _update_controls(self) -> None:
         idle = not self._acquiring
-        self.mode_combo.setEnabled(idle)
+        computer_control = not self._connected or self._simulation or self._control_mode == "computer"
+        self.mode_combo.setEnabled(idle and computer_control)
         spec = descriptor(self._current_mode)
         autorange_allowed = (
             self._simulation or spec.quantity != "current"
             or current_autorange_block_reason(self._current_mode, self._firmware, self._terminals) is None
         )
-        self.autorange_check.setEnabled(idle and autorange_allowed)
-        self.range_combo.setEnabled(idle and not self.autorange_check.isChecked())
+        self.autorange_check.setEnabled(idle and computer_control and autorange_allowed)
+        self.range_combo.setEnabled(idle and computer_control and not self.autorange_check.isChecked())
         # Measurement speed remains editable while acquiring; the Apply Speed
         # action serializes the instrument update in the worker thread.
-        self.nplc_combo.setEnabled(bool(spec.nplc_values) and (idle or self._connected))
-        self.bandwidth_combo.setEnabled(bool(spec.ac_bandwidths_hz) and (idle or self._connected))
-        self.analog_filter_check.setEnabled(idle and spec.analog_filter)
-        self.autozero_check.setEnabled(idle)
+        self.nplc_combo.setEnabled(computer_control and bool(spec.nplc_values) and (idle or self._connected))
+        self.bandwidth_combo.setEnabled(computer_control and bool(spec.ac_bandwidths_hz) and (idle or self._connected))
+        self.analog_filter_check.setEnabled(idle and computer_control and spec.analog_filter)
+        self.autozero_check.setEnabled(idle and computer_control)
         # Interval remains editable during acquisition and is applied by the worker immediately.
         self.interval_spin.setEnabled(True)
-        self.apply_button.setEnabled(idle and self._connected)
-        self.initialize_parameters_button.setEnabled(idle)
+        self.apply_button.setEnabled(idle and self._connected and computer_control)
+        self.initialize_parameters_button.setEnabled(idle and computer_control)
         self.apply_speed_button.setEnabled(
-            self._acquiring and self._connected and not self._speed_update_pending
+            self._acquiring and self._connected and computer_control and not self._speed_update_pending
             and bool(spec.nplc_values or spec.ac_bandwidths_hz)
         )
-        self.zero_button.setEnabled(idle and self._connected)
-        self.start_button.setEnabled(idle and self._connected)
-        self.single_button.setEnabled(idle and self._connected)
+        self.zero_button.setEnabled(idle and self._connected and computer_control)
+        self.start_button.setEnabled(idle and self._connected and computer_control)
+        self.single_button.setEnabled(idle and self._connected and computer_control)
         self.pause_button.setEnabled(self._acquiring)
         self.pause_button.setText("继续" if self._paused else "暂停")
         self.stop_button.setEnabled(self._acquiring)
         self.disconnect_button.setEnabled(self._connected and idle)
         self.connect_button.setEnabled(not self._connected)
+        self.control_mode_combo.setEnabled(
+            self._connected and not self._simulation and idle and not self._control_mode_switch_pending
+        )
+        self.set_control_mode_button.setEnabled(
+            self._connected and not self._simulation and idle and not self._control_mode_switch_pending
+        )
 
     @Slot()
     def _on_sample_ready(self) -> None:

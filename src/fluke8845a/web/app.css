@@ -129,6 +129,9 @@ input::placeholder { color: #99a39d; }
 .connection-detail { min-height: 19px; margin-top: 8px; display: flex; align-items: center; gap: 7px; color: #75817c; font-size: 9px; }
 .connection-led { width: 6px; height: 6px; border-radius: 50%; background: #9ba69f; }
 .connection-detail.is-connected .connection-led { background: #35966b; }
+.control-mode-row { margin-top: 7px; display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 7px; color: #536166; font-size: 10px; font-weight: 650; }
+.control-mode-row select { min-width: 0; height: 31px; padding: 0 8px; border: 1px solid #d5dbd2; border-radius: 5px; color: #334247; background: #fbfbf7; font-size: 10px; }
+.control-mode-row select:disabled { color: #909a93; background: #f0f1eb; }
 .rule { height: 1px; margin: 12px 0; background: #dfe2da; }
 .tiny-status { color: #89948d; font-size: 9px; }
 .tiny-status.is-active { color: #167b80; font-weight: 650; }
@@ -235,6 +238,8 @@ input::placeholder { color: #99a39d; }
   .settings-scroll { padding: 10px; }
   .panel, .analysis-panel { padding: 11px; }
   .serial-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .control-mode-row { grid-template-columns: minmax(0,1fr) auto; }
+  .control-mode-row label { grid-column: 1 / -1; }
   .mode-options { grid-template-columns: 1fr; }
   .stats-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .analysis-heading { align-items: flex-start; flex-direction: column; }

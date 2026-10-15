@@ -14,6 +14,7 @@ from fluke8845a.modes import Mode
 from fluke8845a.scpi import FlowControl
 from fluke8845a.webapp import create_server
 from fluke8845a.webservice import WebRuntime, mode_settings_from_payload, serial_settings_from_payload
+from tests.fakes import FakeTransport
 
 
 @pytest.fixture
@@ -143,11 +144,16 @@ def test_localhost_mock_api_enforces_origin_and_records_one_shot(tmp_path, local
 
     status, headers, page = _main_thread_wait(app, lambda: _http(base_url + "/"))
     assert status == 200
+    page_text = page.decode("utf-8")
     assert b"Fluke 8845A" in page
     assert headers["Content-Security-Policy"]
     assert b'id="settingsDialog"' in page
     assert b'id="openSettings"' in page
     assert b'id="autoScale"' in page
+    assert b'id="controlMode"' in page
+    assert b'id="applyControlMode"' in page
+    assert "不是校准调整或去皮" in page_text
+    assert "仪表RS-232协议仍须设为COMPUTER" in page_text
     assert b'id="plot"' in page
     assert b'class="control-rail"' not in page
     main_view = page.split(b"<dialog", 1)[0]
@@ -158,8 +164,11 @@ def test_localhost_mock_api_enforces_origin_and_records_one_shot(tmp_path, local
     assert b".settings-dialog" in stylesheet
     status, _headers, script = _main_thread_wait(app, lambda: _http(base_url + "/app.js"))
     assert status == 200
+    script_text = script.decode("utf-8")
     assert b"event.altKey" in script and b"event.ctrlKey" in script and b"event.shiftKey" in script
     assert b"app.yView = zoomRange" in script
+    assert "自动测量内部零点并补偿偏移" in script_text
+    assert "const settingsDisabled = acquiring || !computerControl;" in script_text
 
     status, _headers, metadata = _main_thread_wait(app, lambda: _http(base_url + "/api/meta"))
     assert status == 200
@@ -247,3 +256,53 @@ def test_localhost_mock_api_enforces_origin_and_records_one_shot(tmp_path, local
     assert (run_path / "events.csv").read_text(encoding="utf-8-sig").count("负载切换") == 1
     assert (run_path / "config.json").is_file()
     assert runtime.worker.instrument is not None
+
+
+def test_web_real_meter_can_switch_local_and_computer_and_refresh_front_panel_state(
+    local_service, monkeypatch,
+):
+    app, runtime, server = local_service
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    transport = FakeTransport()
+    from fluke8845a import worker as worker_module
+    from fluke8845a.scpi import Serial8845A
+
+    real_instrument_type = Serial8845A
+    monkeypatch.setattr(
+        worker_module,
+        "Serial8845A",
+        lambda port, settings, callback: real_instrument_type(
+            port, settings, callback, transport_factory=lambda *_: transport
+        ),
+    )
+
+    status, _headers, body = _api_command(app, base_url, "connect_real", {
+        "port": "COM3", "serial": {"eol": "CRLF"},
+        "settings": {"mode": "DCV", "autorange": True, "nplc": 1},
+    })
+    assert status == 200, body
+    assert _read_state(app, base_url)["control_mode"] == "computer"
+
+    status, _headers, body = _api_command(app, base_url, "control_mode", {"mode": "local"})
+    assert status == 200, body
+    state = _read_state(app, base_url)
+    assert state["connected"] is True
+    assert state["control_mode"] == "local"
+    assert "已停用" in state["status"] and "暂停" not in state["status"]
+
+    status, _headers, body = _api_command(app, base_url, "configure", {
+        "safety_confirmed": True,
+        "settings": {"mode": "DCI", "autorange": True, "nplc": 1},
+    })
+    assert status == 400
+    assert "LOCAL" in json.loads(body)["message"]
+
+    transport.function = "CURR:DC"
+    status, _headers, body = _api_command(app, base_url, "control_mode", {"mode": "computer"})
+    assert status == 200, body
+    state = _read_state(app, base_url)
+    assert state["control_mode"] == "computer"
+    assert state["configuration"]["function"] == "CURR:DC"
+
+    status, _headers, body = _api_command(app, base_url, "disconnect")
+    assert status == 200, body

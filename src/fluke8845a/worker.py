@@ -31,6 +31,8 @@ MAX_PENDING_GUI_SCPI_LOG_LINES = 5_000
 
 class MeasurementWorker(QObject):
     connected_changed = Signal(bool, str)
+    control_mode_changed = Signal(str)
+    control_mode_result = Signal(bool, str)
     status_changed = Signal(str)
     log_line = Signal(str)
     scpi_logs_ready = Signal()
@@ -49,6 +51,7 @@ class MeasurementWorker(QObject):
         self.instrument: Serial8845A | Mock8845A | None = None
         self.info = None
         self.simulation = False
+        self.control_mode = "disconnected"
         self.current_mode: Mode | None = None
         self._settings_by_mode: dict[Mode, ModeSettings] = {}
         self._machine = AcquisitionStateMachine()
@@ -77,7 +80,15 @@ class MeasurementWorker(QObject):
     def _ready_status(self) -> str:
         if self.simulation:
             return "就绪（MOCK模拟）"
+        if self.control_mode == "local":
+            return "LOCAL 本地操作（前面板可用；软件测量、配置和ZERO已停用）"
         return "就绪（REMOTE远程控制；除LOCAL外面板按键已禁用）"
+
+    def _require_computer_control(self) -> bool:
+        if self.control_mode == "computer" or self.simulation:
+            return True
+        self.error.emit("仪表当前为LOCAL本地操作。请先切换到Computer软件控制，再执行此操作。")
+        return False
 
     @property
     def state(self) -> AcquisitionState:
@@ -140,6 +151,7 @@ class MeasurementWorker(QObject):
             self.instrument = Mock8845A(scenario, self._write_log) if use_mock else Serial8845A(port, serial_settings, self._write_log)
             self.info = self.instrument.connect()
             self.simulation = use_mock
+            self.control_mode = "computer"
             if use_mock:
                 self.current_mode = mode_settings.mode
                 self._settings_by_mode[mode_settings.mode] = mode_settings
@@ -163,6 +175,7 @@ class MeasurementWorker(QObject):
             if active_settings is not None:
                 self._emit_active_settings(active_settings)
             self.connected_changed.emit(True, f"{'模拟' if use_mock else '已连接'} · {self.info.idn_raw}")
+            self.control_mode_changed.emit(self.control_mode)
             self.status_changed.emit(self._ready_status())
         except Exception as exc:
             self.log_line.emit(f"! 连接失败：{exc}")
@@ -173,8 +186,83 @@ class MeasurementWorker(QObject):
                     pass
             self.instrument = None
             self.info = None
+            self.control_mode = "disconnected"
+            self.control_mode_changed.emit(self.control_mode)
             self.connected_changed.emit(False, "未连接")
             self.error.emit(str(exc))
+
+    @Slot(str)
+    def set_control_mode(self, requested: str) -> None:
+        mode = str(requested).strip().casefold()
+        if mode not in {"computer", "local"}:
+            self.control_mode_result.emit(False, "控制方式只能选择 Computer 或 Local")
+            return
+        if self.state != AcquisitionState.STOPPED:
+            self.control_mode_result.emit(False, "请先停止采集，再切换仪器控制方式")
+            self.error.emit("请先停止采集，再切换仪器控制方式")
+            return
+        if self.instrument is None or not self.instrument.connected:
+            self.control_mode_result.emit(False, "请先连接8845A，再切换仪器控制方式")
+            self.error.emit("请先连接8845A，再切换仪器控制方式")
+            return
+        if self.simulation:
+            self.control_mode_result.emit(False, "MOCK模拟器没有仪器面板控制方式")
+            self.error.emit("MOCK模拟器没有仪器面板控制方式")
+            return
+        if mode == self.control_mode:
+            self.control_mode_result.emit(True, f"仪器已处于{'Computer' if mode == 'computer' else 'Local'}模式")
+            return
+
+        try:
+            refreshed_info = self.instrument.set_control_mode(mode)
+            if refreshed_info is not None:
+                self.info = refreshed_info
+            self.control_mode = mode
+            if mode == "local":
+                self.current_mode = None
+                self._settings_by_mode.clear()
+                self.configuration_ready.emit({
+                    "idn": self.info.idn_raw, "function": "", "input_terminals": "",
+                    "simulation": False,
+                })
+                message = "已发送SYST:LOC；仪表交由前面板操作，软件测量与配置已暂停"
+            else:
+                state = self.instrument.read_mode_state()
+                self.current_mode = mode_from_scpi_function(state["function"])
+                self._settings_by_mode.clear()
+                active_settings = None
+                if self.current_mode is not None:
+                    try:
+                        active_settings = self.instrument.read_settings(self.current_mode)
+                    except ScpiTimeout:
+                        raise
+                    except Exception as exc:
+                        self.log_line.emit(f"! 切回Computer后读取当前参数失败：{exc}")
+                self.configuration_ready.emit({
+                    "idn": self.info.idn_raw, **state, "simulation": False,
+                })
+                if active_settings is not None:
+                    self._emit_active_settings(active_settings)
+                message = "已切回Computer软件控制，并重新读取仪表当前状态"
+            self.control_mode_changed.emit(self.control_mode)
+            self.status_changed.emit(self._ready_status())
+            self.log_line.emit(message)
+            self.control_mode_result.emit(True, message)
+        except Exception as exc:
+            self.log_line.emit(f"! 切换仪器控制方式失败：{exc}")
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
+            else:
+                try:
+                    self.instrument.close(restore_local=True)
+                except Exception as close_exc:
+                    self.log_line.emit(f"! 切换失败后释放仪器控制权失败：{close_exc}")
+                self.instrument = None
+                self.control_mode = "disconnected"
+                self.control_mode_changed.emit(self.control_mode)
+                self.connected_changed.emit(False, "控制方式切换失败，连接已关闭")
+            self.error.emit(f"切换仪器控制方式失败：{exc}")
+            self.control_mode_result.emit(False, str(exc))
 
     @Slot(object)
     def configure_mode(self, settings: ModeSettings) -> None:
@@ -183,6 +271,8 @@ class MeasurementWorker(QObject):
             return
         if self.instrument is None or not self.instrument.connected:
             self.error.emit("请先连接8845A或启用MOCK模式")
+            return
+        if not self._require_computer_control():
             return
         try:
             actual = self.instrument.configure(settings)
@@ -206,6 +296,8 @@ class MeasurementWorker(QObject):
         if self.instrument is None or not self.instrument.connected:
             self.error.emit("仪器尚未连接")
             return
+        if not self._require_computer_control():
+            return
         try:
             mode_settings.validate()
             if interval_s is not None and interval_s < 0:
@@ -225,6 +317,7 @@ class MeasurementWorker(QObject):
             info = self.info
             metadata = {
                 "simulation": self.simulation,
+                "control_mode": self.control_mode,
                 "device": {"manufacturer": info.manufacturer, "model": info.model,
                            "serial_number": info.serial_number, "firmware": info.firmware,
                            "idn_raw": info.idn_raw},
@@ -318,6 +411,9 @@ class MeasurementWorker(QObject):
             return
         if self._recorder is None or self.instrument is None or not self.instrument.connected:
             self.measurement_speed_result.emit(False, "实验记录或仪器连接不可用，无法调整速度")
+            return
+        if not self._require_computer_control():
+            self.measurement_speed_result.emit(False, "请先切换到Computer软件控制，再调整测量速度")
             return
         try:
             requested.validate()
@@ -465,6 +561,8 @@ class MeasurementWorker(QObject):
                     self.instrument.close(restore_local=False)
                 except Exception:
                     log.exception("could not close the LOCAL-mode serial session")
+                self.control_mode = "disconnected"
+                self.control_mode_changed.emit(self.control_mode)
                 self._finish_experiment("instrument_local")
                 self.status_changed.emit("仪器已切回LOCAL；采集已停止，请重新连接恢复远程控制")
                 return
@@ -512,6 +610,8 @@ class MeasurementWorker(QObject):
                 instrument.close()
             except Exception as exc:
                 self.log_line.emit(f"! 超时后关闭串口失败：{exc}")
+        self.control_mode = "disconnected"
+        self.control_mode_changed.emit(self.control_mode)
         self.connected_changed.emit(False, "SCPI响应超时，连接已关闭")
         self.status_changed.emit("SCPI响应超时，串口连接已关闭；请重新连接")
 
@@ -588,6 +688,8 @@ class MeasurementWorker(QObject):
         if self.instrument is None or not self.instrument.connected:
             self.error.emit("仪器未连接")
             return
+        if not self._require_computer_control():
+            return
         try:
             self.instrument.zero()
             self.status_changed.emit("仪器ZERO已执行")
@@ -600,6 +702,8 @@ class MeasurementWorker(QObject):
     def diagnose(self) -> None:
         if self.instrument is None or not self.instrument.connected:
             self.error.emit("仪器未连接")
+            return
+        if not self._require_computer_control():
             return
         try:
             result = self.instrument.diagnose()
@@ -650,6 +754,8 @@ class MeasurementWorker(QObject):
             except Exception as exc:
                 self.log_line.emit(f"! 关闭仪器失败：{exc}")
             self.instrument = None
+        self.control_mode = "disconnected"
+        self.control_mode_changed.emit(self.control_mode)
         self.connected_changed.emit(False, "已安全退出")
 
     @Slot()

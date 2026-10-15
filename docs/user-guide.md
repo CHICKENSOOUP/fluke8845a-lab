@@ -10,12 +10,12 @@
 
 v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [README](../README.md) 的步骤安装并启动软件。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
 
-- **真实仪器**：将仪器后面板设为 RS-232 远程接口，并选择 8845A/8846A 指令集的 COMPUTER 模式。连接时本程序查询 `*IDN?`，只接受设备型号字段为 `8845A` 的 Fluke 仪器；不会重置仪器。
+- **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时本程序查询 `*IDN?`，只接受设备型号字段为 `8845A` 的 Fluke 仪器；不会重置仪器。
 - **MOCK**：勾选模拟模式后点击“启动MOCK模拟仪器”。状态栏和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
 
 程序启动时扫描串口，也可在端口框直接输入 COM 号。默认值为 9600 baud、8 data bits、无校验、1 stop bit、无流控、CRLF 结束符、2秒普通命令响应超时。`READ?`会根据当前积分时间或交流滤波设置自动使用更长的主机等待上限；这只是避免过早超时的通信保护，不代表仪器的采样时间保证。手册中 RS-232 出厂参数包含 9600、8位、无校验、1停止位和无流控；EOL需按仪器面板设置。可配置选项包括手册列出的全部波特率、7/8数据位、无/奇/偶校验、1/2停止位、无/XON-XOFF/RTS-CTS流控以及CR/LF/CRLF结束符。若`READ?`仍超时，程序保存一条无数值的超时记录后停止采集并关闭串口；必须重新连接后才能开始下一次采集，避免迟到响应被误认为后续样本。
 
-首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。确认仪器在 COMPUTER 模式及 SCPI 指令集。仪表处于 `REMOTE` 远程控制时，除 `LOCAL` 键外，其他前面板按键会被禁用。若需用面板改挡，先按 `LOCAL`，确认仪表显示本地状态后再按所需功能键；确认模式后重新连接，软件会再次进入远程控制。仪表显示`LOCAL`时，前面板键盘获得控制权，远程SCPI操作会被仪器拒绝；采集期间不要按仪表的LOCAL键。若仪器返回`+550,"Command not allowed in local"`，软件会将其记为`instrument_local`异常行，保留原始响应、不写入测量数值、停止本次采集，并关闭串口会话；重新连接即可恢复远程控制。连接后可在“仪器 → SCPI诊断”检查型号、模式、输入端子及仪器错误队列。断线会记录为失败状态并停止本次实验；检查接线后点击连接即可重连。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
+首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。仪表菜单中的 RS-232 `COMPUTER` 协议模式与软件里的 `COMPUTER/LOCAL` 控制权是两项设置：协议模式须在仪表菜单选择；控制权可在仪器设置区切换。`COMPUTER` 使用 `SYST:REM`，除仪表的 `LOCAL` 键外，其他面板按键会被禁用。选择 `LOCAL` 会发送 `SYST:LOC`，将控制权交给面板；软件停用测量、设置、诊断和ZERO，串口保持连接。面板操作完成后，在软件选择 `COMPUTER` 即可切回远程控制；软件会重新读取当前测量模式和参数。采集中不能切换控制权。若直接按仪表 `LOCAL` 导致 `+550,"Command not allowed in local"`，软件会保存异常行且不伪造读数，停止采集并关闭串口；重新连接可恢复远程控制。连接后可在“仪器 → SCPI诊断”检查型号、模式、输入端子及仪器错误队列。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
 
 ## 2. 测量模式与安全接线
 
@@ -47,7 +47,7 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 可打开自动量程，或取消勾选后选择固定量程。电流模式在当前端子确认为前面板时可开放自动量程；已知固件低于400 mA要求时会拒绝自动量程。后端子下1 A、3 A和10 A固定量程仍不可用。按“应用仪器参数”后，软件写入SCPI命令并读取量程、功能、带宽、端子等可用状态；仪器错误队列非零或功能回读不匹配时不会启动实验。模拟滤波器只出现在DCV/DCI/电阻模式；NPLC只出现在这些直流积分模式。AC滤波档的3/20/200 Hz分别是慢/中/快三档截止频率选择，不是采样频率。
 
-**零点校正与校准、去皮不同。**“自动零点校正”让仪表按自动零点流程测量内部零点并补偿偏移，有助于稳定读数，但额外测量会降低读数速度；它不会把被测输入强制显示为0。“执行 ZERO 校正”发送 `ZERO:AUTO ONCE`，按 Fluke 编程手册的定义立即启动一次零点测量。此操作不是校准调整，也不是对当前被测物去皮。只能在停止采集后执行；若启用模拟滤波，量程、NPLC和触发条件须与 ZERO 测量要求匹配。
+**零点校正与校准、去皮不同。**将鼠标悬停在“自动零点校正”或“执行 ZERO 校正”上，可查看各自说明。“自动零点校正”让仪表按自动零点流程测量内部零点并补偿偏移，有助于稳定读数，但额外测量会降低读数速度；它不会把被测输入强制显示为0。“执行 ZERO 校正”发送 `ZERO:AUTO ONCE`，按 Fluke 编程手册的定义立即启动一次零点测量。此操作不是校准调整，也不是对当前被测物去皮。只能在停止采集后执行；若启用模拟滤波，量程、NPLC和触发条件须与 ZERO 测量要求匹配。
 
 **仪器测量速度和软件采样间隔是两项独立设置。** 直流电压/电流及电阻模式通过NPLC控制积分时间：0.02 NPLC通常转换较快，100 NPLC积分时间较长、通常更有利于抑制工频噪声；交流电压/电流模式使用3/20/200 Hz带宽档，200 Hz档响应较快。速度参数会按模式保存。停止采集时点击“应用仪器参数”写入仪器，开始实验时也会自动写入；连续采集或暂停时可修改NPLC/交流带宽，再点“应用采集速度”。仪表回读确认后从下一读数起生效，修改时间及生效样本写入配置和事件文件，CSV每行记录当时生效的NPLC/带宽。采集中的实时调速仅会改NPLC或交流带宽，不改变测量模式、量程、滤波或零点校正。软件目标采样间隔可单独设定，并能在连续采集中即时修改；实际Hz由有效读数时间戳计算。最低NPLC或最快带宽不保证某个固定Hz，实际速度还受量程、自动零点、滤波、仪器转换及串口通信影响。
 
@@ -112,9 +112,9 @@ Version 1.0.0 is a source release and does not include a prebuilt Windows execut
 
 ### 1. Connection and modes
 
-For a real meter, set the rear interface to RS-232 and select COMPUTER mode with the 8845A/8846A command set. The application queries `*IDN?`, accepts only a Fluke model identified as `8845A`, and does not reset the instrument. Mock mode exercises simulated workflows; its readings are not instrument measurements and must not be used as calibration or experimental evidence.
+For a real meter, set the rear interface to RS-232 and select the COMPUTER protocol with the 8845A/8846A command set. The application connects using COMPUTER/REMOTE control by default; its instrument settings panel can switch between this state and LOCAL front-panel control. It queries `*IDN?`, accepts only a Fluke model identified as `8845A`, and does not reset the instrument. Mock mode exercises simulated workflows; its readings are not instrument measurements and must not be used as calibration or experimental evidence.
 
-The application scans serial ports at startup and also accepts a manually entered COM port. Defaults are 9600 baud, 8 data bits, no parity, one stop bit, no flow control, CRLF termination, and a two-second response timeout. Confirm the instrument's settings. In REMOTE mode, the front-panel keys are disabled except for LOCAL. To change a mode from the panel, press LOCAL, verify local control, select the function, confirm the display, and reconnect when ready. A normal disconnect attempts `SYST:LOC`.
+The application scans serial ports at startup and also accepts a manually entered COM port. Defaults are 9600 baud, 8 data bits, no parity, one stop bit, no flow control, CRLF termination, and a two-second response timeout. Confirm the instrument's settings. The instrument menu's RS-232 COMPUTER protocol and the application's COMPUTER/LOCAL control state are separate settings. COMPUTER control disables front-panel keys except LOCAL. The application can send `SYST:LOC` to hand control to the panel; measurement and settings commands are paused while LOCAL. Switching back to COMPUTER sends `SYST:REM` and refreshes the active function and settings. A normal disconnect attempts `SYST:LOC`.
 
 ### 2. Measurement modes and safe wiring
 

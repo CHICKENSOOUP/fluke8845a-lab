@@ -33,6 +33,20 @@ def test_idn_parser_keeps_firmware_and_model():
     assert info.firmware == "2.0"
 
 
+def test_control_mode_switches_use_only_documented_remote_and_local_commands():
+    transport = FakeTransport()
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    transport.commands.clear()
+
+    assert instrument.set_control_mode("local") is None
+    assert transport.commands == ["SYST:LOC"]
+    info = instrument.set_control_mode("computer")
+    assert info is not None and info.model == "8845A"
+    assert transport.commands == ["SYST:LOC", "SYST:REM", "*IDN?"]
+    instrument.close()
+
+
 @pytest.mark.parametrize(
     ("function", "expected"),
     [

@@ -240,6 +240,44 @@ def test_real_connection_reads_current_mode_without_reconfiguring_instrument(mon
     assert "SYST:LOC" in transport.commands
 
 
+def test_local_computer_switch_blocks_writes_and_refreshes_front_panel_changes(monkeypatch):
+    import fluke8845a.worker as worker_module
+
+    transport = FakeTransport()
+    real_instrument_type = Serial8845A
+    monkeypatch.setattr(
+        worker_module,
+        "Serial8845A",
+        lambda port, settings, callback: real_instrument_type(
+            port, settings, callback, transport_factory=lambda *_: transport
+        ),
+    )
+    worker = MeasurementWorker()
+    errors = []
+    statuses = []
+    worker.error.connect(errors.append)
+    worker.status_changed.connect(statuses.append)
+    worker.connect_real("COM3", SerialSettings(), ModeSettings(Mode.DCV))
+
+    worker.set_control_mode("local")
+    assert worker.control_mode == "local"
+    assert "LOCAL" in statuses[-1] and "已停用" in statuses[-1]
+    assert "暂停" not in statuses[-1]
+    assert transport.commands[-1] == "SYST:LOC"
+    before = list(transport.commands)
+    worker.configure_mode(ModeSettings(Mode.DCI))
+    assert transport.commands == before
+    assert "LOCAL" in errors[-1]
+
+    transport.function = "CURR:DC"
+    worker.set_control_mode("computer")
+    assert worker.control_mode == "computer"
+    assert worker.current_mode is Mode.DCI
+    assert "SYST:REM" in transport.commands
+    assert "SENS:FUNC?" in transport.commands
+    worker.shutdown()
+
+
 def test_front_panel_local_rejection_stops_without_fake_reading(tmp_path, monkeypatch):
     import fluke8845a.worker as worker_module
 

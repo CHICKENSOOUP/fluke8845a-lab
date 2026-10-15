@@ -485,6 +485,30 @@ class Serial8845A:
             self._client.close()
             raise
 
+    def set_control_mode(self, mode: str) -> InstrumentInfo | None:
+        """Switch between front-panel LOCAL and SCPI REMOTE control.
+
+        Returning to REMOTE verifies the command channel again and refreshes
+        the identity; LOCAL is write-only because SCPI queries are unavailable
+        while the front panel owns control.
+        """
+        if not self.connected:
+            raise InstrumentError("仪器未连接")
+        normalized = str(mode).strip().casefold()
+        if normalized == "local":
+            self._client.write("SYST:LOC")
+            self._mode = None
+            self._active_settings = None
+            return None
+        if normalized != "computer":
+            raise ValueError("控制方式必须为 Local 或 Computer")
+        self._client.write("SYST:REM")
+        info = parse_idn(self._client.query("*IDN?"))
+        if "FLUKE" not in info.manufacturer.upper() or info.model != "8845A":
+            raise InstrumentIdentityError(f"需要Fluke 8845A，当前识别为：{info.idn_raw}")
+        self.info = info
+        return info
+
     def close(self, *, restore_local: bool = True) -> None:
         try:
             if self._client.is_open and restore_local:

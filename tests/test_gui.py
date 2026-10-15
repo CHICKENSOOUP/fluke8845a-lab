@@ -77,7 +77,13 @@ def test_real_connection_displays_remote_front_panel_lock(qt_app, monkeypatch, t
         window._on_connected(True, "已连接 · FLUKE,8845A,TEST,2.0")
         assert "REMOTE" in window.connection_badge.text()
         assert "除LOCAL键外" in window.connection_badge.toolTip()
-        assert "先断开软件连接" in window.connection_badge.toolTip()
+        assert "RS-232接口协议" in window.control_mode_combo.toolTip()
+        assert window.control_mode_combo.itemData(window.control_mode_combo.findText("Local · 面板操作")) == "local"
+        window._on_control_mode_changed("local")
+        assert "LOCAL" in window.connection_badge.text()
+        assert not window.start_button.isEnabled()
+        window._on_control_mode_changed("computer")
+        assert "REMOTE" in window.connection_badge.text()
 
         window._on_status("就绪（REMOTE远程控制；除LOCAL外面板按键已禁用）")
         assert "REMOTE" in window.statusBar().currentMessage()
@@ -621,9 +627,43 @@ def test_zero_controls_explain_one_shot_and_automatic_zero(qt_app, monkeypatch, 
     window = MainWindow()
     try:
         assert "不会把被测输入的读数强制改成 0" in window.autozero_check.toolTip()
+        assert "不会把被测输入的读数强制改成 0" in window.autozero_label.toolTip()
         assert "ZERO:AUTO ONCE" in window.zero_button.toolTip()
         assert "不会把当前显示值清零" in window.zero_button.toolTip()
-        assert "不是校准调整" in window.zero_explanation.text()
+        assert "不是校准调整" in window.zero_button.toolTip()
+        assert not hasattr(window, "zero_explanation")
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_control_mode_has_hover_help_and_local_disables_instrument_controls(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        assert "Computer" in window.control_mode_combo.toolTip()
+        assert "Local" in window.control_mode_combo.toolTip()
+        assert "RS-232" in window.control_mode_combo.toolTip()
+        assert "RS-232" in window.control_mode_label.toolTip()
+
+        window._connected = True
+        window._control_mode = "local"
+        window._update_controls()
+        assert window.control_mode_combo.isEnabled()
+        assert window.set_control_mode_button.isEnabled()
+        for widget in (
+            window.mode_combo, window.apply_button, window.initialize_parameters_button,
+            window.zero_button, window.start_button, window.single_button,
+        ):
+            assert not widget.isEnabled()
+
+        window._control_mode = "computer"
+        window._update_controls()
+        assert window.mode_combo.isEnabled()
+        assert window.apply_button.isEnabled()
+        assert window.zero_button.isEnabled()
     finally:
         window.close()
         qt_app.processEvents()

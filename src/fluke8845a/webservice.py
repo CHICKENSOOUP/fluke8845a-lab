@@ -124,6 +124,7 @@ class WebStateStore:
         self._state: dict = {
             "connected": False,
             "simulation": False,
+            "control_mode": "disconnected",
             "connection_text": "未连接",
             "status": "未连接",
             "device": {},
@@ -270,6 +271,7 @@ class WebCommandRouter(QObject):
         self.worker = worker
         self.store = store
         worker.connected_changed.connect(self._on_connected)
+        worker.control_mode_changed.connect(self._on_control_mode)
         worker.status_changed.connect(self._on_status)
         worker.log_line.connect(self._on_log)
         worker.configuration_ready.connect(self._on_configuration)
@@ -287,8 +289,13 @@ class WebCommandRouter(QObject):
             connected=bool(connected),
             connection_text=str(message),
             simulation=bool(self.worker.simulation) if connected else False,
+            control_mode=str(self.worker.control_mode),
             device={"idn": self.worker.info.idn_raw} if connected and self.worker.info else {},
         )
+
+    @Slot(str)
+    def _on_control_mode(self, mode: str) -> None:
+        self.store.update(control_mode=str(mode))
 
     @Slot(str)
     def _on_status(self, status: str) -> None:
@@ -382,6 +389,20 @@ class WebCommandRouter(QObject):
                 raise ValueError("请先停止采集，再断开仪器")
             worker.shutdown()
             return {"success": True, "message": "仪器连接已安全关闭"}
+
+        if action == "control_mode":
+            mode = str(payload.get("mode", "")).strip().casefold()
+            if mode not in {"computer", "local"}:
+                raise ValueError("控制方式只能选择 Computer 或 Local")
+            if worker.simulation:
+                raise ValueError("MOCK模拟器没有仪器面板控制方式")
+            if worker.state != AcquisitionState.STOPPED:
+                raise ValueError("请先停止采集，再切换仪器控制方式")
+            worker.set_control_mode(mode)
+            error = check_worker_error("切换仪器控制方式失败")
+            if error:
+                return error
+            return {"success": True, "message": self.store.snapshot()["status"]}
 
         if action == "shutdown":
             worker.shutdown()

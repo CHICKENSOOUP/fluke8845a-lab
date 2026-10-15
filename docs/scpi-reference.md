@@ -21,7 +21,7 @@
 
 ## 实际写入命令
 
-连接：`*IDN?` 识别后写 `SYST:REM`；收到/检查仪器错误队列。正常断开写 `SYST:LOC`。
+连接：`*IDN?` 识别后写 `SYST:REM`；收到/检查仪器错误队列。仪器设置区允许在停止采集时切换 `SYST:LOC`（Local面板操作）与 `SYST:REM`（Computer远程操作）；切回Computer后重新回读当前模式及参数。正常断开写 `SYST:LOC`。仪表RS-232菜单的COMPUTER协议设置与软件的Local/Computer控制权分开：前者须在仪表面板设置，后者使用这两个SCPI命令。
 
 功能配置用 `CONF:VOLT:DC`、`CONF:VOLT:AC`、`CONF:CURR:DC`、`CONF:CURR:AC`、`CONF:RES`、`CONF:FRES`。设置自动量程用 `SENS:<function>:RANG:AUTO ON`；固定量程用 `...:RANG:AUTO OFF` 后写 `...:RANG <SI>`。仅DCV/DCI/RES/FRES写 `...:NPLC`；ACV/ACI写 `SENS:DET:BAND <3|20|200>`；受支持的直流模式才写 `SENS:<function>:FILT:STAT ON|OFF`。自动零点写 `ZERO:AUTO ON|OFF`。每次数据以单点 `READ?` 触发，之后读取实际 `...:RANG?` 并立即完整解析响应。
 
@@ -32,6 +32,7 @@
 ## 重要保守处理
 
 - 模式参数先按手册的离散枚举验证。仪器错误队列非零时配置失败并中止，不继续保存看似有效的读数。
+- `LOCAL`面板控制时软件不发送配置、诊断、ZERO或采集命令；采集停止后可切回`COMPUTER`，并从仪表重新读取面板操作后当前的模式和参数。
 - 400 mA的DCI/ACI分别检查资料所列固件门槛；只有仪器回报了可识别且低于门槛的版本时才禁用固定档/自动量程。部分8845A的`*IDN?`返回日期格式，无法据此读取软件版本；本机面板已确认软件版本高于2.0，因此日期格式不再触发拒绝。连接其他仪表时应先在面板核实软件版本。
 - 1/3/10 A档按规格仅在前面板端子显示可用；后端子下固定档被禁用且电流自动量程被阻止。
 - `READ?`的时间戳是PC写命令前时间，仪器转换并无逐样本硬件时间戳。读数周期与range-query耗时一并保存在`read_duration_s`。并未使用资料中有额外条件的典型高速度作为保证。
@@ -58,13 +59,14 @@ This reference maps application behavior to the Fluke 8845A documentation consul
 
 ### Commands sent by the application
 
-After `*IDN?` identification, connection sends `SYST:REM` and checks the instrument error queue. Normal disconnect sends `SYST:LOC`. Function setup uses `CONF:VOLT:DC`, `CONF:VOLT:AC`, `CONF:CURR:DC`, `CONF:CURR:AC`, `CONF:RES`, or `CONF:FRES`. Autorange uses `SENS:<function>:RANG:AUTO ON`; fixed range uses `...:RANG:AUTO OFF` followed by `...:RANG <SI>`. Only DCV, DCI, RES, and FRES use `...:NPLC`. ACV/ACI set `SENS:DET:BAND <3|20|200>`. Supported DC modes set `SENS:<function>:FILT:STAT ON|OFF`; auto-zero uses `ZERO:AUTO ON|OFF`. Each point uses `READ?`, followed by a query of the actual range and complete response parsing.
+After `*IDN?` identification, connection sends `SYST:REM` and checks the instrument error queue. When acquisition is stopped, the instrument settings panel can switch `SYST:LOC` (Local/front-panel control) and `SYST:REM` (Computer/remote control); switching back to Computer re-reads the active function and settings. Normal disconnect sends `SYST:LOC`. The meter's RS-232 COMPUTER protocol selection is separate from this Local/Computer control state and must be set on the instrument. Function setup uses `CONF:VOLT:DC`, `CONF:VOLT:AC`, `CONF:CURR:DC`, `CONF:CURR:AC`, `CONF:RES`, or `CONF:FRES`. Autorange uses `SENS:<function>:RANG:AUTO ON`; fixed range uses `...:RANG:AUTO OFF` followed by `...:RANG <SI>`. Only DCV, DCI, RES, and FRES use `...:NPLC`. ACV/ACI set `SENS:DET:BAND <3|20|200>`. Supported DC modes set `SENS:<function>:FILT:STAT ON|OFF`; auto-zero uses `ZERO:AUTO ON|OFF`. Each point uses `READ?`, followed by a query of the actual range and complete response parsing.
 
 The application does not configure capacitance, RTD temperature, source output, or synchronous dual voltage/current channels. A response identifying an 8846A, another model, or malformed identity is rejected. Tests and Mock mode do not establish real-meter accuracy.
 
 ### Conservative implementation boundaries
 
 - Parameters are validated against documented discrete values. A non-zero instrument error queue aborts configuration and acquisition.
+- In `LOCAL` panel-control mode, the application sends no configuration, diagnostic, ZERO, or acquisition commands. After panel operation, switching back to `COMPUTER` re-reads the current function and settings.
 - The 400 mA DCI/ACI ranges enforce the documented firmware threshold when the reported version is identifiable and demonstrably too old. An unparseable date-style `*IDN?` field alone does not block the range; verify firmware on the front panel when the version is not readable from SCPI.
 - 1/3/10 A ranges are exposed only when front-panel terminals are confirmed; rear-terminal operation blocks these fixed ranges and current autorange.
 - `READ?` timestamps are host timestamps taken before sending the command. The meter supplies no hardware timestamp per sample; `read_duration_s` records the read and range-query interval. Published typical maximum speeds are not treated as guarantees.
