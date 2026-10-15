@@ -270,7 +270,7 @@ def test_front_panel_local_rejection_stops_without_fake_reading(tmp_path, monkey
         assert worker.state is AcquisitionState.STOPPED
         assert connected[-1][0] is False
         assert "LOCAL" in connected[-1][1]
-        assert any("重新连接" in status for status in statuses)
+        assert any("\u8bf7\u91cd\u65b0\u8fde\u63a5" in status for status in statuses)
         directory = Path(finished[0])
         with (directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
             rows = list(csv.DictReader(stream))
@@ -283,6 +283,54 @@ def test_front_panel_local_rejection_stops_without_fake_reading(tmp_path, monkey
         assert metadata["completion_status"] == "instrument_local"
         assert worker.instrument is not None and not worker.instrument.connected
         assert "SYST:LOC" not in transport.commands
+    finally:
+        worker.shutdown()
+
+
+def test_scpi_read_timeout_is_saved_once_then_session_closes(tmp_path, monkeypatch):
+    import fluke8845a.worker as worker_module
+
+    transport = FakeTransport()
+    real_instrument_type = Serial8845A
+    monkeypatch.setattr(
+        worker_module,
+        "Serial8845A",
+        lambda port, settings, callback: real_instrument_type(
+            port, settings, callback, transport_factory=lambda *_: transport
+        ),
+    )
+    worker = MeasurementWorker()
+    finished = []
+    connected = []
+    statuses = []
+    loop = QEventLoop()
+    worker.experiment_finished.connect(lambda directory: (finished.append(directory), loop.quit()))
+    worker.connected_changed.connect(lambda connected_now, label: connected.append((connected_now, label)))
+    worker.status_changed.connect(statuses.append)
+
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_real("COM3", SerialSettings(), settings)
+    transport.timeouts.add("READ?")
+    worker.start_experiment(settings, "SCPI timeout safety", str(tmp_path), 0.01)
+    loop.exec()
+
+    try:
+        assert worker.state is AcquisitionState.STOPPED
+        assert [command for command in transport.commands if command == "READ?"] == ["READ?"]
+        assert transport.commands[-1] == "SYST:LOC"
+        assert transport.is_open is False
+        assert connected[-1][0] is False
+        assert statuses[-1].startswith("SCPI")
+        directory = Path(finished[0])
+        with (directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
+            rows = list(csv.DictReader(stream))
+        metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        assert len(rows) == 1
+        assert rows[0]["status"] == "timeout"
+        assert rows[0]["value_si"] == ""
+        assert rows[0]["raw_reading"] == "partial"
+        assert metadata["completion_status"] == "scpi_timeout"
+        assert worker.instrument is not None and not worker.instrument.connected
     finally:
         worker.shutdown()
 

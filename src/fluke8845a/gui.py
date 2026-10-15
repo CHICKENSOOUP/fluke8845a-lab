@@ -702,6 +702,7 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setDecimals(1)
         self.timeout_spin.setSuffix(" s")
         self.timeout_spin.setValue(2.0)
+        self.timeout_spin.setToolTip("普通SCPI命令的等待上限。READ?会按当前积分/滤波设置自动延长，防止慢速测量被过早判超时。")
         advanced_form.addRow("响应超时", self.timeout_spin)
         advanced.setVisible(False)
         form.addRow("", advanced)
@@ -1981,6 +1982,8 @@ class MainWindow(QMainWindow):
             display_status = "就绪"
         elif status.startswith("连续超时"):
             display_status = "连续超时"
+        elif status.startswith("SCPI"):
+            display_status = "响应超时"
         else:
             display_status = status
         self.experiment_status.setText(display_status)
@@ -2004,6 +2007,10 @@ class MainWindow(QMainWindow):
             # The recorder may be closed slightly before this status reaches the GUI.
             if status.startswith("就绪"):
                 self._experiment_active = False
+        elif status.startswith("SCPI"):
+            self._acquiring = False
+            self._paused = False
+            self._experiment_active = False
         dot_state = "paused" if self._paused else "running" if self._acquiring else "idle"
         self.status_dot.setProperty("state", dot_state)
         self.status_dot.style().unpolish(self.status_dot)

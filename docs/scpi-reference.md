@@ -35,6 +35,7 @@
 - 400 mA的DCI/ACI分别检查资料所列固件门槛；未识别固件时禁用固定档及可能跨入该档的电流自动量程。
 - 1/3/10 A档按规格仅在前面板端子显示可用；后端子下固定档被禁用且电流自动量程被阻止。
 - `READ?`的时间戳是PC写命令前时间，仪器转换并无逐样本硬件时间戳。读数周期与range-query耗时一并保存在`read_duration_s`。并未使用资料中有额外条件的典型高速度作为保证。
+- 用户设置的串口响应超时是普通SCPI命令的下限。程序按NPLC/自动零点或交流带宽为`READ?`增加主机等待时间；这是保守通信保护，不是Fluke转换时间保证。若响应不完整，软件记录一条空值超时行后停止采集并关闭串口，避免后续请求误读迟到数据。
 
 ## English
 
@@ -67,5 +68,6 @@ The application does not configure capacitance, RTD temperature, source output, 
 - The 400 mA DCI/ACI ranges check documented firmware thresholds. If firmware cannot be identified, the fixed range and potentially crossing autorange are disabled.
 - 1/3/10 A ranges are exposed only when front-panel terminals are confirmed; rear-terminal operation blocks these fixed ranges and current autorange.
 - `READ?` timestamps are host timestamps taken before sending the command. The meter supplies no hardware timestamp per sample; `read_duration_s` records the read and range-query interval. Published typical maximum speeds are not treated as guarantees.
+- The configured serial timeout is the floor for ordinary SCPI commands. The host allows a longer `READ?` response window based on NPLC/autozero or the selected AC bandwidth; this is a conservative host timeout, not a Fluke conversion-time guarantee. An incomplete `READ?` response is saved as a blank timeout attempt, then acquisition stops and the serial session closes before another query can consume a delayed response.
 - The manual shows separate mA/400 mA and 10 A jacks. `ROUT:TERM?` reports only FRONT/REAR, and range readback cannot identify the physical red jack. The operator must verify the lead and front-panel input selection.
 

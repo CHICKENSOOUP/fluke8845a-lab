@@ -14,6 +14,7 @@ class FakeTransport:
         self.is_open = False
         self.last_command = ""
         self.commands = []
+        self.read_timeouts = []
         self.error_queue = deque()
         self.timeouts = set()
         self.echo_commands = False
@@ -64,7 +65,8 @@ class FakeTransport:
         if command.startswith("CONF:") and self.inject_config_error:
             self.error_queue.append('101,"Invalid parameter"')
 
-    def read_until(self, terminator: bytes) -> bytes:
+    def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
+        self.read_timeouts.append((self.last_command, timeout_s))
         if self.last_command in self.timeouts:
             return b"partial"
         if self.echo_commands:

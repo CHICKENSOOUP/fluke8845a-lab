@@ -4,9 +4,9 @@ import pytest
 
 from fluke8845a.modes import Mode, mode_from_scpi_function, range_label
 from fluke8845a.scpi import (
-    FlowControl, InstrumentError, InstrumentIdentityError, InstrumentLocalModeError, ModeSettings, ReadingError, Rs232TerminalModeError,
+    FlowControl, InstrumentError, InstrumentIdentityError, InstrumentLocalModeError, ModeSettings, PySerialTransport, ReadingError, Rs232TerminalModeError,
     ScpiClient, ScpiProtocolError, ScpiTimeout, Serial8845A, SerialSettings,
-    UnsupportedRange, compare_firmware, parse_idn, parse_reading,
+    UnsupportedRange, compare_firmware, measurement_read_timeout_s, parse_idn, parse_reading,
 )
 from tests.fakes import FakeTransport
 
@@ -77,6 +77,28 @@ def test_serial_timeout_is_reported_and_closes_failed_connection():
     assert not transport.is_open
 
 
+def test_instrument_close_releases_transport_after_read_exception():
+    class FailingReadTransport(FakeTransport):
+        fail_read = False
+
+        def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
+            if self.fail_read and self.last_command.upper() == "READ?":
+                raise OSError("simulated serial read failure")
+            return super().read_until(terminator, timeout_s)
+
+    transport = FailingReadTransport()
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.configure(ModeSettings(Mode.DCV))
+    transport.fail_read = True
+
+    with pytest.raises(OSError, match="simulated serial read failure"):
+        instrument.read()
+    assert not instrument.connected
+    instrument.close()
+    assert not transport.is_open
+
+
 def test_serial_terminator_configuration_is_respected():
     settings = SerialSettings(eol="CRLF", flow_control=FlowControl.RTSCTS)
     transport = FakeTransport(settings=settings)
@@ -98,6 +120,51 @@ def test_default_serial_settings_match_confirmed_instrument_parameters():
 def test_serial_timeout_must_be_positive_and_finite(timeout_s):
     with pytest.raises(ValueError, match="正的有限数"):
         SerialSettings(timeout_s=timeout_s)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_pyserial_transport_restores_base_timeout_after_scoped_read(fails):
+    class StubPort:
+        is_open = True
+        timeout = 2.0
+
+        def read_until(self, _terminator):
+            assert self.timeout == 7.0
+            if fails:
+                raise OSError("simulated read failure")
+            return b"ok\r\n"
+
+    transport = PySerialTransport("COM3", SerialSettings(timeout_s=2.0))
+    port = StubPort()
+    transport._port = port
+    if fails:
+        with pytest.raises(InstrumentError, match="串口读取失败"):
+            transport.read_until(b"\r\n", timeout_s=7.0)
+    else:
+        assert transport.read_until(b"\r\n", timeout_s=7.0) == b"ok\r\n"
+    assert port.timeout == 2.0
+
+
+def test_read_response_timeout_expands_for_slow_measurement_settings():
+    assert measurement_read_timeout_s(ModeSettings(Mode.DCI, nplc=100), 2.0) == pytest.approx(7.0)
+    assert measurement_read_timeout_s(ModeSettings(Mode.DCI, nplc=100, autozero=False), 2.0) == pytest.approx(5.0)
+    assert measurement_read_timeout_s(ModeSettings(Mode.ACV, ac_bandwidth_hz=3), 2.0) == 8.0
+    assert measurement_read_timeout_s(ModeSettings(Mode.DCV, nplc=1), 10.0) == 10.0
+
+
+def test_read_query_uses_derived_timeout_only_for_read_response():
+    transport = FakeTransport()
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.configure(ModeSettings(Mode.DCI, autorange=False, range_si=0.01, nplc=100))
+    transport.read_timeouts.clear()
+
+    instrument.read()
+
+    timeouts = dict(transport.read_timeouts)
+    assert timeouts["READ?"] == pytest.approx(7.0)
+    assert timeouts["SENS:CURR:DC:RANG?"] is None
+    instrument.close()
 
 
 def test_serial_flow_control_normalizes_known_values_and_rejects_unknown_ones():
@@ -214,10 +281,10 @@ def test_config_function_readback_is_verified():
 
 def test_config_accepts_the_8845a_short_dc_function_readback():
     class ShortFunctionTransport(FakeTransport):
-        def read_until(self, terminator: bytes) -> bytes:
+        def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
             if self.last_command.upper() == "SENS:FUNC?":
                 return b'"VOLT"' + terminator
-            return super().read_until(terminator)
+            return super().read_until(terminator, timeout_s)
 
     transport = ShortFunctionTransport()
     instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
@@ -273,10 +340,10 @@ def test_configuration_rejects_every_mismatched_parameter_readback(
     settings, query, wrong_response, error_match
 ):
     class MismatchedReadbackTransport(FakeTransport):
-        def read_until(self, terminator: bytes) -> bytes:
+        def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
             if self.last_command.upper() == query:
                 return wrong_response.encode("ascii") + terminator
-            return super().read_until(terminator)
+            return super().read_until(terminator, timeout_s)
 
     transport = MismatchedReadbackTransport()
     instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
@@ -299,10 +366,10 @@ def test_configuration_rejects_malformed_or_nonfinite_readbacks(
     query, response, settings, error_match
 ):
     class MalformedReadbackTransport(FakeTransport):
-        def read_until(self, terminator: bytes) -> bytes:
+        def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
             if self.last_command.upper() == query:
                 return response.encode("ascii") + terminator
-            return super().read_until(terminator)
+            return super().read_until(terminator, timeout_s)
 
     transport = MalformedReadbackTransport()
     instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
@@ -365,10 +432,10 @@ def test_live_speed_update_changes_only_active_nplc_and_reads_back_confirmation(
 
 def test_live_speed_update_rejects_readback_mismatch():
     class WrongNplcTransport(FakeTransport):
-        def read_until(self, terminator: bytes) -> bytes:
+        def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
             if self.last_command.upper().endswith(":NPLC?"):
                 return b"1" + terminator
-            return super().read_until(terminator)
+            return super().read_until(terminator, timeout_s)
 
     transport = WrongNplcTransport()
     instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)

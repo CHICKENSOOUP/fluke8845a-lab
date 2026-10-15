@@ -154,6 +154,8 @@ class MeasurementWorker(QObject):
                 if self.current_mode is not None:
                     try:
                         active_settings = self.instrument.read_settings(self.current_mode)
+                    except ScpiTimeout:
+                        raise
                     except Exception as exc:
                         self.log_line.emit(f"! 已连接，但当前设置回读失败：{exc}")
                 self.log_line.emit(f"连接时只读当前仪器状态：{actual}")
@@ -192,6 +194,8 @@ class MeasurementWorker(QObject):
             self.status_changed.emit(self._ready_status())
         except Exception as exc:
             self.log_line.emit(f"! 配置测量模式失败：{exc}")
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
             self.error.emit(str(exc))
 
     @Slot(object, str, str, object, bool)
@@ -251,6 +255,8 @@ class MeasurementWorker(QObject):
                 self._timer.start(0)
         except Exception as exc:
             self.log_line.emit(f"! 实验启动失败：{exc}")
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
             if self._recorder is not None:
                 self._safe_finish_recorder("start_error")
                 self._recorder = None
@@ -346,8 +352,11 @@ class MeasurementWorker(QObject):
             self._storage_fault(exc)
             self.measurement_speed_result.emit(False, f"调速记录写入失败：{exc}")
         except Exception as exc:
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
             self.log_line.emit(f"! 实时调速失败，采集已停止：{exc}")
-            self.error.emit(f"实时调速失败：{exc}。为避免数据条件不明，当前采集已停止。")
+            reconnect = "响应超时，串口已关闭，请重新连接。" if isinstance(exc, ScpiTimeout) else ""
+            self.error.emit(f"实时调速失败：{exc}。{reconnect}为避免数据条件不明，当前采集已停止。")
             try:
                 if self.state != AcquisitionState.STOPPED:
                     self._machine.stop()
@@ -420,7 +429,8 @@ class MeasurementWorker(QObject):
                     timestamp_local=host_local,
                     timestamp_utc=host_utc,
                     read_duration_s=(now_ns - routine_start_ns) / 1e9,
-                    status=code, error=str(exc), raw_reading=getattr(exc, "raw", ""),
+                    status=code, error=str(exc),
+                    raw_reading=getattr(exc, "raw", getattr(exc, "partial_response", "")),
                 )
             except OSError as storage_exc:
                 self._storage_fault(storage_exc)
@@ -432,6 +442,11 @@ class MeasurementWorker(QObject):
                 return
             self.log_line.emit(f"! {code}：{exc}")
             self._queue_ui_row(row)
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
+                self._finish_experiment("scpi_timeout")
+                self.status_changed.emit("SCPI响应超时，已停止采集并关闭连接；请重新连接")
+                return
             if code == "timeout":
                 self._consecutive_timeouts += 1
             else:
@@ -488,6 +503,17 @@ class MeasurementWorker(QObject):
             elapsed = (time.monotonic_ns() - routine_start_ns) / 1e9
             delay_ms = max(0, int((self._target_interval_s - elapsed) * 1000))
         self._timer.start(delay_ms)
+
+    def _close_after_scpi_timeout(self) -> None:
+        """Close a desynchronized serial session before another query can consume late bytes."""
+        instrument = self.instrument
+        if instrument is not None:
+            try:
+                instrument.close()
+            except Exception as exc:
+                self.log_line.emit(f"! 超时后关闭串口失败：{exc}")
+        self.connected_changed.emit(False, "SCPI响应超时，连接已关闭")
+        self.status_changed.emit("SCPI响应超时，串口连接已关闭；请重新连接")
 
     def _queue_ui_row(self, row: dict) -> None:
         self._pending_rows.append(row)
@@ -566,6 +592,8 @@ class MeasurementWorker(QObject):
             self.instrument.zero()
             self.status_changed.emit("仪器ZERO已执行")
         except Exception as exc:
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
             self.error.emit(f"ZERO失败：{exc}")
 
     @Slot()
@@ -577,6 +605,8 @@ class MeasurementWorker(QObject):
             result = self.instrument.diagnose()
             self.diagnostic_ready.emit("\n".join(f"{key}: {value}" for key, value in result.items()))
         except Exception as exc:
+            if isinstance(exc, ScpiTimeout):
+                self._close_after_scpi_timeout()
             self.error.emit(f"诊断查询失败：{exc}")
 
     def _safe_finish_recorder(self, status: str) -> None:

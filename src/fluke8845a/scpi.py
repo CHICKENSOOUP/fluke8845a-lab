@@ -8,7 +8,7 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Callable, Protocol
 
@@ -22,7 +22,18 @@ class InstrumentError(RuntimeError):
 
 
 class ScpiTimeout(InstrumentError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        command: str = "",
+        partial_response: str = "",
+        timeout_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.command = command
+        self.partial_response = partial_response
+        self.timeout_s = timeout_s
 
 
 class ScpiProtocolError(InstrumentError):
@@ -140,6 +151,34 @@ class ModeSettings:
         return spec
 
 
+READ_RESPONSE_TIMEOUT_MARGIN_S = 3.0
+AC_READ_RESPONSE_TIMEOUT_FLOOR_S = 8.0
+CONSERVATIVE_LINE_FREQUENCY_HZ = 50.0
+
+
+def measurement_read_timeout_s(settings: ModeSettings, base_timeout_s: float) -> float:
+    """Add a conservative response window for slow 8845A conversions.
+
+    The user-selected serial timeout remains the floor for ordinary commands.
+    AC functions get a conservative fixed floor; NPLC functions scale with the
+    longest common mains period (50 Hz), counting an additional conversion for
+    autozero. These are host-side wait guards, not meter timing guarantees.
+    """
+    spec = settings.validate()
+    required = float(base_timeout_s)
+    if spec.ac_bandwidths_hz:
+        required = max(required, AC_READ_RESPONSE_TIMEOUT_FLOOR_S)
+    elif settings.nplc is not None:
+        conversions = 2 if settings.autozero else 1
+        conversion_window_s = conversions * settings.nplc / CONSERVATIVE_LINE_FREQUENCY_HZ
+        filter_margin_s = 1.0 if settings.analog_filter else 0.0
+        required = max(
+            required,
+            READ_RESPONSE_TIMEOUT_MARGIN_S + conversion_window_s + filter_margin_s,
+        )
+    return required
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedReading:
     raw: str
@@ -168,7 +207,7 @@ class ByteTransport(Protocol):
     def open(self) -> None: ...
     def close(self) -> None: ...
     def write(self, payload: bytes) -> None: ...
-    def read_until(self, terminator: bytes) -> bytes: ...
+    def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes: ...
     def discard_input(self) -> None: ...
 
 
@@ -223,13 +262,19 @@ class PySerialTransport:
         except Exception as exc:
             raise InstrumentError(f"串口写入失败：{exc}") from exc
 
-    def read_until(self, terminator: bytes) -> bytes:
+    def read_until(self, terminator: bytes, timeout_s: float | None = None) -> bytes:
         if self._port is None or not self._port.is_open:
             raise InstrumentError("串口未打开")
+        previous_timeout = self._port.timeout
         try:
+            if timeout_s is not None:
+                self._port.timeout = timeout_s
             return bytes(self._port.read_until(terminator))
         except Exception as exc:
             raise InstrumentError(f"串口读取失败：{exc}") from exc
+        finally:
+            if timeout_s is not None and self._port is not None and self._port.is_open:
+                self._port.timeout = previous_timeout
 
     def discard_input(self) -> None:
         if self._port is not None and self._port.is_open:
@@ -357,19 +402,30 @@ class ScpiClient:
             self.is_open = False
             raise
 
-    def query(self, command: str) -> str:
+    def query(self, command: str, *, timeout_s: float | None = None) -> str:
+        if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError("SCPI响应超时必须为正的有限数")
         self.transport.discard_input()
         self.write(command)
         try:
-            payload = self.transport.read_until(self.settings.terminator)
+            if timeout_s is None:
+                payload = self.transport.read_until(self.settings.terminator)
+            else:
+                payload = self.transport.read_until(self.settings.terminator, timeout_s)
         except Exception:
             self.is_open = False
             raise
         if not payload.endswith(self.settings.terminator):
             partial = payload.decode("ascii", errors="replace").strip()
-            self._log("!", f"{command}超时；部分响应={partial!r}")
+            effective_timeout = self.settings.timeout_s if timeout_s is None else timeout_s
+            self._log("!", f"{command}超时（{effective_timeout:g}s）；部分响应={partial!r}")
             self.transport.discard_input()
-            raise ScpiTimeout(f"等待{command}响应超时；部分数据：{partial!r}")
+            raise ScpiTimeout(
+                f"等待{command}响应超时（{effective_timeout:g}s）；部分数据：{partial!r}",
+                command=command,
+                partial_response=partial,
+                timeout_s=effective_timeout,
+            )
         response = payload[: -len(self.settings.terminator)].decode("ascii", errors="replace").strip()
         self._log("<", response)
         if response.casefold() == command.strip().casefold():
@@ -399,10 +455,17 @@ class Serial8845A:
         self._client = ScpiClient(transport_factory(port, settings), settings, self._logger)
         self.info: InstrumentInfo | None = None
         self._mode: Mode | None = None
+        self._active_settings: ModeSettings | None = None
 
     @property
     def connected(self) -> bool:
         return self._client.is_open
+
+    @property
+    def measurement_read_timeout_s(self) -> float:
+        if self._active_settings is None:
+            return self.settings.timeout_s
+        return measurement_read_timeout_s(self._active_settings, self.settings.timeout_s)
 
     def connect(self) -> InstrumentInfo:
         self._client.open()
@@ -420,15 +483,16 @@ class Serial8845A:
             raise
 
     def close(self, *, restore_local: bool = True) -> None:
-        if self._client.is_open:
-            try:
-                if restore_local:
-                    try:
-                        self._client.write("SYST:LOC")
-                    except Exception as exc:
-                        self._logger(f"! 本地控制恢复失败：{exc}")
-            finally:
-                self._client.close()
+        try:
+            if self._client.is_open and restore_local:
+                try:
+                    self._client.write("SYST:LOC")
+                except Exception as exc:
+                    self._logger(f"! 本地控制恢复失败：{exc}")
+        finally:
+            self._client.close()
+            self._mode = None
+            self._active_settings = None
 
     def read_mode_state(self) -> dict[str, str]:
         """Read the selected function and input terminals without reconfiguring."""
@@ -557,6 +621,7 @@ class Serial8845A:
         # write or readback must not leave the acquisition layer believing that
         # the old or requested function is still safely configured.
         self._mode = None
+        self._active_settings = None
         self._client.write(f"CONF:{spec.function}")
         prefix = spec.sense_prefix
         if settings.autorange:
@@ -633,6 +698,12 @@ class Serial8845A:
                 f"实际{actual_zero}"
             )
         self._mode = settings.mode
+        self._active_settings = settings
+        read_timeout = self.measurement_read_timeout_s
+        if read_timeout > self.settings.timeout_s:
+            self._logger(
+                f"~ 慢速{spec.label} READ?响应上限按当前积分/滤波设置扩展为{read_timeout:g}s"
+            )
         return {
             "function": actual_function,
             "range_response": actual_range,
@@ -642,9 +713,10 @@ class Serial8845A:
             "analog_filter_response": actual_filter,
             "autozero_response": actual_zero,
             "input_terminals": terminal,
+            "measurement_read_timeout_s": read_timeout,
         }
 
-    def set_measurement_speed(self, settings: ModeSettings) -> dict[str, str | None]:
+    def set_measurement_speed(self, settings: ModeSettings) -> dict[str, str | float | None]:
         """Change only the active function's integration/bandwidth while acquiring."""
         spec = settings.validate()
         if not self.connected:
@@ -675,7 +747,21 @@ class Serial8845A:
                 f"调速参数回读不符：期望NPLC={settings.nplc}、交流带宽={settings.ac_bandwidth_hz} Hz；"
                 f"实际NPLC={actual_nplc}、交流带宽={actual_band} Hz"
             )
-        return {"nplc_response": actual_nplc, "ac_bandwidth_response": actual_band}
+        if self._active_settings is None:
+            raise InstrumentError("仪器测量设置尚未确认")
+        self._active_settings = replace(
+            self._active_settings,
+            nplc=settings.nplc,
+            ac_bandwidth_hz=settings.ac_bandwidth_hz,
+        )
+        read_timeout = self.measurement_read_timeout_s
+        if read_timeout > self.settings.timeout_s:
+            self._logger(f"~ 慢速READ?响应上限已更新为{read_timeout:g}s")
+        return {
+            "nplc_response": actual_nplc,
+            "ac_bandwidth_response": actual_band,
+            "measurement_read_timeout_s": read_timeout,
+        }
 
     def read(self) -> Reading:
         if not self.connected or self._mode is None:
@@ -686,7 +772,7 @@ class Serial8845A:
         now = datetime.now(timezone.utc)
         timestamp_utc = now.isoformat(timespec="microseconds")
         timestamp_local = now.astimezone().isoformat(timespec="microseconds")
-        raw = self._client.query("READ?")
+        raw = self._client.query("READ?", timeout_s=self.measurement_read_timeout_s)
         parsed = parse_reading(raw)
         if parsed.value_si is None:
             raise ReadingError(parsed.detail, parsed.raw)
