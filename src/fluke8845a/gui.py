@@ -2628,7 +2628,12 @@ class MainWindow(QMainWindow):
         }
 
     def _selected_serial_profile_port(self) -> str:
-        text = str(self.port_combo.currentData() or self.port_combo.currentText()).strip()
+        text = str(self.port_combo.currentText()).strip()
+        index = self.port_combo.currentIndex()
+        if index >= 0 and text == self.port_combo.itemText(index).strip():
+            item_data = self.port_combo.itemData(index)
+            if item_data:
+                text = str(item_data).strip()
         return text.split(" ", 1)[0].upper() if text else ""
 
     def _restore_port_serial_settings(self, port: str) -> None:

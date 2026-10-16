@@ -4142,6 +4142,37 @@ def test_serial_settings_are_saved_and_restored_per_com_port(qt_app, monkeypatch
         qt_app.processEvents()
 
 
+def test_editing_port_restores_profile_instead_of_using_stale_combo_data(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv(
+        "FLUKE8845A_CONFIG_DIR", str(tmp_path / "stale-port-data-config")
+    )
+    window = MainWindow()
+    try:
+        window.port_combo.blockSignals(True)
+        window.port_combo.clear()
+        window.port_combo.addItem("COM3 · configured adapter", "COM3")
+        window.port_combo.addItem("COM4 · existing adapter", "COM4")
+        window.port_combo.setCurrentIndex(1)
+        window.port_combo.blockSignals(False)
+        window._serial_profile_port = "COM4"
+        window._profiles["serial_by_port"] = {
+            "COM3": {"baudrate": "115200"},
+            "COM4": {"baudrate": "9600"},
+        }
+        window._restore_port_serial_settings("COM4")
+
+        window.port_combo.setEditText("COM3")
+
+        assert window._serial_profile_port == "COM3"
+        assert window.baud_combo.currentText() == "115200"
+        assert window._profiles["serial_by_port"]["COM4"]["baudrate"] == "9600"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_recommended_serial_settings_restore_only_the_selected_port_profile(
     qt_app, monkeypatch, tmp_path
 ):
