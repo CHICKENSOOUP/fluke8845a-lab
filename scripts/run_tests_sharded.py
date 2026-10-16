@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -98,6 +99,11 @@ def runner_environment(root: Path = ROOT, base: dict[str, str] | None = None) ->
     return env
 
 
+def default_output_root() -> Path:
+    """Keep pytest logs and temporary files out of the source checkout."""
+    return Path(tempfile.gettempdir()) / "Fluke8845A_Test_Artifacts" / "pytest-shards"
+
+
 def run_shards(
     *,
     python: Path = Path(sys.executable),
@@ -109,7 +115,7 @@ def run_shards(
         raise ValueError("timeout-seconds must be between 1 and 55")
     root = Path(root).resolve()
     validate_shard_coverage(root)
-    output_root = Path(output_root) if output_root is not None else root / "build" / "pytest-shards"
+    output_root = Path(output_root) if output_root is not None else default_output_root()
     run_directory = output_root / uuid.uuid4().hex
     run_directory.mkdir(parents=True, exist_ok=False)
 

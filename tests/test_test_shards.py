@@ -27,6 +27,14 @@ def test_runner_environment_includes_project_src_and_preserves_existing_path(tmp
     assert env["KEEP"] == "yes"
 
 
+def test_default_pytest_artifacts_are_outside_the_checkout(tmp_path, monkeypatch):
+    import scripts.run_tests_sharded as test_runner
+
+    monkeypatch.setattr(test_runner.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    assert test_runner.default_output_root() == tmp_path / "Fluke8845A_Test_Artifacts" / "pytest-shards"
+
+
 def test_shard_plan_fails_when_a_new_test_module_is_unassigned(tmp_path):
     from scripts.run_tests_sharded import SHARDS
 

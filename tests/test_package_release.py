@@ -520,8 +520,22 @@ def test_source_archive_includes_first_run_windows_launchers():
         "run_web.bat",
         "scripts/launch_windows.py",
         "scripts/generate_demo.py",
+        "docs/release-notes-v1.0.2.md",
         "docs/release-notes-v1.0.1.md",
     } <= set(REQUIRED_ARCHIVE_PATHS)
+
+
+def test_source_archive_includes_release_notes_for_the_project_version():
+    import tomllib
+
+    from fluke8845a import __version__
+
+    root = Path(__file__).resolve().parents[1]
+    project_version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+
+    assert __version__ == project_version
+    assert f"docs/release-notes-v{project_version}.md" in REQUIRED_ARCHIVE_PATHS
+    assert (root / f"docs/release-notes-v{project_version}.md").is_file()
 
 
 def test_source_archive_manifest_requires_the_history_import_module():

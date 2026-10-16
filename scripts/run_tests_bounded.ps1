@@ -25,16 +25,17 @@ if ($LASTEXITCODE -ne 0) {
     throw "pytest is missing from $PythonPath; install the project developer dependencies first."
 }
 
-$buildDirectory = Join-Path $repositoryRoot "build"
-New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
 $runId = [guid]::NewGuid().ToString("N")
-$stdoutPath = Join-Path $buildDirectory ("pytest-bounded-" + $runId + ".stdout.log")
-$stderrPath = Join-Path $buildDirectory ("pytest-bounded-" + $runId + ".stderr.log")
+$testArtifactsDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "Fluke8845A_Test_Artifacts"
+$runDirectory = Join-Path $testArtifactsDirectory ("pytest-bounded-" + $runId)
+New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+$stdoutPath = Join-Path $runDirectory "runner.stdout.log"
+$stderrPath = Join-Path $runDirectory "runner.stderr.log"
 
 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
 $startInfo.FileName = $PythonPath
 $runnerPath = Join-Path $repositoryRoot "scripts\run_tests_sharded.py"
-$shardLogRoot = Join-Path $buildDirectory "pytest-shards"
+$shardLogRoot = Join-Path $runDirectory "pytest-shards"
 $startInfo.Arguments = '"{0}" --python "{1}" --timeout-seconds 45 --output-root "{2}"' -f $runnerPath, $PythonPath, $shardLogRoot
 $startInfo.WorkingDirectory = $repositoryRoot
 $startInfo.UseShellExecute = $false
