@@ -893,8 +893,8 @@ function updateStateDisplay(state) {
   el("reconnectReal").classList.toggle("hidden", !!state.connected || !!state.simulation || !hasSavedRealConnection);
   el("connectReal").classList.toggle("hidden", !!state.connected);
   el("connectMock").classList.toggle("hidden", !!state.connected);
-  el("mockScenarioRow").classList.toggle("hidden", !state.simulation);
-  el("mockScenario").disabled = !!state.connected;
+  el("mockScenarioRow").classList.toggle("hidden", !!state.connected && !state.simulation);
+  el("mockScenario").disabled = !!state.connected || app.mockConnectPending;
   const scenario = state.simulation
     ? String(state.mock_scenario?.name ?? state.mock_scenario ?? "")
     : "";

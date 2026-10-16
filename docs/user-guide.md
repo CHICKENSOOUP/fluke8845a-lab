@@ -4,11 +4,11 @@
 
 ## 简体中文
 
-版本 1.0.5 · 中文 Windows 桌面应用
+版本 1.0.6 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v1.0.5 是当前主分支源码的版本发布刷新，不包含额外功能改动，也不包含预编译 Windows 程序。请按根目录 [README](../README.md) 的步骤安装并启动软件。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
+v1.0.6 可在连接模拟仪器前选择模拟场景，连接后场景选择会锁定，避免误以为运行中的模拟实验已切换场景。本版本发布源码 ZIP，不包含预编译 Windows 程序。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时本程序查询 `*IDN?`，只接受设备型号字段为 `8845A` 的 Fluke 仪器；不会重置仪器。
 - **MOCK**：勾选模拟模式后点击“启动MOCK模拟仪器”。状态栏和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
@@ -112,7 +112,7 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 ## English
 
-Version 1.0.5 republishes the current main source state without additional feature changes and does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
+Version 1.0.6 lets users select a Mock scenario before connecting the simulated instrument; the selection is locked after connection so a running experiment cannot appear to change scenarios. This source release does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
 
 ### 1. Connection and modes
 

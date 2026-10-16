@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fluke8845a-lab"
-version = "1.0.5"
+version = "1.0.6"
 description = "Fluke 8845A RS-232 scientific measurement and logging application"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

@@ -767,6 +767,7 @@ test("real instrument mode keeps wiring confirmation visible and user controlled
   api.app.state = connectedState({ simulation: false, connection_text: "8845A 已连接" });
   api.updateStateDisplay(api.app.state);
 
+  assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), true);
   assert.equal(element(elements, "safetyControls").classList.contains("hidden"), false);
   assert.equal(element(elements, "mockSafetyNote").classList.contains("hidden"), true);
   element(elements, "safetyConfirm").checked = true;
@@ -781,6 +782,27 @@ test("connected Mock scenario cannot be edited without reconnecting", () => {
 
   assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), false);
   assert.equal(element(elements, "mockScenario").disabled, true);
+});
+
+test("Mock scenario is selectable before connection and is sent with the request", async () => {
+  const { api, elements, context } = createFrontend();
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  assert.match(html, /id="mockScenarioRow" class="scenario-row"/);
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState({ connected: false, simulation: false });
+  api.updateStateDisplay(api.app.state);
+
+  assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), false);
+  assert.equal(element(elements, "mockScenario").disabled, false);
+  element(elements, "mockScenario").value = "长期漂移";
+
+  const requests = mockSuccessfulCommand(context);
+  await api.connectMock();
+
+  const request = JSON.parse(requests[0].options.body);
+  assert.equal(request.action, "connect_mock");
+  assert.equal(request.payload.scenario, "长期漂移");
 });
 
 test("changing mode or range clears the previous physical wiring confirmation", () => {

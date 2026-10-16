@@ -126,7 +126,7 @@
               <button id="resetSerialDefaults" class="button button-mini" type="button">恢复推荐串口设置</button>
             </details>
             <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="connectMock" class="button button-quiet" type="button">连接模拟器</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button><button id="diagnose" class="button button-quiet" type="button">运行诊断</button></div>
-            <div id="mockScenarioRow" class="scenario-row hidden"><label for="mockScenario">模拟场景</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
+            <div id="mockScenarioRow" class="scenario-row"><label for="mockScenario">模拟场景（连接前选择）</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
             <div class="connection-detail"><span class="connection-led"></span><span id="connectionText">串口尚未打开</span></div>
             <div id="connectionProgress" class="connection-progress hidden" role="status" aria-live="polite"></div>
             <ol id="connectionStages" class="connection-stages" aria-label="连接步骤"></ol>
