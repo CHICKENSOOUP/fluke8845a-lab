@@ -788,6 +788,7 @@ class MainWindow(QMainWindow):
         self._terminals = ""
         self._loading_mode_controls = False
         self._acquiring = False
+        self._single_shot_running = False
         self._paused = False
         self._speed_update_pending = False
         self._diagnostic_pending = False
@@ -1859,7 +1860,7 @@ class MainWindow(QMainWindow):
         self.view_mode_label = QLabel("自动跟随最新数据")
         self.view_mode_label.setObjectName("chartViewMode")
         plot_toolbar_layout.addWidget(self.view_mode_label, 0, 1)
-        self.acquisition_hint = QLabel("纵轴缩放仍跟随；时间轴缩放或平移会停止跟随")
+        self.acquisition_hint = QLabel("手动缩放任一坐标轴或平移时间轴会停止自动跟随")
         self.acquisition_hint.setObjectName("chartAcquisitionHint")
         self.acquisition_hint.setWordWrap(True)
         plot_toolbar_layout.addWidget(self.acquisition_hint, 0, 2)
@@ -3896,6 +3897,7 @@ class MainWindow(QMainWindow):
             self._bridge.stop.emit()
 
     def _on_status(self, status: str) -> None:
+        self._single_shot_running = "单次测量中" in status
         if status.startswith(("连续超时", "SCPI响应超时", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
             self._last_acquisition_issue = status
             self._show_recovery_guidance(status)
@@ -4039,7 +4041,7 @@ class MainWindow(QMainWindow):
         self.zero_button.setEnabled(command_ready and self._connected and computer_control)
         self.start_button.setEnabled(command_ready and self._connected and computer_control and self._experiment_name_valid)
         self.single_button.setEnabled(command_ready and self._connected and computer_control and self._experiment_name_valid)
-        self.pause_button.setEnabled(self._acquiring)
+        self.pause_button.setEnabled(self._acquiring and not self._single_shot_running)
         self.pause_button.setText("继续" if self._paused else "暂停")
         self.stop_button.setEnabled(self._acquiring)
         self.history_button.setEnabled(idle and not self._history_load_pending)
@@ -4087,8 +4089,21 @@ class MainWindow(QMainWindow):
         name_reason = self.experiment_name_validation.text() if not self._experiment_name_valid else ""
         self.start_button.setToolTip((reason or name_reason or "开始连续采集；原始结果逐点保存到当前实验 CSV。") + " 快捷键：Ctrl+R。")
         self.single_button.setToolTip(reason or name_reason or "只读取一次并保存为独立实验数据。")
-        self.pause_button.setToolTip("暂停或继续当前采集。快捷键：Ctrl+P。")
-        self.stop_button.setToolTip("停止当前读数、刷新缓冲并保存实验数据。快捷键：Ctrl+Shift+S。")
+        pause_tooltip = (
+            "继续当前已暂停的采集。快捷键：Ctrl+P。" if self._paused else
+            "单次测量不支持暂停；可停止当前读数。" if self._single_shot_running else
+            "暂停当前连续采集。快捷键：Ctrl+P。" if self._acquiring else
+            "当前没有连续采集；开始连续采集后可暂停。快捷键：Ctrl+P。"
+        )
+        self.pause_button.setToolTip(pause_tooltip)
+        stop_tooltip = (
+            "停止当前单次测量并保存已写入的数据。快捷键：Ctrl+Shift+S。"
+            if self._single_shot_running else
+            "停止当前采集并保存已写入的数据。快捷键：Ctrl+Shift+S。"
+            if self._acquiring else
+            "当前没有进行中的采集；开始连续采集后可停止并保存。快捷键：Ctrl+Shift+S。"
+        )
+        self.stop_button.setToolTip(stop_tooltip)
         self.event_button.setToolTip(
             ("请先开始一次实验，再记录事件。" if not self._experiment_active else "记录带有当前时间、样本号和读数的实验事件。")
             + " 快捷键：Ctrl+Enter。"
@@ -4668,6 +4683,7 @@ class MainWindow(QMainWindow):
     def _on_experiment_finished(self, directory: str) -> None:
         self._start_pending = False
         self._acquiring = False
+        self._single_shot_running = False
         self._paused = False
         self._experiment_active = False
         self._experiment_csv_path = Path(directory) / "measurements.csv"

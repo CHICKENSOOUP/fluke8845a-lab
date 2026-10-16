@@ -520,6 +520,7 @@ def test_source_archive_includes_first_run_windows_launchers():
         "run_web.bat",
         "scripts/launch_windows.py",
         "scripts/generate_demo.py",
+        "docs/release-notes-v1.0.4.md",
         "docs/release-notes-v1.0.3.md",
         "docs/release-notes-v1.0.2.md",
         "docs/release-notes-v1.0.1.md",
@@ -553,6 +554,8 @@ def test_source_archive_includes_automated_release_workflow_and_guide():
 def test_release_workflow_stages_and_verifies_both_publications():
     workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
     oras_arguments = workflow.split("$orasArguments = @(\n", 1)[1].split("\n          )", 1)[0]
+    assert "release-notes-v$($metadata.version).md" in workflow
+    assert "          $releaseNotes\n\n          ---\n\n          Automated source-only package" in workflow
     assert workflow.index("GitHub draft Release creation failed before GHCR publish") < workflow.index('"push",')
     assert '"push",' in oras_arguments
     assert '"--disable-path-validation"' in oras_arguments

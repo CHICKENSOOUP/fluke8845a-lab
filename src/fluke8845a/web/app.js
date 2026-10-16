@@ -15,6 +15,7 @@ const app = {
   logRows: [], logFilter: "all",
   activePointers: new Map(), pinchState: null,
   activeDeviceSerial: "",
+  safetyReadback: null,
   xView: null, yView: null, dragging: null, cursor: null, selectedPointIndex: null, bufferTruncated: false,
   awaitInitialSettings: false, awaitSettingsReadback: false, awaitSpeedReadback: false,
   mockConnectPending: false, startPending: false, pendingCommands: new Set(), commandOriginalDisabled: new Map(),
@@ -195,6 +196,21 @@ function populateModeOptions(spec) {
 }
 
 function clearSafetyConfirmation() { ui.confirm.checked = false; }
+
+function updateSafetyReadback(state) {
+  const next = state?.connected && !state.simulation
+    ? JSON.stringify({
+      serial: String(state.device?.serial_number || "").trim(),
+      controlMode: String(state.control_mode || "").trim().toLowerCase(),
+      mode: String(state.active_settings?.mode || state.configuration?.function || "").trim().toUpperCase(),
+      autorange: state.active_settings?.autorange === true,
+      range: state.active_settings?.autorange === true ? "AUTO" : state.active_settings?.range_si ?? null,
+      terminals: String(state.configuration?.input_terminals || "").trim().toUpperCase(),
+    })
+    : null;
+  if (next !== app.safetyReadback) clearSafetyConfirmation();
+  app.safetyReadback = next;
+}
 
 function setServiceStatus(online, error = "") {
   const status = el("serviceStatus");
@@ -832,6 +848,7 @@ async function pollState() {
 }
 
 function updateStateDisplay(state) {
+  updateSafetyReadback(state);
   app.state = state;
   syncSettingsReadback(state);
   const device = state.device || {};
@@ -997,10 +1014,23 @@ function updateStateDisplay(state) {
   el("applyControlMode").disabled = !state.connected || state.simulation || acquiring;
   el("start").disabled = !state.connected || !computerControl || acquiring || !!nameError || app.startPending;
   el("single").disabled = !state.connected || !computerControl || acquiring || !!nameError || app.startPending;
-  el("pause").disabled = !running;
+  const singleMeasurement = String(state.status || "").includes("单次测量中");
+  const continuousRunning = running && !singleMeasurement;
+  el("pause").disabled = !continuousRunning;
+  el("pause").title = singleMeasurement
+    ? "单次测量不支持暂停；可停止当前读数。"
+    : continuousRunning
+      ? "暂停当前连续采集。"
+      : "当前没有连续采集；开始连续采集后可暂停。";
   el("pause").classList.toggle("hidden", paused);
   el("resume").classList.toggle("hidden", !paused);
+  el("resume").title = paused ? "继续当前已暂停的采集。" : "当前没有已暂停的采集。";
   el("stop").disabled = !running && !paused;
+  el("stop").title = singleMeasurement
+    ? "停止当前单次测量并保存已写入的数据。"
+    : running || paused
+      ? "停止当前采集并保存已写入的数据。"
+    : "当前没有进行中的采集；开始连续采集后可停止并保存。";
   el("applySettings").disabled = !state.connected || !computerControl || acquiring;
   el("disconnect").disabled = acquiring;
   const settingsDisabled = acquiring || !computerControl;
@@ -1171,6 +1201,9 @@ function updateStats() {
   if (el("analysisContext")) {
     const source = app.imported ? "当前历史文件" : (app.bufferTruncated ? "当前缓存（早期点已滚动）；原始 CSV 保留全程数据" : "当前实时缓存");
     el("analysisContext").textContent = `统计范围：${source}中的全部有效读数 · n=${points.length} · 单位 ${labelUnit}`;
+  }
+  for (const id of ["statMeanCount", "statStdCount", "statMinCount", "statMaxCount"]) {
+    el(id).textContent = `n=${points.length}`;
   }
   if (!points.length) {
     for (const id of ["statMean", "statStd", "statMin", "statMax"]) el(id).textContent = "—";
@@ -1486,7 +1519,7 @@ function drawChart() {
     app.chartScale = null;
     app.chartEventHits = [];
     el("plotRange").textContent = "等待数据";
-    el("pointCursor").textContent = "滚轮缩放纵轴 · Shift 时间轴 · Ctrl 双轴 · Alt 锚定零点 · 拖动平移";
+    el("pointCursor").textContent = "暂无可读数点";
     updateChartAccessibilitySummary();
     return;
   }
@@ -1927,7 +1960,7 @@ ui.canvas.addEventListener("pointermove", (event) => {
     const point = app.cursor.point;
     const value = scaledValue(point.y, point.unit || "");
     el("pointCursor").textContent = `样本 #${point.id} · ${formatLocalDateTime(point.timestamp)} · t=${timeLabel(point.x)} · ${value.value} ${value.unit} · 原始 ${point.raw || numberText(point.y, 14)}`;
-  } else el("pointCursor").textContent = "滚轮缩放纵轴 · Shift 时间轴 · Ctrl 双轴 · Alt 锚定零点 · 拖动平移";
+  } else el("pointCursor").textContent = "悬停在曲线上读取读数";
   schedulePointerRedraw();
 });
 ui.canvas.addEventListener("pointerdown", (event) => {

@@ -157,8 +157,8 @@ def test_main_window_is_a_single_plot_with_settings_in_a_separate_window(
         assert all(window._chart_panel_layout.itemAt(i).widget() is not window.analysis_tabs
                    for i in range(window._chart_panel_layout.count()))
         assert window.autoscale_button.text() == "全部数据"
-        assert "纵轴缩放仍跟随" in window.acquisition_hint.text()
-        assert "时间轴缩放或平移会停止跟随" in window.acquisition_hint.text()
+        assert "手动缩放任一坐标轴或平移时间轴会停止自动跟随" in window.acquisition_hint.text()
+        assert "纵轴缩放仍跟随" not in window.acquisition_hint.text()
 
         window._on_status("连续采集中 · 目标间隔 0 s")
         assert window.experiment_status.text() == "连续采集中"
@@ -2675,10 +2675,40 @@ def test_live_follow_guidance_explains_axis_behavior_and_highlights_return(qt_ap
     window = MainWindow()
     try:
         guidance = f"{window.acquisition_hint.text()} {window.chart_gesture_help.text()}"
-        assert "手动缩放任一坐标轴或平移时间轴会停止自动跟随" in guidance
+        assert "手动缩放任一坐标轴或平移时间轴会停止自动跟随" in window.acquisition_hint.text()
         assert "回到实时窗口" in guidance
         assert window.return_live_button.objectName() == "primaryButton"
     finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_disabled_pause_and_stop_buttons_explain_the_required_state(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._connected = True
+        window._acquiring = False
+        window._paused = False
+        window._update_controls()
+        assert not window.pause_button.isEnabled()
+        assert "开始连续采集后" in window.pause_button.toolTip()
+        assert not window.stop_button.isEnabled()
+        assert "没有进行中的采集" in window.stop_button.toolTip()
+
+        window._acquiring = True
+        window._update_controls()
+        assert window.pause_button.isEnabled()
+        assert "暂停当前连续采集" in window.pause_button.toolTip()
+        assert window.stop_button.isEnabled()
+        assert "停止当前采集" in window.stop_button.toolTip()
+
+        window._on_status("单次测量中")
+        assert not window.pause_button.isEnabled()
+        assert "单次测量不支持暂停" in window.pause_button.toolTip()
+        assert window.stop_button.isEnabled()
+    finally:
+        window._acquiring = False
         window.close()
         qt_app.processEvents()
 

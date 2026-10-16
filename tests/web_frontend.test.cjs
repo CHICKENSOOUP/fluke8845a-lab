@@ -45,6 +45,24 @@ test("Web summary counts valid measurements separately from attempts", () => {
   assert.equal(element(elements, "sampleCount").textContent, "7");
 });
 
+test("each Web summary statistic shows its sample count beside the value and unit", () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.points = [
+    { id: 1, x: 0, y: 1, status: "ok", unit: "V" },
+    { id: 2, x: 1, y: 3, status: "ok", unit: "V" },
+  ];
+  api.updateStats();
+
+  for (const id of ["statMean", "statStd", "statMin", "statMax"]) {
+    assert.match(html, new RegExp(`id="${id}Count"`));
+    assert.equal(element(elements, `${id}Count`).textContent, "n=2");
+    assert.match(element(elements, id).textContent, /V$/);
+  }
+});
+
 test("primary status metrics follow connection, acquisition, reading, samples, and interval order", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   const ids = ["connectionBadge", "runStatus", "readingMode", "readingValue", "sampleCount", "actualRate"];
@@ -787,6 +805,74 @@ test("changing mode or range clears the previous physical wiring confirmation", 
   assert.equal(element(elements, "safetyConfirm").checked, false);
 });
 
+test("physical mode, fixed-range, and terminal readback changes clear wiring confirmation", async () => {
+  const { api, elements, context } = createFrontend();
+  const dci = { ...dcv, value: "DCI", label: "直流电流", quantity: "current", unit: "A", ranges: [.01, .1, .4, 1, 3, 10] };
+  const aci = { ...dci, value: "ACI", label: "交流电流" };
+  api.app.modes.set("DCI", dci);
+  api.app.modes.set("ACI", aci);
+  api.app.selectedMode = "DCI";
+  const stateFor = ({ mode = "DCI", range = .1, terminal = "FRONT" } = {}) => connectedState({
+    simulation: false,
+    control_mode: "computer",
+    connection_text: "8845A 已连接",
+    device: { serial_number: "9383035" },
+    configuration: { input_terminals: terminal },
+    active_settings: { mode, autorange: false, range_si: range },
+    generation: 1,
+    sample_buffer_start: 1,
+    samples: [],
+    logs: [],
+    log_seq: 0,
+    events: [],
+  });
+  const states = [
+    stateFor(), stateFor(), stateFor({ terminal: "REAR" }),
+    stateFor({ terminal: "REAR", range: .4 }), stateFor({ mode: "ACI", terminal: "REAR", range: .4 }),
+  ];
+  context.fetch = async () => ({ ok: true, json: async () => states.shift() });
+
+  await api.pollState();
+  element(elements, "safetyConfirm").checked = true;
+  await api.pollState();
+  assert.equal(element(elements, "safetyConfirm").checked, true, "stable readback keeps the user's confirmation");
+  await api.pollState();
+  assert.equal(element(elements, "safetyConfirm").checked, false, "terminal change invalidates confirmation");
+  element(elements, "safetyConfirm").checked = true;
+  await api.pollState();
+  assert.equal(element(elements, "safetyConfirm").checked, false, "fixed-range change invalidates confirmation");
+  element(elements, "safetyConfirm").checked = true;
+  await api.pollState();
+
+  assert.equal(element(elements, "safetyConfirm").checked, false, "mode change invalidates confirmation");
+});
+
+test("disabled pause and stop actions explain the acquisition state they require", () => {
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ status: "等待连接" }));
+
+  assert.equal(element(elements, "pause").disabled, true);
+  assert.match(element(elements, "pause").title, /开始连续采集后.*暂停/);
+  assert.equal(element(elements, "stop").disabled, true);
+  assert.match(element(elements, "stop").title, /没有进行中的采集/);
+
+  api.updateStateDisplay(connectedState({ status: "连续采集中" }));
+  assert.equal(element(elements, "pause").disabled, false);
+  assert.match(element(elements, "pause").title, /暂停当前连续采集/);
+  assert.equal(element(elements, "stop").disabled, false);
+  assert.match(element(elements, "stop").title, /停止当前采集/);
+});
+
+test("single measurements remain stoppable but cannot be paused", () => {
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ status: "单次测量中" }));
+
+  assert.equal(element(elements, "pause").disabled, true);
+  assert.match(element(elements, "pause").title, /单次测量不支持暂停/);
+  assert.equal(element(elements, "stop").disabled, false);
+  assert.match(element(elements, "stop").title, /停止当前单次测量/);
+});
+
 function mockSuccessfulCommand(context) {
   const requests = [];
   context.fetch = async (url, options = {}) => {
@@ -1494,7 +1580,8 @@ test("chart gesture help is expandable and the live hint stays concise", () => {
   assert.match(html, /<details id="plotHelp"[^>]*>/);
   assert.match(html, /<summary>[^<]*触屏[^<]*<\/summary>/);
   assert.match(html, /触屏单指平移、双指缩放/);
-  assert.match(html, /id="pointCursor"[^>]*>[^<]*(滚轮缩放|滚轮)/);
+  assert.match(html, /id="pointCursor"[^>]*>[^<]*悬停读点/);
+  assert.match(html, /id="chartGestureHint"[^>]*>[^<]*滚轮/);
   assert.match(html, /id="scenarioBadge"/);
   assert.match(html, /id="acquisitionFeedback"/);
   assert.match(html, /class="pause-slot"[\s\S]*id="pause"[\s\S]*id="resume"/);
@@ -1888,6 +1975,7 @@ test("event entries identify their chart location and selecting one centers the 
 test("chart points can be selected and locked as baseline with the keyboard", async () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("DCV", dcv);
+  element(elements, "chartGestureHint").textContent = "滚轮读数轴 · Shift 时间轴 · Ctrl 双轴 · Alt 零点锚";
   api.app.points = [
     { id: 1, x: 0, y: 1, status: "ok", unit: "V", raw: "1.0" },
     { id: 2, x: 1, y: 2, status: "ok", unit: "V", raw: "2.0" },
@@ -1897,6 +1985,7 @@ test("chart points can be selected and locked as baseline with the keyboard", as
 
   await element(elements, "plot").dispatch("keydown", { key: "End", preventDefault() {} });
   assert.match(element(elements, "pointCursor").textContent, /已选样本 #2/);
+  assert.equal(element(elements, "chartGestureHint").textContent, "滚轮读数轴 · Shift 时间轴 · Ctrl 双轴 · Alt 零点锚");
   await element(elements, "plot").dispatch("keydown", { key: "Enter", preventDefault() {} });
 
   assert.equal(api.app.baseline, 2);
@@ -2335,12 +2424,16 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
     Promise.all(frames.map(({frame}) => new Promise((resolve) => frame.addEventListener("load", () => {
       const doc = frame.contentDocument;
       const viewport = frame.contentWindow.innerWidth;
-      const measured = [".topbar", ".workspace", ".measurement-area", ".readout-panel", ".chart-panel", ".plot-wrap", ".chart-actions .toggle-label"]
+      const measured = [".topbar", ".workspace", ".measurement-area", ".readout-panel", ".chart-panel", ".plot-wrap", ".chart-context", ".chart-context-actions", "#pointCursor", "#chartGestureHint", ".chart-actions .toggle-label"]
         .map((selector) => { const node = doc.querySelector(selector); const rect = node.getBoundingClientRect(); return [selector, rect.left, rect.right]; });
+      const overflowing = [...doc.body.querySelectorAll("*")].map((node) => {
+        const rect = node.getBoundingClientRect();
+        return [node.id || node.className || node.tagName, rect.left, rect.right, node.scrollWidth, node.clientWidth];
+      }).filter(([, left, right]) => left < -1 || right > doc.documentElement.clientWidth + 1).slice(0, 12);
       const targetRect = doc.querySelector(".chart-actions .toggle-label").getBoundingClientRect();
       resolve({ viewport, bodyMinWidth: getComputedStyle(doc.body).minWidth, bodyClient: doc.body.clientWidth, bodyScroll: doc.body.scrollWidth,
         documentClient: doc.documentElement.clientWidth, documentScroll: doc.documentElement.scrollWidth,
-        touchTarget: [targetRect.width, targetRect.height], measured });
+        touchTarget: [targetRect.width, targetRect.height], measured, overflowing });
     })))).then((metrics) => { document.getElementById("result").textContent = JSON.stringify(metrics); });
   </script>`;
   const tempHtml = path.join(require("node:os").tmpdir(), `8845a-layout-${process.pid}-${Date.now()}.html`);
@@ -2354,7 +2447,7 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
     const metrics = JSON.parse(match[1]);
     assert.equal(metrics.length, 4);
     for (const layout of metrics) {
-      assert.equal(layout.bodyScroll, layout.bodyClient, `${layout.viewport}px body has no horizontal overflow`);
+      assert.equal(layout.bodyScroll, layout.bodyClient, `${layout.viewport}px body has no horizontal overflow: ${JSON.stringify(layout)}`);
       assert.equal(layout.documentScroll, layout.documentClient, `${layout.viewport}px document has no horizontal overflow`);
       assert.ok(layout.documentClient <= layout.viewport, `${layout.viewport}px document client area stays within the viewport`);
       assert.equal(layout.bodyMinWidth, layout.viewport <= 350 ? "0px" : "280px", `${layout.viewport}px min-width breakpoint is applied at the intended boundary`);

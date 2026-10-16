@@ -135,8 +135,17 @@ jobs:
           $tag = $metadata.tag
           $title = $metadata.title
           $prerelease = [bool]$metadata.prerelease
+          $releaseNotesPath = Join-Path $env:GITHUB_WORKSPACE ("docs\release-notes-v$($metadata.version).md")
+          if (-not (Test-Path -LiteralPath $releaseNotesPath -PathType Leaf)) {
+            throw "Versioned release notes are missing: $releaseNotesPath"
+          }
+          $releaseNotes = (Get-Content -LiteralPath $releaseNotesPath -Raw).Trim()
 
           $notes = @"
+          $releaseNotes
+
+          ---
+
           Automated source-only package for commit $sha.
 
           Assets: Fluke8845A_Source_Project.zip and SHA256SUMS.txt.

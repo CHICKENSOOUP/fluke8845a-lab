@@ -98,6 +98,8 @@ button { cursor: pointer; }
 .chart-context { min-height: 28px; display: flex; justify-content: space-between; align-items: center; gap: 14px; color: #596762; font-size: 12px; }
 .chart-context > span:first-child { display: inline-flex; align-items: center; gap: 7px; color: #4e5d61; white-space: nowrap; }
 .chart-context > span:last-child { text-align: right; }
+.chart-context-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }
+#chartGestureHint { color: #6b7772; white-space: nowrap; }
 .legend-line { width: 18px; height: 2px; display: inline-block; background: #138b92; }
 .plot-wrap { position: relative; min-height: 0; flex: 1 1 auto; overflow: hidden; border: 1px solid #d0d2c9; border-radius: 5px; background: #faf9f2; }
 #plot { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
@@ -252,6 +254,8 @@ input::placeholder { color: #68736e; }
 .stats-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; }
 .stat-card { min-width: 0; min-height: 56px; padding: 8px 10px; border: 1px solid #e1e3db; border-radius: 5px; background: #f5f5ee; }
 .stat-card span { color: #596762; font-size: 12px; }
+.stat-card-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 5px; }
+.stat-card .stat-count { color: #77827c; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat-card strong { display: block; margin-top: 5px; overflow: hidden; color: #344247; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .baseline-row { margin-top: 10px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); align-items: center; gap: 6px; }
 .baseline-label, .baseline-entry { grid-column: 1 / -1; }
@@ -331,7 +335,8 @@ input::placeholder { color: #68736e; }
   .chart-actions { justify-content: flex-start; }
   .chart-actions .toggle-label { min-width: 44px; min-height: 44px; padding: 5px 4px; }
   .chart-context { align-items: flex-start; flex-direction: column; gap: 4px; padding: 5px 0; }
-  .chart-context > span:last-child { text-align: left; line-height: 1.5; }
+  .chart-context > span:last-child { justify-content: flex-start; text-align: left; line-height: 1.5; }
+  #chartGestureHint { white-space: normal; }
   .plot-footer { align-items: flex-start; flex-direction: column; gap: 4px; }
   .settings-dialog { width: calc(100vw - 14px); max-height: calc(100dvh - 14px); }
   .dialog-shell { max-height: calc(100dvh - 14px); }
@@ -362,8 +367,7 @@ input::placeholder { color: #68736e; }
   .option-check, .confirm-row { min-height: 44px; padding: 5px 2px; }
   .telemetry-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
-@media (max-width: 350px) {
-  body { min-width: 0; }
+@media (max-width: 380px) {
   .topbar { padding-inline: 7px; gap: 4px; }
   .brand-mark, .brand-mark svg { width: 30px; height: 28px; }
   .brand-lockup { gap: 4px; }
@@ -372,6 +376,9 @@ input::placeholder { color: #68736e; }
   .connection-badge { max-width: 26vw; padding: 5px; }
   .button-header, .service-exit { padding-inline: 5px; font-size: 12px; }
   .topbar-right #openSettings { max-width: 82px; white-space: normal; line-height: 1.15; }
+}
+@media (max-width: 350px) {
+  body { min-width: 0; }
   .readout-panel { padding-inline: 9px; }
   .action-bar { gap: 4px; padding-inline: 5px; }
   .action-bar .button { padding-inline: 5px; font-size: 12px; }
