@@ -41,10 +41,23 @@ test("Web summary counts valid measurements separately from attempts", () => {
 
 test("primary status metrics follow connection, acquisition, reading, samples, and interval order", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  const ids = ["connectionBadge", "runStatus", "readingMode", "sampleCount", "actualRate"];
+  const ids = ["connectionBadge", "runStatus", "readingMode", "readingValue", "sampleCount", "actualRate"];
   const positions = ids.map((id) => html.indexOf(`id=\"${id}\"`));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
+});
+
+test("mode settings bind only controls supported by the selected mode", () => {
+  const { api, context, elements } = createFrontend();
+  const getElementById = context.document.getElementById;
+  const modeOptionIds = new Set(["autorange", "range", "nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "digitalFilter", "autozero"]);
+  context.document.getElementById = (id) => {
+    if (modeOptionIds.has(id) && !element(elements, "modeOptions").innerHTML.includes(`id="${id}"`)) return null;
+    return getElementById(id);
+  };
+
+  api.app.modes.set("DCV", dcv);
+  assert.doesNotThrow(() => api.populateModeOptions(dcv));
 });
 
 test("connection stage chips render each phase status using text content", () => {
@@ -318,10 +331,39 @@ test("AC bandwidth and NPLC hints update for the selected measurement mode", () 
   api.populateModeOptions(acv);
   assert.match(element(elements, "modeOptions").innerHTML, /当前模式可调交流响应带宽/);
   assert.match(element(elements, "modeOptions").innerHTML, /交流响应带宽会影响稳定时间和噪声/);
+  assert.match(element(elements, "modeOptions").innerHTML, /自动零点.*实测.*间隔/);
+  assert.match(element(elements, "modeOptions").innerHTML, /软件目标间隔.*实测采样间隔/);
   assert.doesNotMatch(element(elements, "modeOptions").innerHTML, /NPLC 越高/);
-  api.populateModeOptions(dcv);
+  const dcvWithFilter = { ...dcv, analog_filter: true };
+  api.populateModeOptions(dcvWithFilter);
   assert.match(element(elements, "modeOptions").innerHTML, /NPLC 越高/);
+  assert.match(element(elements, "modeOptions").innerHTML, /模拟滤波.*实测.*间隔/);
   assert.doesNotMatch(element(elements, "modeOptions").innerHTML, /交流响应带宽会影响/);
+});
+
+test("Web exit explains that closing the page leaves service and acquisition running", async () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  assert.match(html, /id="shutdownService"[^>]*title="[^"]*关闭浏览器标签[^\"]*采集仍会继续/);
+  const { api, elements, context } = createFrontend();
+  const confirmations = [];
+  const requests = [];
+  context.window.confirm = (message) => { confirmations.push(message); return false; };
+  context.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { json: async () => ({ success: true, message: "服务正在退出" }) };
+  };
+  api.bindControls();
+
+  await element(elements, "shutdownService").dispatch("click");
+  assert.match(confirmations[0], /先停止采集.*保存并关闭当前实验.*关闭 localhost 服务/);
+  assert.match(confirmations[0], /关闭网页标签页不会停止采集或服务/);
+  assert.equal(requests.length, 0, "cancelling the confirmation must not send shutdown");
+
+  context.window.confirm = (message) => { confirmations.push(message); return true; };
+  await element(elements, "shutdownService").dispatch("click");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/api/command");
+  assert.equal(JSON.parse(requests[0].options.body).action, "shutdown");
 });
 
 test("mode terminal panel shows named 8845A jacks and backend metadata supplies terminal groups", () => {
@@ -629,6 +671,58 @@ test("service polling failure is separate from the last instrument and acquisiti
   assert.equal(element(elements, "connectionText").textContent, "MOCK 模拟器已连接");
   assert.equal(element(elements, "connectionBadge").classList.contains("mock"), true);
   assert.match(element(elements, "serviceStatus").textContent, /服务.*(中断|不可用)/);
+});
+
+test("state polling skips a new request while the previous request is still in flight", async () => {
+  const { api, context } = createFrontend();
+  const pending = [];
+  let requests = 0;
+  context.fetch = () => {
+    requests += 1;
+    return new Promise((resolve) => pending.push(resolve));
+  };
+
+  const first = api.pollState();
+  const second = api.pollState();
+
+  assert.equal(requests, 1);
+  assert.equal(pending.length, 1);
+  pending[0]({
+    ok: true,
+    json: async () => connectedState({ generation: 1, sample_buffer_start: 1, samples: [], logs: [], log_seq: 0, events: [] }),
+  });
+  await Promise.all([first, second]);
+
+  assert.equal(api.app.generation, 1);
+  assert.equal(requests, 1);
+
+  const afterCompletion = api.pollState();
+  assert.equal(requests, 2);
+  pending[1]({
+    ok: true,
+    json: async () => connectedState({ generation: 1, sample_buffer_start: 1, samples: [], logs: [], log_seq: 0, events: [] }),
+  });
+  await afterCompletion;
+});
+
+test("state polling can retry after a request throws", async () => {
+  const { api, context } = createFrontend();
+  let requests = 0;
+  context.fetch = async () => {
+    requests += 1;
+    if (requests === 1) throw new Error("temporary connection failure");
+    return {
+      ok: true,
+      json: async () => connectedState({ generation: 1, sample_buffer_start: 1, samples: [], logs: [], log_seq: 0, events: [] }),
+    };
+  };
+
+  await api.pollState();
+  assert.equal(api.app.pollInFlight, false);
+  await api.pollState();
+
+  assert.equal(requests, 2);
+  assert.equal(api.app.pollInFlight, false);
 });
 
 test("Mock mode hides physical wiring confirmation and sends no physical confirmation field", () => {

@@ -1908,8 +1908,8 @@ class MainWindow(QMainWindow):
             "滚轮缩放读数轴（纵轴）；Shift+滚轮缩放时间轴；Ctrl+滚轮同时缩放两轴；"
             "Alt+滚轮以零点为锚缩放读数轴。拖动曲线可平移，点击曲线可锁定读数点；"
             "聚焦图表后按方向键选点，Enter将锁定点设为基准；Shift+方向键平移，"
-            "PageUp/PageDown缩放，Ctrl缩放时间轴，Alt缩放读数轴。仅缩放读数轴不会停止自动跟随；"
-            "缩放或平移时间轴会停止自动跟随。点击“回到实时窗口”可恢复最新数据跟随；"
+            "PageUp/PageDown缩放，Ctrl缩放时间轴，Alt缩放读数轴。手动缩放任一坐标轴或平移时间轴会停止自动跟随；"
+            "点击“回到实时窗口”可恢复最新数据跟随；"
             "Home显示全部数据，End回到实时窗口。"
         )
         self.chart_gesture_help.setObjectName("secondaryText")
@@ -1945,6 +1945,7 @@ class MainWindow(QMainWindow):
             axis.setTickFont(QFont("Microsoft YaHei UI", 10))
         plot_item.vb.sigRangeChanged.connect(self._position_event_labels)
         self.view_box.userZoomed.connect(self._on_plot_wheel_zoom)
+        self.view_box.sigRangeChangedManually.connect(self._on_plot_range_changed_manually)
         plot_item.setMenuEnabled(False)
         plot_item.vb.setMouseEnabled(x=True, y=True)
         plot_item.setClipToView(True)
@@ -2228,8 +2229,12 @@ class MainWindow(QMainWindow):
             toolbar_layout.setColumnStretch(1, 1)
         self.plot_toolbar.updateGeometry()
 
-    def _on_plot_wheel_zoom(self, zoom_x: bool, _zoom_y: bool) -> None:
-        if zoom_x:
+    def _on_plot_wheel_zoom(self, zoom_x: bool, zoom_y: bool) -> None:
+        if zoom_x or zoom_y:
+            self.follow_check.setChecked(False)
+
+    def _on_plot_range_changed_manually(self, axes) -> None:
+        if axes and axes[0]:
             self.follow_check.setChecked(False)
 
     def _on_follow_toggled(self, enabled: bool) -> None:
@@ -3299,10 +3304,17 @@ class MainWindow(QMainWindow):
             self.bandwidth_combo.setEnabled(False)
             self.bandwidth_combo.hide()
             self.bandwidth_row_label.hide()
+        timing_effects = []
+        if spec.nplc_values:
+            timing_effects.append("NPLC 越高，积分越久")
+        if spec.ac_bandwidths_hz:
+            timing_effects.append("较低交流响应带宽可能延长响应和稳定时间")
+        if spec.analog_filter:
+            timing_effects.append("启用模拟滤波可能增加稳定等待")
+        timing_effects.append("若启用自动零点，额外内部测量可能增加耗时")
         self.measurement_speed_help.setText(
-            f"{spec.label}：积分时间由 NPLC 控制；较高 NPLC 通常延长单次读数时间。"
-            if spec.nplc_values else
-            f"{spec.label}：交流响应由带宽档位控制；较低带宽更慢，通常更利于抑制噪声。"
+            f"{spec.label}：{'；'.join(timing_effects)}，这些因素都可能拉长实测采样间隔。"
+            "软件目标间隔只是仪器读数完成后的额外等待；实际间隔还包括仪器转换和串口通信耗时。"
         )
         self.analog_filter_check.setVisible(spec.analog_filter)
         self.analog_filter_check.setEnabled(spec.analog_filter)

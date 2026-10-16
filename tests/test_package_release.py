@@ -520,6 +520,7 @@ def test_source_archive_includes_first_run_windows_launchers():
         "run_web.bat",
         "scripts/launch_windows.py",
         "scripts/generate_demo.py",
+        "docs/release-notes-v1.0.3.md",
         "docs/release-notes-v1.0.2.md",
         "docs/release-notes-v1.0.1.md",
     } <= set(REQUIRED_ARCHIVE_PATHS)
@@ -559,6 +560,15 @@ def test_release_workflow_stages_and_verifies_both_publications():
     assert workflow.index("--draft=false") < workflow.index("release_publication.py release")
     assert 'throw "GitHub Release lookup failed' in workflow
     assert 'throw "GitHub Release asset upload failed' in workflow
+
+
+def test_release_workflow_runs_web_frontend_tests_with_a_one_minute_limit():
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+    marker = "- name: Run Web frontend JavaScript tests (60-second limit)"
+    assert marker in workflow
+    step = workflow.split(marker, 1)[1].split("      - name:", 1)[0]
+    assert "node --test --test-timeout=15000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs" in step
+    assert "timeout-minutes: 1" in step
 
 
 def test_source_archive_includes_python311_dependency_lock():

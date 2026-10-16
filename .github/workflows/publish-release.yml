@@ -62,6 +62,14 @@ jobs:
         run: python scripts/release_metadata.py --ref-type $env:GITHUB_REF_TYPE --ref-name $env:GITHUB_REF_NAME --sha $env:GITHUB_SHA
         shell: pwsh
 
+      - name: Run Web frontend JavaScript tests (60-second limit)
+        run: |
+          node --version
+          node --test --test-timeout=15000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Web frontend JavaScript tests failed (exit $LASTEXITCODE)." }
+        shell: pwsh
+        timeout-minutes: 1
+
       - name: Install locked test environment
         run: |
           python -m pip install --disable-pip-version-check -r requirements-lock.txt

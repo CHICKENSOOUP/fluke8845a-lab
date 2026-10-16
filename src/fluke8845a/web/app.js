@@ -8,7 +8,7 @@ const ui = {
 };
 const app = {
   meta: null, state: null, points: [], latestInvalidPoint: null, imported: null, generation: null, lastSample: 0, lastLog: 0,
-  modes: new Map(), selectedMode: "DCV", baseline: null, baselineByMode: new Map(), dcvInputImpedanceAuto: false, toastTimer: 0, pollTimer: 0,
+  modes: new Map(), selectedMode: "DCV", baseline: null, baselineByMode: new Map(), dcvInputImpedanceAuto: false, toastTimer: 0, pollTimer: 0, pollInFlight: false,
   portDescriptions: new Map(),
   importedEvents: null, importedExperimentId: null, importedFileName: "", chartEventHits: [], hoveredEventIndex: null, selectedEventIndex: null,
   chartFramePending: false, pointerFramePending: false, pointIndexCache: null,
@@ -148,11 +148,12 @@ function populateModeOptions(spec) {
     supportedTiming.push("交流响应带宽");
   }
   const timingEffects = [];
-  if (spec.nplc.length) timingEffects.push("NPLC 越高，积分越久，实测间隔通常越长");
-  if (spec.bandwidths.length) timingEffects.push("交流响应带宽会影响稳定时间和噪声");
-  if (spec.analog_filter) timingEffects.push("启用模拟滤波可能增加读数等待时间");
-  timingEffects.push("自动零点会增加一次内部测量时间");
-  const timingHint = `${supportedTiming.length ? `当前模式可调${supportedTiming.join("与")}。采集前用“应用仪器参数”；采集中调整后用“应用速度”。` : "当前模式没有可调的积分时间或交流响应带宽。"}${timingEffects.length ? ` ${timingEffects.join("；")}；软件目标间隔仅表示额外等待时间。` : ""}`;
+  if (spec.nplc.length) timingEffects.push("NPLC 越高，积分越久，实测采样间隔通常越长");
+  if (spec.bandwidths.length) timingEffects.push("交流响应带宽会影响稳定时间和噪声，较低带宽可能拉长实测采样间隔");
+  if (spec.analog_filter) timingEffects.push("启用模拟滤波可能增加稳定等待并拉长实测采样间隔");
+  timingEffects.push("若启用自动零点，额外内部测量可能拉长实测采样间隔");
+  timingEffects.push("软件目标间隔仅是仪器读数完成后的额外等待；实测采样间隔还包括仪器转换和串口通信耗时");
+  const timingHint = `${supportedTiming.length ? `当前模式可调${supportedTiming.join("与")}。采集前用“应用仪器参数”；采集中调整后用“应用速度”。` : "当前模式没有可调的积分时间或交流响应带宽。"} ${timingEffects.join("；")}。`;
   html += `<p id="modeParameterHint" class="mode-parameter-hint" aria-live="polite">${timingHint}</p>`;
   if (spec.analog_filter) html += `<label class="option-check"><input id="analogFilter" type="checkbox"> 启用直流模拟滤波</label>`;
   if (spec.input_impedance_auto) html += `<label class="option-check" title="默认关闭为10 MΩ。启用后仅在100 mV、1 V、10 V DCV量程使用大于10 GΩ的输入阻抗，其他量程仍为10 MΩ。"><input id="inputImpedanceAuto" type="checkbox" ${app.dcvInputImpedanceAuto ? "checked" : ""}> 自动高输入阻抗（仅DCV）</label><p class="field-hint">仅100 mV、1 V、10 V量程可用，启用时输入阻抗大于10 GΩ。</p>`;
@@ -170,7 +171,8 @@ function populateModeOptions(spec) {
   });
   el("range").addEventListener("change", () => { clearSafetyConfirmation(); clearPreflightSummary(); renderSettingsComparison(app.state); updateCurrentRangeGuidance(app.state); });
   for (const id of ["nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "autozero"]) {
-    el(id).addEventListener("change", () => { clearPreflightSummary(); renderSettingsComparison(app.state); });
+    const control = el(id);
+    if (control) control.addEventListener("change", () => { clearPreflightSummary(); renderSettingsComparison(app.state); });
   }
   ui.safety.textContent = spec.safety;
   const diagram = el("terminalDiagram");
@@ -786,6 +788,8 @@ function appendSampleRows(rows) {
 }
 
 async function pollState() {
+  if (app.pollInFlight) return;
+  app.pollInFlight = true;
   const parameters = new URLSearchParams({ since_sample: String(app.lastSample), since_log: String(app.lastLog) });
   if (app.generation !== null) parameters.set("generation", String(app.generation));
   try {
@@ -822,6 +826,8 @@ async function pollState() {
     updateStats();
   } catch (error) {
     setServiceStatus(false, error.message);
+  } finally {
+    app.pollInFlight = false;
   }
 }
 
@@ -2448,7 +2454,7 @@ function bindControls() {
   });
   el("baselineClear").addEventListener("click", () => { setActiveBaseline(null); el("baselineValue").value = ""; updateBaseline(null, activeMode()?.unit || ""); });
   el("shutdownService").addEventListener("click", async () => {
-    if (!window.confirm("退出会先停止采集、保存并关闭当前实验，然后关闭 localhost 服务。继续？")) return;
+    if (!window.confirm("退出会先停止采集、保存并关闭当前实验，然后关闭 localhost 服务。关闭网页标签页不会停止采集或服务；它们会继续运行。确定退出服务？")) return;
     await command("shutdown");
   });
   ui.confirm.addEventListener("change", () => { if (ui.confirm.checked) toast("接线确认仅记录你的人工核对；软件无法检测插孔、保险丝或外部回路"); });

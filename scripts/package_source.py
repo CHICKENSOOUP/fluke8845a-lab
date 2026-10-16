@@ -72,6 +72,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/licenses/third-party/pyserial-3.5-LICENSE.txt",
     "docs/hardware-validation.md",
     "docs/release-notes-v1.0.2.md",
+    "docs/release-notes-v1.0.3.md",
     "docs/release-notes-v1.0.1.md",
     "docs/releasing.md",
     "requirements-lock.txt",

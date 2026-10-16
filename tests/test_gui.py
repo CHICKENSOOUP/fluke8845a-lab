@@ -2344,6 +2344,13 @@ def test_gui_exposes_only_parameters_supported_by_selected_mode(qt_app, monkeypa
         window._load_mode_controls(mode)
         spec = DESCRIPTORS[mode]
 
+        speed_help = window.measurement_speed_help.text()
+        assert "实测采样间隔" in speed_help
+        assert "自动零点" in speed_help
+        assert "软件目标间隔" in speed_help
+        assert ("NPLC" in speed_help) is bool(spec.nplc_values)
+        assert ("模拟滤波" in speed_help) is bool(spec.analog_filter)
+        assert ("交流响应带宽" in speed_help) is bool(spec.ac_bandwidths_hz)
         assert window.nplc_combo.isHidden() is (not bool(spec.nplc_values))
         assert window.nplc_combo.isEnabled() is bool(spec.nplc_values)
         if spec.nplc_values:
@@ -2631,15 +2638,33 @@ def test_wheel_zoom_modifier_mapping(modifiers, expected):
     assert gui_module._wheel_zoom_axes(modifiers) == expected
 
 
-def test_manual_vertical_zoom_keeps_live_follow_but_time_zoom_stops_it(qt_app, monkeypatch, tmp_path):
+def test_manual_zoom_on_either_axis_stops_live_follow(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
         window.follow_check.setChecked(True)
         window._on_plot_wheel_zoom(False, True)
-        assert window.follow_check.isChecked()
+        assert not window.follow_check.isChecked()
         window._on_plot_wheel_zoom(True, False)
         assert not window.follow_check.isChecked()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("axes", "expected_follow"),
+    [([True, False], False), ([False, True], True)],
+)
+def test_manual_drag_stops_live_follow_only_when_time_axis_moves(
+    qt_app, monkeypatch, tmp_path, axes, expected_follow
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.follow_check.setChecked(True)
+        window.view_box.sigRangeChangedManually.emit(axes)
+        assert window.follow_check.isChecked() is expected_follow
     finally:
         window.close()
         qt_app.processEvents()
@@ -2650,8 +2675,7 @@ def test_live_follow_guidance_explains_axis_behavior_and_highlights_return(qt_ap
     window = MainWindow()
     try:
         guidance = f"{window.acquisition_hint.text()} {window.chart_gesture_help.text()}"
-        assert "仅缩放读数轴不会停止自动跟随" in guidance
-        assert "缩放或平移时间轴会停止自动跟随" in guidance
+        assert "手动缩放任一坐标轴或平移时间轴会停止自动跟随" in guidance
         assert "回到实时窗口" in guidance
         assert window.return_live_button.objectName() == "primaryButton"
     finally:
