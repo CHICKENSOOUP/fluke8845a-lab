@@ -537,7 +537,10 @@ def test_source_archive_includes_automated_release_workflow_and_guide():
 
 def test_release_workflow_stages_and_verifies_both_publications():
     workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+    oras_arguments = workflow.split("$orasArguments = @(\n", 1)[1].split("\n          )", 1)[0]
     assert workflow.index("GitHub draft Release creation failed before GHCR publish") < workflow.index('"push",')
+    assert '"push",' in oras_arguments
+    assert '"--disable-path-validation"' in oras_arguments
     assert workflow.index("release_publication.py package") < workflow.index("--draft=false")
     assert workflow.index("--draft=false") < workflow.index("release_publication.py release")
     assert 'throw "GitHub Release lookup failed' in workflow
