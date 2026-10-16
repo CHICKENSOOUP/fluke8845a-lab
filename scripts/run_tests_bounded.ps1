@@ -28,18 +28,24 @@ if ($LASTEXITCODE -ne 0) {
 $buildDirectory = Join-Path $repositoryRoot "build"
 New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
 $runId = [guid]::NewGuid().ToString("N")
-$baseTemp = Join-Path $buildDirectory ("pytest-bounded-" + $runId)
 $stdoutPath = Join-Path $buildDirectory ("pytest-bounded-" + $runId + ".stdout.log")
 $stderrPath = Join-Path $buildDirectory ("pytest-bounded-" + $runId + ".stderr.log")
 
 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
 $startInfo.FileName = $PythonPath
-$startInfo.Arguments = '-m pytest -p no:cacheprovider --basetemp "{0}"' -f $baseTemp
+$runnerPath = Join-Path $repositoryRoot "scripts\run_tests_sharded.py"
+$shardLogRoot = Join-Path $buildDirectory "pytest-shards"
+$startInfo.Arguments = '"{0}" --python "{1}" --timeout-seconds 45 --output-root "{2}"' -f $runnerPath, $PythonPath, $shardLogRoot
 $startInfo.WorkingDirectory = $repositoryRoot
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
+$pythonPathEntries = @((Join-Path $repositoryRoot "src"))
+if (-not [string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+    $pythonPathEntries += $env:PYTHONPATH
+}
+$startInfo.EnvironmentVariables["PYTHONPATH"] = $pythonPathEntries -join [System.IO.Path]::PathSeparator
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $startInfo
 [void]$process.Start()
@@ -62,7 +68,7 @@ Write-Output $stdout
 Write-Output $stderr
 
 if ($timedOut) {
-    Write-Output "pytest exceeded the 55-second limit; test process tree was stopped."
+    Write-Output "The complete pytest shard suite exceeded the 50-second wrapper limit; test process tree was stopped."
     exit 124
 }
 if (-not $process.HasExited) {

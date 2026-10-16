@@ -38,7 +38,8 @@ jobs:
       - name: Run Python 3.11 tests (60-second limit)
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python -m pytest -p no:cacheprovider --maxfail=1 --basetemp "build\pytest-release-py311"
+          python scripts/run_tests_sharded.py --timeout-seconds 50 --output-root "build\pytest-shards-py311"
+          if ($LASTEXITCODE -ne 0) { throw "Python 3.11 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
         timeout-minutes: 1
 
@@ -57,6 +58,10 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-lock.txt
 
+      - name: Validate versioned release identity
+        run: python scripts/release_metadata.py --ref-type $env:GITHUB_REF_TYPE --ref-name $env:GITHUB_REF_NAME --sha $env:GITHUB_SHA
+        shell: pwsh
+
       - name: Install locked test environment
         run: |
           python -m pip install --disable-pip-version-check -r requirements-lock.txt
@@ -66,13 +71,18 @@ jobs:
       - name: Run tests (60-second limit)
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python -m pytest -p no:cacheprovider --maxfail=1 --basetemp "build\pytest-release"
+          python scripts/run_tests_sharded.py --timeout-seconds 50 --output-root "build\pytest-shards-py312"
+          if ($LASTEXITCODE -ne 0) { throw "Python 3.12 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
         timeout-minutes: 1
 
       - name: Build and verify source package
         run: |
-          python scripts/package_source.py --output dist/Fluke8845A_Source_Project.zip
+          New-Item -ItemType Directory -Path "build" -Force | Out-Null
+          python scripts/build_provenance.py source --root . --candidate-build-name Fluke8845A --output build/BUILD-PROVENANCE.json
+          if ($LASTEXITCODE -ne 0) { throw "Source provenance generation failed (exit $LASTEXITCODE)." }
+          python scripts/package_source.py --output dist/Fluke8845A_Source_Project.zip --provenance build/BUILD-PROVENANCE.json
+          if ($LASTEXITCODE -ne 0) { throw "Source package creation failed (exit $LASTEXITCODE)." }
           $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  Fluke8845A_Source_Project.zip" | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
@@ -100,56 +110,21 @@ jobs:
         with:
           version: 1.2.2
 
-      - name: Publish source package to GitHub Packages (GHCR)
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $repoPath = $env:GITHUB_REPOSITORY.ToLowerInvariant()
-          $package = "ghcr.io/$repoPath-source"
-
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $packageTag = $env:GITHUB_REF_NAME.ToLowerInvariant()
-          } else {
-            $packageTag = "main-build-$($env:GITHUB_SHA.Substring(0, 12))"
-          }
-
-          $packageReference = "${package}:$packageTag"
-          $env:GHCR_TOKEN | oras login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
-          if ($LASTEXITCODE -ne 0) { throw "GHCR login failed (exit $LASTEXITCODE)." }
-
-          $orasArguments = @(
-            "push",
-            "--artifact-type", "application/vnd.fluke8845a.source-bundle.v1",
-            "--annotation", "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY",
-            "--annotation", "org.opencontainers.image.description=Fluke 8845A source ZIP and SHA-256 checksum",
-            $packageReference,
-            "dist/Fluke8845A_Source_Project.zip:application/zip",
-            "dist/SHA256SUMS.txt:text/plain"
-          )
-          & oras @orasArguments
-          if ($LASTEXITCODE -ne 0) { throw "GHCR package publication failed (exit $LASTEXITCODE)." }
-
-          Write-Host "Published OCI source package $packageReference"
-        shell: pwsh
-
-      - name: Publish commit-specific GitHub Release
+      - name: Publish and verify matching Release and GHCR package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
           $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
           $checksums = Join-Path $env:GITHUB_WORKSPACE "dist\SHA256SUMS.txt"
+          $manifestPath = Join-Path $env:RUNNER_TEMP ("ghcr-manifest-" + [guid]::NewGuid().ToString("N") + ".json")
+          $releasePath = Join-Path $env:RUNNER_TEMP ("github-release-" + [guid]::NewGuid().ToString("N") + ".json")
           $sha = $env:GITHUB_SHA
-
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $tag = $env:GITHUB_REF_NAME
-            $title = "Fluke 8845A Lab $tag"
-            $prerelease = $false
-          } else {
-            $tag = "main-build-$($sha.Substring(0, 12))"
-            $title = "Fluke 8845A Lab main build $($sha.Substring(0, 7))"
-            $prerelease = $true
-          }
+          $metadata = (python scripts/release_metadata.py --ref-type $env:GITHUB_REF_TYPE --ref-name $env:GITHUB_REF_NAME --sha $sha | ConvertFrom-Json)
+          $tag = $metadata.tag
+          $title = $metadata.title
+          $prerelease = [bool]$metadata.prerelease
 
           $notes = @"
           Automated source-only package for commit $sha.
@@ -159,14 +134,77 @@ jobs:
           A Windows binary is omitted while the documented Qt/PySide licensing review remains open.
           "@
 
-          gh release view $tag --repo $repo *> $null
-          $exists = $LASTEXITCODE -eq 0
-          if ($exists) {
-            gh release upload $tag $archive $checksums --repo $repo --clobber
-          } else {
-            $ghArguments = @("release", "create", $tag, $archive, $checksums, "--repo", $repo, "--title", $title, "--notes", $notes, "--target", $sha)
+          $viewOutput = & gh release view $tag --repo $repo --json tagName,isDraft,isPrerelease,assets 2>&1
+          $viewExitCode = $LASTEXITCODE
+          $wasDraft = $false
+          if ($viewExitCode -eq 0) {
+            try { $existingRelease = ($viewOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw "GitHub Release lookup returned invalid JSON: $($viewOutput -join "`n")" }
+            if ($existingRelease.tagName -ne $tag) { throw "GitHub Release lookup returned a different tag." }
+            $wasDraft = [bool]$existingRelease.isDraft
+            & gh release upload $tag $archive $checksums --repo $repo --clobber
+            $uploadExitCode = $LASTEXITCODE
+            if ($uploadExitCode -ne 0) { throw "GitHub Release asset upload failed (exit $uploadExitCode)." }
+            $editArguments = @("release", "edit", $tag, "--repo", $repo, "--title", $title, "--notes", $notes)
+            if ($prerelease) { $editArguments += "--prerelease" }
+            & gh @editArguments
+            $editExitCode = $LASTEXITCODE
+            if ($editExitCode -ne 0) { throw "GitHub Release metadata update failed (exit $editExitCode)." }
+            if (-not $wasDraft) {
+              Write-Host "The versioned GitHub Release already exists; refreshing it before package verification."
+            }
+          } elseif (($viewOutput -join "`n") -match "(?i)(HTTP\s*404|\b404\b|not found)" ) {
+            # Creating the draft first proves contents:write before the public GHCR tag is changed.
+            $ghArguments = @("release", "create", $tag, $archive, $checksums, "--repo", $repo, "--title", $title, "--notes", $notes, "--target", $sha, "--draft")
             if ($prerelease) { $ghArguments += "--prerelease" } else { $ghArguments += "--verify-tag" }
-            gh @ghArguments
+            & gh @ghArguments
+            $createExitCode = $LASTEXITCODE
+            if ($createExitCode -ne 0) { throw "GitHub draft Release creation failed before GHCR publish (exit $createExitCode)." }
+            $wasDraft = $true
+          } else {
+            throw "GitHub Release lookup failed (exit $viewExitCode); refusing to publish GHCR without a verified Release identity. $($viewOutput -join "`n")"
           }
-          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed (exit $LASTEXITCODE)." }
+
+          $repoPath = $env:GITHUB_REPOSITORY.ToLowerInvariant()
+          $package = "ghcr.io/$repoPath-source"
+          $packageReference = "${package}:$($metadata.tag.ToLowerInvariant())"
+          $env:GHCR_TOKEN | oras login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
+          $loginExitCode = $LASTEXITCODE
+          if ($loginExitCode -ne 0) { throw "GHCR login failed (exit $loginExitCode)." }
+
+          $orasArguments = @(
+            "push",
+            "--artifact-type", "application/vnd.fluke8845a.source-bundle.v1",
+            "--annotation", "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY",
+            "--annotation", "org.opencontainers.image.description=Fluke 8845A source ZIP and SHA-256 checksum",
+            $packageReference,
+            "${archive}:application/zip",
+            "${checksums}:text/plain"
+          )
+          & oras @orasArguments
+          $pushExitCode = $LASTEXITCODE
+          if ($pushExitCode -ne 0) { throw "GHCR package publication failed (exit $pushExitCode); the GitHub Release remains a draft if newly created." }
+
+          $manifestJson = & oras manifest fetch $packageReference --format json
+          $manifestExitCode = $LASTEXITCODE
+          if ($manifestExitCode -ne 0) { throw "GHCR tag fetch failed for $packageReference (exit $manifestExitCode)." }
+          $manifestJson | Set-Content -LiteralPath $manifestPath -Encoding utf8
+          & python scripts/release_publication.py package --json $manifestPath --archive $archive --checksums $checksums
+          if ($LASTEXITCODE -ne 0) { throw "GHCR package contents do not match the source ZIP and checksum." }
+
+          if ($wasDraft) {
+            & gh release edit $tag --repo $repo --draft=false
+            $publishExitCode = $LASTEXITCODE
+            if ($publishExitCode -ne 0) { throw "GitHub draft Release publication failed after GHCR verification (exit $publishExitCode)." }
+          }
+
+          $finalReleaseJson = & gh release view $tag --repo $repo --json tagName,isDraft,isPrerelease,assets
+          $finalViewExitCode = $LASTEXITCODE
+          if ($finalViewExitCode -ne 0) { throw "Final GitHub Release verification failed for $tag (exit $finalViewExitCode)." }
+          $finalReleaseJson | Set-Content -LiteralPath $releasePath -Encoding utf8
+          $expectedChannel = if ($prerelease) { "true" } else { "false" }
+          & python scripts/release_publication.py release --json $releasePath --tag $tag --prerelease $expectedChannel --archive $archive --checksums $checksums
+          if ($LASTEXITCODE -ne 0) { throw "Final Release assets/status do not match the validated GHCR package." }
+
+          Write-Host "Verified matching GitHub Release and GHCR package: $tag"
         shell: pwsh

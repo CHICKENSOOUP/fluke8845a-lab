@@ -78,12 +78,37 @@ def _copy_license_tree(
     return copied
 
 
+def _native_binary_family(path: Path) -> str:
+    relative = path.as_posix().casefold()
+    basename = path.name.casefold()
+    if basename.startswith(("msvcp", "vcruntime", "concrt", "ucrtbase", "api-ms-win-crt")):
+        return "Microsoft Visual C++ runtime"
+    if "pyside6" in relative or "shiboken6" in relative or basename.startswith(("qt6", "pyside6", "shiboken6")):
+        return "Qt/PySide/Shiboken"
+    if "numpy" in relative or basename.startswith(("libopenblas", "openblas")):
+        return "NumPy/OpenBLAS"
+    if "openssl" in relative or basename.startswith(("libcrypto", "libssl")):
+        return "OpenSSL"
+    if "nuitka" in relative:
+        return "Nuitka"
+    if basename in {"fluke8845a.exe", "fluke8845a-web.exe"}:
+        return "Fluke8845A application executable"
+    if basename.startswith("libffi-"):
+        return "CPython libffi dependency"
+    if path.suffix.casefold() == ".pyd":
+        return "CPython extension module"
+    if "python" in relative or basename.startswith("python"):
+        return "CPython"
+    return "unclassified; review required"
+
+
 def collect_runtime_license_materials(
     *,
     python_root: Path,
     site_packages: Path,
     project_root: Path,
     output_root: Path,
+    binary_root: Path,
     python_version: str,
 ) -> Path:
     """Copy bundled-runtime notices and write a content-addressed manifest."""
@@ -91,7 +116,8 @@ def collect_runtime_license_materials(
     site_packages = site_packages.resolve()
     project_root = project_root.resolve()
     output_root = output_root.resolve()
-    for label, path in (("Python runtime", python_root), ("site-packages", site_packages), ("project", project_root)):
+    binary_root = binary_root.resolve()
+    for label, path in (("Python runtime", python_root), ("site-packages", site_packages), ("project", project_root), ("frozen binary root", binary_root)):
         if not path.is_dir():
             raise ValueError(f"{label} directory does not exist: {path}")
 
@@ -112,6 +138,27 @@ def collect_runtime_license_materials(
             _copy_file(cet_license, target, "pyqtgraph CET color maps", "pyqtgraph/colors/maps/CC-BY license - applies to CET color map data.txt", records)
             copied.append(target.as_posix())
         components.append({"name": metadata["name"], "version": metadata["version"], "license_files": copied})
+
+    qt_for_python_license = licenses_root / "qt-for-python" / "LGPL-3.0.txt"
+    _copy_file(
+        project_root / "docs" / "licenses" / "LGPL-3.0.txt",
+        qt_for_python_license,
+        "Qt for Python planned LGPLv3 path",
+        "docs/licenses/LGPL-3.0.txt (planned path; not a legal clearance)",
+        records,
+    )
+    for name in ("PySide6_Essentials", "shiboken6"):
+        distribution, metadata = _distribution(site_packages, name)
+        copied = _copy_license_tree(distribution, licenses_root / name.casefold(), name, records)
+        copied.append(qt_for_python_license.as_posix())
+        components.append({
+            "name": metadata["name"],
+            "version": metadata["version"],
+            "declared_license": metadata.get("license", ""),
+            "declared_license_file": metadata.get("license-file", ""),
+            "planned_license_path": "LGPL-3.0-only; review remains open",
+            "license_files": copied,
+        })
 
     pyserial_distribution, pyserial_metadata = _distribution(site_packages, "pyserial")
     if pyserial_metadata["version"] != "3.5":
@@ -154,6 +201,18 @@ def collect_runtime_license_materials(
         nuitka_copied.append(target.as_posix())
     components.append({"name": "Nuitka runtime library", "version": nuitka_metadata["version"], "license_files": nuitka_copied})
 
+    native_binaries = []
+    for binary in sorted(path for path in binary_root.rglob("*") if path.is_file() and path.suffix.casefold() in {".dll", ".pyd", ".exe"}):
+        data = binary.read_bytes()
+        native_binaries.append({
+            "path": binary.relative_to(binary_root).as_posix(),
+            "family": _native_binary_family(binary.relative_to(binary_root)),
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest().upper(),
+        })
+    if not native_binaries:
+        raise ValueError(f"No Windows native binaries found under {binary_root}")
+
     for record in records:
         record["path"] = Path(record["path"]).relative_to(output_root).as_posix()
     for component in components:
@@ -167,6 +226,8 @@ def collect_runtime_license_materials(
         "review_status": "partial; see docs/licenses/windows-portable-review-2026-10-15.md",
         "components": components,
         "license_files": sorted(records, key=lambda row: row["path"]),
+        "native_binary_scope": "All .dll, .pyd, and .exe files present in the frozen application directory at collection time; family labels are inventory hints, not license conclusions.",
+        "native_binaries": native_binaries,
         "known_open_items": [
             "Qt/PySide module and third-party notices require final exact-bundle review.",
             "Microsoft Visual C++ redistribution source and applicable license terms require confirmation.",
@@ -182,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--site-packages", type=Path, required=True)
     parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--output-root", type=Path, required=True, help="destination docs/licenses directory inside the build")
+    parser.add_argument("--binary-root", type=Path, required=True, help="complete frozen application .dist directory")
     parser.add_argument("--python-version", required=True)
     args = parser.parse_args(argv)
     try:
@@ -190,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             site_packages=args.site_packages,
             project_root=args.project_root,
             output_root=args.output_root,
+            binary_root=args.binary_root,
             python_version=args.python_version,
         )
     except (OSError, ValueError) as exc:

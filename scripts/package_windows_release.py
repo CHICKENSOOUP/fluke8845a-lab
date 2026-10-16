@@ -16,8 +16,21 @@ from urllib.request import Request, urlopen
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.archive_paths import ensure_path_within, ensure_regular_file_within
+from scripts.build_provenance import (
+    BUILD_PROVENANCE_NAME,
+    WINDOWS_ARCHIVE_SUFFIX,
+    candidate_name_from_archive,
+    validate_provenance,
+    validate_windows_archive_provenance,
+)
+from scripts.package_source import validate_packaged_web_resources, validate_web_archive_resources
+
+
 DIST = ROOT / "dist"
 APP_DIST = DIST / "Fluke8845A.dist"
 ARCHIVE = DIST / "Fluke8845A_Windows_x64.zip"
@@ -30,9 +43,11 @@ REQUIRED_ENTRIES = {
     "Fluke8845A-Web.dist/fluke8845a/web/index.html",
     "Fluke8845A-Web.dist/fluke8845a/web/app.css",
     "Fluke8845A-Web.dist/fluke8845a/web/app.js",
+    "Fluke8845A-Web.dist/fluke8845a/web/history_worker.js",
     "README.md",
     "LICENSE",
     "THIRD-PARTY-NOTICES.md",
+    BUILD_PROVENANCE_NAME,
     "docs/user-guide.md",
     "docs/hardware-validation.md",
     "docs/qt-licensing-and-third-party-notices.md",
@@ -109,14 +124,19 @@ def validate_portable_runtime_components(entries: set[str]) -> None:
         raise ValueError("Portable package contains unused Qt PDF components: " + ", ".join(unexpected))
 
 
-def validate_runtime_license_manifest(manifest: dict, license_contents: dict[str, bytes]) -> None:
+def validate_runtime_license_manifest(
+    manifest: dict,
+    license_contents: dict[str, bytes],
+    native_binary_contents: dict[str, bytes] | None = None,
+) -> None:
     """Require copied license texts to match the collector's content-addressed manifest."""
     if not isinstance(manifest, dict):
         raise ValueError("Runtime license manifest is not a JSON object")
     if manifest.get("format_version") != 1 or not manifest.get("python_runtime_version"):
         raise ValueError("Runtime license manifest has an unsupported format or no Python runtime version")
     required_components = {
-        "CPython", "numpy", "pyqtgraph", "pyserial", "OpenSSL", "Nuitka runtime library",
+        "CPython", "numpy", "pyqtgraph", "PySide6_Essentials", "shiboken6",
+        "pyserial", "OpenSSL", "Nuitka runtime library",
     }
     components = manifest.get("components")
     if not isinstance(components, list):
@@ -124,6 +144,25 @@ def validate_runtime_license_manifest(manifest: dict, license_contents: dict[str
     component_names = {entry.get("name") for entry in components if isinstance(entry, dict)}
     if not required_components <= component_names:
         raise ValueError("Runtime license manifest omits components: " + ", ".join(sorted(required_components - component_names)))
+    qt_components = {
+        entry.get("name"): entry
+        for entry in components
+        if isinstance(entry, dict) and entry.get("name") in {"PySide6_Essentials", "shiboken6"}
+    }
+    for name, component in qt_components.items():
+        declared_license = str(component.get("declared_license", ""))
+        planned_license = str(component.get("planned_license_path", ""))
+        expected_files = {
+            f"third-party/{name.casefold()}/LicenseRef-Qt-Commercial.txt",
+            "third-party/qt-for-python/LGPL-3.0.txt",
+        }
+        component_files = component.get("license_files")
+        if not declared_license or "LGPL-3.0-only" not in declared_license:
+            raise ValueError(f"Runtime license manifest omits the declared license expression for {name}")
+        if "LGPL-3.0-only" not in planned_license or "review remains open" not in planned_license.casefold():
+            raise ValueError(f"Runtime license manifest must keep the planned license path open for review: {name}")
+        if not isinstance(component_files, list) or not expected_files <= set(component_files):
+            raise ValueError(f"Runtime license manifest is missing required license files for {name}")
 
     records = manifest.get("license_files")
     if not isinstance(records, list) or not records:
@@ -152,8 +191,51 @@ def validate_runtime_license_manifest(manifest: dict, license_contents: dict[str
             raise ValueError("Runtime license manifest contains an invalid component entry")
         if not set(component["license_files"]) <= record_paths:
             raise ValueError(f"Runtime license files for {component.get('name')} are not covered by the file manifest")
+    if native_binary_contents is not None:
+        native_records = manifest.get("native_binaries")
+        if not isinstance(native_records, list) or not native_records:
+            raise ValueError("Runtime manifest does not list native binaries from this build")
+        native_paths: set[str] = set()
+        for record in native_records:
+            if not isinstance(record, dict):
+                raise ValueError("Runtime manifest contains an invalid native binary record")
+            value = str(record.get("path", ""))
+            relative = PurePosixPath(value)
+            raw_parts = value.split("/")
+            if (
+                "\\" in value or ":" in value or relative.is_absolute()
+                or any(part in {"", ".", ".."} for part in raw_parts)
+                or not relative.parts
+            ):
+                raise ValueError(f"Runtime manifest contains an unsafe native binary path: {value}")
+            if relative.suffix.casefold() not in {".dll", ".pyd", ".exe"}:
+                raise ValueError(f"Runtime manifest contains an unsupported native binary type: {value}")
+            if not isinstance(record.get("family"), str) or not record["family"].strip():
+                raise ValueError(f"Runtime manifest does not classify native binary for review: {value}")
+            if "unclassified" in record["family"].casefold():
+                raise ValueError(f"Native binary family is unclassified and requires review: {value}")
+            path = relative.as_posix()
+            if path in native_paths:
+                raise ValueError(f"Runtime manifest repeats a native binary path: {path}")
+            native_paths.add(path)
+            data = native_binary_contents.get(path)
+            if data is None or len(data) != record.get("bytes"):
+                raise ValueError(f"Native binary inventory does not match the package: {path}")
+            digest = hashlib.sha256(data).hexdigest().upper()
+            if digest != str(record.get("sha256", "")).upper():
+                raise ValueError(f"Runtime native binary SHA-256 does not match the package: {path}")
+        if native_paths != set(native_binary_contents):
+            raise ValueError("Native binary inventory does not match the package file set")
+        review_status = str(manifest.get("review_status", "")).casefold()
+        if not review_status.startswith("partial") or not manifest.get("known_open_items"):
+            raise ValueError("Binary package manifest must preserve the unapproved review status and open items")
     if not manifest.get("known_open_items"):
         raise ValueError("Runtime license manifest must preserve known open review items")
+    if not any(
+        isinstance(item, str) and "qt/pyside" in item.casefold() and "exact-bundle review" in item.casefold()
+        for item in manifest["known_open_items"]
+    ):
+        raise ValueError("Runtime license manifest must preserve the Qt/PySide review item")
 
 
 def verify_extracted_portable_release(archive_path: Path, executable_sha256: str) -> None:
@@ -216,9 +298,13 @@ def verify_local_web_release(release_root: Path) -> None:
             raise RuntimeError("Packaged web UI did not start on IPv4 loopback within 12 seconds")
         with urlopen(base_url + "/", timeout=1.0) as response:
             html = response.read().decode("utf-8")
-        if "实时趋势" not in html:
-            raise RuntimeError("Packaged localhost page is missing its measurement dashboard")
-        for asset in ("/app.css", "/app.js"):
+        with urlopen(base_url + "/app.js", timeout=1.0) as response:
+            javascript = response.read().decode("utf-8")
+        try:
+            validate_packaged_web_resources(html, javascript)
+        except ValueError as exc:
+            raise RuntimeError(f"Packaged localhost UI resources are stale or incomplete: {exc}") from exc
+        for asset in ("/app.css",):
             with urlopen(base_url + asset, timeout=1.0) as response:
                 if not response.read(256):
                     raise RuntimeError(f"Packaged localhost asset is empty: {asset}")
@@ -243,20 +329,111 @@ def verify_local_web_release(release_root: Path) -> None:
 
 
 def _release_files(app_dist: Path) -> list[tuple[Path, str]]:
+    app_dist = Path(app_dist).resolve(strict=True)
     files: dict[str, Path] = {}
     for path in sorted(app_dist.rglob("*")):
-        if not path.is_file():
-            continue
         relative = path.relative_to(app_dist).as_posix()
         if any(part in EXCLUDED_PATH_PARTS for part in Path(relative).parts):
             continue
-        files[relative] = path
+        ensure_path_within(path, app_dist)
+        if not path.is_file():
+            continue
+        files[relative] = ensure_regular_file_within(path, app_dist)
 
     for relative in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md"):
         source = ROOT / relative
         if source.is_file():
-            files[relative] = source
+            files[relative] = ensure_regular_file_within(source, ROOT)
     return [(path, name) for name, path in sorted(files.items())]
+
+
+def _copy_release_docs(docs_source: Path, docs_target: Path) -> None:
+    """Copy docs only after validating every file and directory against ROOT."""
+    ensure_path_within(docs_source, ROOT)
+    source_files: dict[str, Path] = {}
+    for source in sorted(docs_source.rglob("*")):
+        relative_path = source.relative_to(docs_source)
+        validated = ensure_path_within(source, ROOT)
+        if source.is_dir():
+            continue
+        if not source.is_file():
+            continue
+        source_files[relative_path.as_posix()] = ensure_regular_file_within(validated, ROOT)
+
+    app_dist = docs_target.parent.resolve(strict=True)
+    if docs_target.exists():
+        ensure_path_within(docs_target, app_dist)
+        generated_runtime_docs = _validated_runtime_license_doc_paths(docs_target, app_dist)
+        existing_files: set[str] = set()
+        for existing in sorted(docs_target.rglob("*")):
+            ensure_path_within(existing, app_dist)
+            if existing.is_file():
+                existing_files.add(existing.relative_to(docs_target).as_posix())
+        stale_files = sorted(existing_files - set(source_files) - generated_runtime_docs)
+        if stale_files:
+            raise ValueError("release docs destination contains stale files: " + ", ".join(stale_files))
+
+    for relative_path, source in source_files.items():
+        destination = docs_target / Path(relative_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def _validated_runtime_license_doc_paths(docs_target: Path, app_dist: Path) -> set[str]:
+    """Preserve only runtime license files verified by their generated manifest."""
+    manifest_relative = "licenses/windows-runtime-license-manifest.json"
+    manifest_path = docs_target / Path(*PurePosixPath(manifest_relative).parts)
+    if not manifest_path.exists():
+        return set()
+
+    ensure_regular_file_within(manifest_path, app_dist)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"runtime license manifest is unreadable: {exc}") from exc
+    records = manifest.get("license_files") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("format_version") != 1
+        or not isinstance(records, list)
+    ):
+        raise ValueError("runtime license manifest is malformed")
+
+    generated = {manifest_relative}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("runtime license manifest contains an invalid license record")
+        value = record.get("path")
+        if not isinstance(value, str):
+            raise ValueError("runtime license manifest contains an invalid license path")
+        relative = PurePosixPath(value)
+        if (
+            not value
+            or "\\" in value
+            or ":" in value
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or not relative.parts
+            or relative.parts[0] != "third-party"
+        ):
+            raise ValueError(f"runtime license manifest contains an unsafe license path: {value}")
+        relative_docs_path = "licenses/" + relative.as_posix()
+        if relative_docs_path in generated:
+            raise ValueError(f"runtime license manifest repeats a license path: {value}")
+        license_path = docs_target / Path(*PurePosixPath(relative_docs_path).parts)
+        data = ensure_regular_file_within(license_path, app_dist).read_bytes()
+        expected_bytes = record.get("bytes")
+        expected_sha256 = record.get("sha256")
+        if (
+            isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes != len(data)
+            or not isinstance(expected_sha256, str)
+            or hashlib.sha256(data).hexdigest().upper() != expected_sha256.upper()
+        ):
+            raise ValueError(f"runtime license manifest does not match {value}")
+        generated.add(relative_docs_path)
+    return generated
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -264,10 +441,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app-dist", type=Path, default=APP_DIST, help="Nuitka .dist directory")
     parser.add_argument("--archive", type=Path, default=ARCHIVE, help="portable ZIP destination under dist/")
     parser.add_argument("--mock-report", type=Path, default=ROOT / MOCK_E2E_REPORT)
+    parser.add_argument("--provenance", type=Path, required=True, help="shared BUILD-PROVENANCE.json for this build")
     args = parser.parse_args(argv)
     app_dist = args.app_dist.resolve()
     archive_path = args.archive.resolve()
     mock_report_path = args.mock_report.resolve()
+    provenance_path = args.provenance.resolve()
     try:
         app_dist.relative_to(DIST.resolve())
         archive_path.relative_to(DIST.resolve())
@@ -282,13 +461,27 @@ def main(argv: list[str] | None = None) -> int:
     if not mock_report_path.is_file():
         print(f"Frozen Mock E2E report not found: {mock_report_path}", file=sys.stderr)
         return 2
+    if not provenance_path.is_file():
+        print(f"Build provenance file not found: {provenance_path}", file=sys.stderr)
+        return 2
+    try:
+        candidate_name = candidate_name_from_archive(archive_path, WINDOWS_ARCHIVE_SUFFIX)
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        validate_provenance(provenance, expected_candidate_build_name=candidate_name)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"Invalid Windows build provenance: {exc}", file=sys.stderr)
+        return 2
 
     docs_source = ROOT / "docs"
     docs_target = app_dist / "docs"
     if not docs_source.is_dir():
         print(f"Documentation directory not found: {docs_source}", file=sys.stderr)
         return 2
-    shutil.copytree(docs_source, docs_target, dirs_exist_ok=True)
+    try:
+        _copy_release_docs(docs_source, docs_target)
+    except (OSError, ValueError) as exc:
+        print(f"Documentation contains an unsafe release path: {exc}", file=sys.stderr)
+        return 2
 
     DIST.mkdir(parents=True, exist_ok=True)
     try:
@@ -297,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
             for source, member in _release_files(app_dist):
                 archive.write(source, member)
             archive.write(mock_report_path, MOCK_E2E_REPORT)
+            archive.writestr(BUILD_PROVENANCE_NAME, provenance_path.read_bytes())
 
         with ZipFile(archive_path, "r") as archive:
             names = set(archive.namelist())
@@ -309,6 +503,11 @@ def main(argv: list[str] | None = None) -> int:
             damaged = archive.testzip()
             if missing:
                 raise RuntimeError("Portable package is missing required files: " + ", ".join(missing))
+            validate_web_archive_resources(
+                archive,
+                "Fluke8845A-Web.dist/fluke8845a/web",
+                ROOT / "src" / "fluke8845a" / "web",
+            )
             validate_portable_runtime_components(names)
             license_manifest = json.loads(archive.read("docs/licenses/windows-runtime-license-manifest.json").decode("utf-8"))
             if not isinstance(license_manifest, dict):
@@ -321,12 +520,28 @@ def main(argv: list[str] | None = None) -> int:
                 for path in (str(record.get("path", "")) for record in license_records if isinstance(record, dict))
                 if "docs/licenses/" + path in names and "\\" not in path
             }
-            validate_runtime_license_manifest(license_manifest, license_contents)
+            native_binary_contents = {
+                name: archive.read(name)
+                for name in names
+                if PurePosixPath(name).suffix.casefold() in {".dll", ".pyd", ".exe"}
+            }
+            validate_runtime_license_manifest(license_manifest, license_contents, native_binary_contents)
             if unsafe:
                 raise RuntimeError("Portable package contains excluded paths or identifiers: " + ", ".join(unsafe))
             if damaged:
                 raise RuntimeError(f"Portable package failed CRC verification at {damaged}")
             exe_hash = hashlib.sha256(archive.read("Fluke8845A.exe")).hexdigest().upper()
+            archived_provenance = json.loads(archive.read(BUILD_PROVENANCE_NAME).decode("utf-8"))
+            validate_windows_archive_provenance(
+                archived_provenance,
+                {
+                    "Fluke8845A.exe": archive.read("Fluke8845A.exe"),
+                    "Fluke8845A-Web.dist/Fluke8845A-Web.exe": archive.read(
+                        "Fluke8845A-Web.dist/Fluke8845A-Web.exe"
+                    ),
+                },
+                expected_candidate_build_name=candidate_name,
+            )
             report = json.loads(archive.read(MOCK_E2E_REPORT).decode("utf-8-sig"))
             validate_mock_e2e_report(report, exe_hash)
     except (OSError, RuntimeError, BadZipFile, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:

@@ -50,6 +50,7 @@ try {
         if ($BuildName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' -or $BuildName.Contains("..")) {
             throw "BuildName must be a short Windows-safe name without path separators."
         }
+        $candidateBuildName = $BuildName
         $outputDirectory = Join-Path $distRoot $BuildName
         $portableArchive = Join-Path $distRoot ($BuildName + "_Windows_x64.zip")
         $sourceArchive = Join-Path $distRoot ($BuildName + "_Source_Project.zip")
@@ -72,6 +73,7 @@ try {
             throw "The standard EXE is running and locked. Save the experiment, close it, or rebuild safely with -SideBySide."
         }
         $outputDirectory = $distRoot
+        $candidateBuildName = "Fluke8845A"
         $portableArchive = Join-Path $distRoot "Fluke8845A_Windows_x64.zip"
         $sourceArchive = Join-Path $distRoot "Fluke8845A_Source_Project.zip"
     }
@@ -94,13 +96,21 @@ try {
     & $python (Join-Path $PSScriptRoot "scripts\create_app_icon_ico.py")
     if ($LASTEXITCODE -ne 0) { throw "Application icon generation failed." }
 
+    $provenanceRunId = [guid]::NewGuid().ToString("N")
+    $sourceDigestPath = Join-Path $PSScriptRoot ("build\source-tree-" + $provenanceRunId + ".sha256")
+    $provenancePath = Join-Path $PSScriptRoot ("build\BUILD-PROVENANCE-" + $provenanceRunId + ".json")
+    & $python (Join-Path $PSScriptRoot "scripts\build_provenance.py") digest `
+        --root $PSScriptRoot `
+        --output $sourceDigestPath
+    if ($LASTEXITCODE -ne 0) { throw "Build provenance source-tree capture failed." }
+
     $pytestRunId = [guid]::NewGuid().ToString("N")
-    $pytestTemp = Join-Path $PSScriptRoot ("build\pytest_temp_" + $pytestRunId)
     $pytestStdoutPath = Join-Path $PSScriptRoot ("build\pytest_build_" + $pytestRunId + ".stdout.log")
     $pytestStderrPath = Join-Path $PSScriptRoot ("build\pytest_build_" + $pytestRunId + ".stderr.log")
     $pytestStartInfo = New-Object System.Diagnostics.ProcessStartInfo
     $pytestStartInfo.FileName = $python
-    $pytestStartInfo.Arguments = '-m pytest -p no:cacheprovider --basetemp "{0}"' -f $pytestTemp
+    $pytestRunner = Join-Path $PSScriptRoot "scripts\run_tests_sharded.py"
+    $pytestStartInfo.Arguments = '"{0}" --python "{1}" --timeout-seconds 45 --output-root "{2}"' -f $pytestRunner, $python, (Join-Path $PSScriptRoot "build\pytest-shards")
     $pytestStartInfo.WorkingDirectory = $PSScriptRoot
     $pytestStartInfo.UseShellExecute = $false
     $pytestStartInfo.CreateNoWindow = $true
@@ -221,6 +231,7 @@ try {
         --site-packages $pythonSitePackages `
         --project-root $PSScriptRoot `
         --output-root (Join-Path $exeDist "docs\licenses") `
+        --binary-root $exeDist `
         --python-version $pythonVersion
     if ($LASTEXITCODE -ne 0) { throw "Windows runtime license collection failed." }
 
@@ -245,14 +256,36 @@ try {
     $mockE2EData | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $mockE2EReport -Encoding utf8
     $mockValidationDirectory = Join-Path $PSScriptRoot "output\mock_validation"
     New-Item -ItemType Directory -Path $mockValidationDirectory -Force | Out-Null
-    $releaseMockE2EReport = Join-Path $mockValidationDirectory "latest_frozen_exe_six_mode_e2e.json"
+    if ($SideBySide) {
+        $releaseMockE2EReport = Join-Path $mockValidationDirectory ($BuildName + "_six_mode_e2e.json")
+        if (Test-Path -LiteralPath $releaseMockE2EReport) {
+            throw "Refusing to overwrite an existing side-by-side Mock report: $releaseMockE2EReport"
+        }
+    } else {
+        $releaseMockE2EReport = Join-Path $mockValidationDirectory "latest_frozen_exe_six_mode_e2e.json"
+    }
     Copy-Item -LiteralPath $mockE2EReport -Destination $releaseMockE2EReport -Force
     $env:PYTHONPATH = $buildPythonPath
 
-    & $python (Join-Path $PSScriptRoot "scripts\package_windows_release.py") --app-dist $exeDist --archive $portableArchive
+    & $python (Join-Path $PSScriptRoot "scripts\build_provenance.py") create `
+        --root $PSScriptRoot `
+        --candidate-build-name $candidateBuildName `
+        --expected-source-digest $sourceDigestPath `
+        --desktop-exe $exe `
+        --web-exe $webExecutable `
+        --output $provenancePath
+    if ($LASTEXITCODE -ne 0) { throw "Build provenance creation failed; sources may have changed during compilation." }
+
+    & $python (Join-Path $PSScriptRoot "scripts\package_windows_release.py") `
+        --app-dist $exeDist `
+        --archive $portableArchive `
+        --mock-report $releaseMockE2EReport `
+        --provenance $provenancePath
     if ($LASTEXITCODE -ne 0) { throw "Portable Windows package creation or verification failed." }
 
-    & $python (Join-Path $PSScriptRoot "scripts\package_source.py") --output $sourceArchive
+    & $python (Join-Path $PSScriptRoot "scripts\package_source.py") `
+        --output $sourceArchive `
+        --provenance $provenancePath
     if ($LASTEXITCODE -ne 0) { throw "Source project archive creation or verification failed." }
 
     Write-Host "Created and smoke-checked $exe"

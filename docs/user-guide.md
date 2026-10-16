@@ -4,11 +4,11 @@
 
 ## 简体中文
 
-版本 1.0.0 · 中文 Windows 桌面应用
+版本 1.0.1 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [README](../README.md) 的步骤安装并启动软件。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
+v1.0.1 是源码发布，不包含预编译 Windows 程序。请按根目录 [README](../README.md) 的步骤安装并启动软件。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时本程序查询 `*IDN?`，只接受设备型号字段为 `8845A` 的 Fluke 仪器；不会重置仪器。
 - **MOCK**：勾选模拟模式后点击“启动MOCK模拟仪器”。状态栏和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
@@ -19,7 +19,7 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 ## 2. 测量模式与安全接线
 
-支持 **DCV、ACV、DCI、ACI、2W电阻、4W电阻**。每个模式单独记住量程、NPLC/交流带宽、模拟滤波和自动零点设置；设置存于当前 Windows 用户配置目录。无关参数显示“不适用”且不能修改。ACV/ACI显示真 RMS 有效值，不是峰值或波形采样数据。
+支持 **DCV、ACV、DCI、ACI、2W电阻、4W电阻**。每个模式单独记住量程、NPLC/交流带宽、适用滤波和自动零点设置；DCV 另可设置自动输入阻抗。设置存于当前 Windows 用户配置目录。无关参数显示“不适用”且不能修改。ACV/ACI显示真 RMS 有效值，不是峰值或波形采样数据。
 
 切换电压、电流或两线/四线电阻接线类别时会显示正确/错误接线示意和确认提示；开始电流或电阻实验前还会再次要求确认。示意图依据官方中文《用户手册》第 4-4、4-9 至 4-11 页的前面板端子图和接线步骤整理。软件不能观察被测电路、测试线、保险丝或插孔，这些检查必须由操作者完成：
 
@@ -38,7 +38,7 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 | 模式 | 软件提供的范围 | 可用参数 |
 |---|---|---|
-| DCV | 100 mV、1 V、10 V、100 V、1000 V | NPLC 0.02、0.2、1、10、100；模拟滤波；自动零点 |
+| DCV | 100 mV、1 V、10 V、100 V、1000 V | NPLC 0.02、0.2、1、10、100；模拟滤波；自动零点；自动输入阻抗 |
 | ACV | 100 mV、1 V、10 V、100 V、750 V | 交流滤波 3、20、200 Hz；自动零点 |
 | DCI | 100 µA、1 mA、10 mA、100 mA、400 mA¹、1 A²、3 A²、10 A² | NPLC 0.02、0.2、1、10、100；模拟滤波；自动零点 |
 | ACI | 10 mA、100 mA、400 mA³、1 A²、3 A²、10 A² | 交流滤波 3、20、200 Hz；自动零点 |
@@ -46,6 +46,8 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 | 4W | 100 Ω、1 kΩ、10 kΩ、100 kΩ、1 MΩ、10 MΩ、100 MΩ | NPLC 0.02、0.2、1、10、100；模拟滤波；自动零点 |
 
 ¹ DCI 的 400 mA 档要求 OutG SW ≥2.0；² 1/3/10 A 档仅限前面板端子（DCI 的 3 A 是 10 A 档的一部分，用户手册注明 10 A 电流测量不能使用后面板端子）；³ ACI 的 400 mA 档要求 OutG SW ≥1.0.700.18。8845A 的 ACI 不含 100 µA、1 mA（8846A 专有）。400 mA 固定档只有在版本可解析且明确低于相应要求时才会禁用，版本未知不会误判为过旧。其他固定档不受 400 mA 固件门槛影响。
+
+DCV 的自动输入阻抗默认关闭，表示 10 MΩ。启用后，8845A 只在 100 mV、1 V、10 V 量程使用大于 10 GΩ 的输入阻抗；100 V、1000 V 量程仍为 10 MΩ。自动量程时仪表按当前实际量程应用相应输入阻抗。该设置只出现在 DCV，配置后会查询并核对 `INP:IMP:AUTO?`，且写入实验配置和每条测量 CSV。
 
 可打开自动量程，或取消勾选后选择固定量程。电流模式在当前端子确认为前面板时可开放自动量程；已知固件低于400 mA要求时会拒绝自动量程。后端子下1 A、3 A和10 A固定量程仍不可用。按“应用仪器参数”后，软件写入SCPI命令并读取量程、功能、带宽、端子等可用状态；仪器错误队列非零或功能回读不匹配时不会启动实验。模拟滤波器只出现在DCV/DCI/电阻模式；NPLC只出现在这些直流积分模式。AC滤波档的3/20/200 Hz分别是慢/中/快三档截止频率选择，不是采样频率。
 
@@ -57,7 +59,7 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 采集中调整速度下拉框只修改“所选值”，不会立即改变仪表。读数卡会分别显示仪表已回读生效的参数和“待应用”值；点击“应用采集速度”且仪表回读成功后，新速度才从下一读数起生效。若应用失败，采集会安全停止并保留失败记录，不会把所选值误记为仪表当前值。
 
-桌面主窗口以单张曲线和当前读数/采集状态为主。点击右下角状态栏的“设置与分析…”打开独立窗口：“连接与采集”页含串口、测量模式、仪器速度、实验目录和目标间隔；“分析与事件”页含统计、基准、局部区间和事件。完整SCPI通信日志可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
+桌面主窗口以单张曲线和当前读数/采集状态为主。顶栏“采集”返回波形主界面，“实验文件”打开独立文件窗口，集中列出当前实验目录中的测量 CSV、事件 CSV、配置、运行日志和导出结果；文件窗口也提供打开/复制目录、加载历史 CSV、导出进行中快照及事件安全副本。“通讯”“分析”及右下角“设置与分析…”打开设置窗口：“连接与采集”页含串口、测量模式、仪器速度、实验目录和目标间隔；“分析与事件”页含统计、基准、局部区间和事件。完整SCPI通信日志可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
 
 采集速率会受测量模式、量程、NPLC/交流带宽、自动零点、串口波特率和被测条件共同影响。请以当前实验中实际记录的时间戳和有效读数为准，不要把某一台设备或某次接线的速率当作准确度或通用性能保证。
 
@@ -69,14 +71,14 @@ v1.0.0 是源码发布，不包含预编译 Windows 程序。请按根目录 [RE
 
 CSV的PC本地/UTC时间和`elapsed_s`记录主机发送单次`READ?`前的时间；`read_duration_s`包括读数及量程回读的主机通信周期。仪器没有给每个读数提供本机硬件时间戳，因此转换器真实采样时刻只在一次读取周期内，不能宣称比这个窗口更精确。GUI实际频率由最近最多21个有效读数的PC单调接收时刻差计算，短实验使用现有点数；它不是目标间隔的倒数。可用每点`elapsed_s + read_duration_s`重建接收时刻核对该滚动值。每次超时/异常尝试仍占一个序号，`value_si`留空并写明状态，不伪造零值。
 
-串口、触发/读数解析、CSV写入、统计累积均在专用采集线程完成。测量数据逐点追加并刷新文件；GUI绘图按小批次刷新，最多保留最近100,000个点在内存中。若GUI线程暂时卡顿，界面通知会合并，待处理显示数据最多保留最近10,000点；曲线可能跳过中间显示点，但CSV和全程统计不会因此丢失。长实验全程min/max/平均值/样本标准差采用流式统计，不受绘图缓存长度影响。程序退出会请求停止当前采集、关闭文件和串口并尝试恢复仪器本地控制。
+串口、触发/读数解析、CSV写入、统计累积均在专用采集线程完成。测量数据逐点追加并刷新文件；测量与事件CSV最多每5秒调用一次系统同步，事件写入和正常停止/关闭时立即同步。系统调用仍不能保证磁盘控制器在断电时已把缓存写入介质；同步耗时也会计入真实采样间隔。磁盘检查每5秒执行一次，当前使用10 MiB固定余量保护，不预测剩余可运行时长。暂停或停止会在当前同步串口读数结束后生效，响应延迟受仪器读数转换和串口超时影响。GUI绘图按小批次刷新，最多保留最近100,000个点在内存中。若GUI线程暂时卡顿，界面通知会合并，待处理显示数据最多保留最近10,000点；曲线可能跳过中间显示点，但CSV和全程统计不会因此丢失。长实验全程min/max/平均值/样本标准差采用流式统计，不受绘图缓存长度影响。程序退出会请求停止当前采集、关闭文件和串口并尝试恢复仪器本地控制。
 
 ## 5. 分析、事件与历史数据
 
 - 滚轮默认缩放读数轴；Shift+滚轮缩放时间轴，Ctrl+滚轮同时缩放两轴，Alt+滚轮缩放读数轴并以零点为锚。拖动曲线可平移视图，“自动缩放”重新适配当前数据；另可启用自动跟随、读取最近点、选择局部统计区间和导出PNG。统计区间可直接输入相对实验开始的起止秒数，也可拖动图中区间手柄；两种操作会互相同步。自动跟随先逐步扩展视窗至120秒，再滚动显示最近120秒。
-- 基准可以手动输入SI值、取最新读数、取图上锁定点或取当前图中缓存均值。鼠标悬停只预览读数；在曲线上单击会锁定黄色圆圈标出的数据点，移动鼠标不会改变它。点击“锁定点设为基准”后，软件使用该固定点的读数。电压显示ΔV/V₀，电流显示ΔI/I₀，电阻显示ΔR/R₀。阈值栏使用SI值；基准绝对值小于或等于阈值、阈值无效或基准未设置时不计算相对变化率。
+- 基准可以手动输入，也可取最新读数、图上锁定点或当前图中缓存均值。Web 端可在 V/mV/µV、A/mA/µA、Ω/kΩ/MΩ/GΩ 间选择输入单位；内部计算和原始数据仍统一使用 SI 值。鼠标悬停只预览读数；在曲线上单击会锁定黄色圆圈标出的数据点，移动鼠标不会改变它。点击“锁定点设为基准”后，软件使用该固定点的读数。电压显示ΔV/V₀，电流显示ΔI/I₀，电阻显示ΔR/R₀。阈值栏使用SI值；基准绝对值小于或等于阈值、阈值无效或基准未设置时不计算相对变化率。
 - “记录实验事件”写入事件CSV并在曲线上画标记。基准设置、更改和清除在活动实验中也会写入事件并画出曲线标记。
-- “加载历史CSV”只读现存测量文件；若同一实验目录中有配套`events.csv`，会一并恢复落在当前时间范围内的事件标记。超过100,000点时，图形显示均匀抽稀视图，原文件不变；拖选区间后，软件在后台扫描完整原始CSV计算统计，图表抽稀不影响统计。实时采集期间，统计完成后会把区间内新到的有效读数增量纳入，后台读取不阻塞采集线程。
+- “加载历史CSV”只读现存测量文件；若同一实验目录中有配套`events.csv`，会一并恢复落在当前时间范围内的事件标记，Web 端的事件文件也由后台 Worker 解析。超过100,000点时，图形显示均匀抽稀视图，原文件不变；拖选区间后，软件在后台扫描完整原始CSV计算统计，图表抽稀不影响统计。实时采集期间，统计完成后会把区间内新到的有效读数增量纳入，后台读取不阻塞采集线程。
 
 ## 6. 实验目录和CSV字段
 
@@ -104,13 +106,13 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 ## 9. localhost 浏览器界面
 
-运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat` 可启动本机网页界面。服务只监听 `127.0.0.1:8765`，不加载远程页面或 CDN；网页与桌面版共用仪器驱动、采集线程和逐点写盘器。主页面只显示当前读数、采集状态、控制按钮和一张大曲线；顶部“设置与分析”打开单独的设置对话框。图表的滚轮和 Shift/Ctrl/Alt 用法与桌面端相同，并提供自动缩放、自动跟随、历史 CSV 和 PNG 导出。
+运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat` 可启动本机网页界面。服务只监听 `127.0.0.1:8765`，不加载远程页面或 CDN；网页与桌面版共用仪器驱动、采集线程和逐点写盘器。主页面只显示当前读数、采集状态、控制按钮和一张大曲线；顶部“实验文件”打开独立文件窗口，列出当前或最近实验的测量 CSV、事件 CSV、配置、日志和导出结果；“设置与分析”打开单独的设置对话框。图表的滚轮和 Shift/Ctrl/Alt 用法与桌面端相同，并提供自动缩放、自动跟随、历史 CSV 和 PNG 导出。
 
 启动服务不会自动打开串口。连接前先断开桌面版占用的 COM 端口，因为同一端口不能同时由两个程序打开。电流和电阻测量仍须由操作者确认接线、输入端子、保险丝和被测电路状态。页面的“退出服务”会停止采集、完成待写数据并安全关闭串口。Mock 读数始终是模拟数据。
 
 ## English
 
-Version 1.0.0 is a source release and does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
+Version 1.0.1 is a source release and does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
 
 ### 1. Connection and modes
 
@@ -120,13 +122,13 @@ The application scans serial ports at startup and also accepts a manually entere
 
 ### 2. Measurement modes and safe wiring
 
-Supported modes are DCV, ACV, DCI, ACI, 2-wire resistance, and 4-wire resistance. AC readings are RMS values, not peak values or waveform samples. The application cannot inspect the circuit, test leads, terminals, or fuses. Connect voltage inputs in parallel. De-energize the circuit before resistance measurements. For current, de-energize first and connect the meter in series. Select the appropriate mA/400 mA or 10 A input, never connect both red current inputs simultaneously, and never place a current input in parallel with a voltage source. Check wiring, range, front-panel input selection, and fuses before each measurement. Software cannot identify which physical red jack contains a lead. Firmware-sensitive limits apply only to 400 mA: a parseable `*IDN?` software version takes priority; if that field is a date/time marker, the operator may record OutG SW from the front-panel versions page, saved by instrument serial number. InG SW is recorded as metadata only. The fixed 400 mA range is rejected only when the selected version evidence is parseable and explicitly below the documented threshold; unknown or unparseable values do not cause rejection. Autorange is blocked if a known old firmware version could allow entry into 400 mA, or if rear terminals could allow entry into front-only current ranges.
+Supported modes are DCV, ACV, DCI, ACI, 2-wire resistance, and 4-wire resistance. AC readings are RMS values, not peak values or waveform samples. DCV also offers automatic input impedance, off by default (10 MΩ); when enabled it selects >10 GΩ only for 100 mV, 1 V, and 10 V ranges. Other DCV ranges remain 10 MΩ. The setting is queried back from the instrument and saved with experiment data. The application cannot inspect the circuit, test leads, terminals, or fuses. Connect voltage inputs in parallel. De-energize the circuit before resistance measurements. For current, de-energize first and connect the meter in series. Select the appropriate mA/400 mA or 10 A input, never connect both red current inputs simultaneously, and never place a current input in parallel with a voltage source. Check wiring, range, front-panel input selection, and fuses before each measurement. Software cannot identify which physical red jack contains a lead. Firmware-sensitive limits apply only to 400 mA: a parseable `*IDN?` software version takes priority; if that field is a date/time marker, the operator may record OutG SW from the front-panel versions page, saved by instrument serial number. InG SW is recorded as metadata only. The fixed 400 mA range is rejected only when the selected version evidence is parseable and explicitly below the documented threshold; unknown or unparseable values do not cause rejection. Autorange is blocked if a known old firmware version could allow entry into 400 mA, or if rear terminals could allow entry into front-only current ranges.
 
 The mA input has a 440 mA fuse and the 10 A input an 11 A fuse. The documented limit is 400 mA continuous; 550 mA is limited to two minutes followed by one minute off. Fuse ratings are not continuous operating limits. The fixed 1/3/10 A ranges require front terminals: the DCI table marks 1 A front-only, 3 A is part of the 10 A range, and the user manual says rear terminals cannot measure 10 A; the ACI table marks 1/3/10 A front-only. Autorange is blocked on rear terminals because it may enter those ranges. DCI 400 mA requires OutG SW 2.0 or later; ACI 400 mA requires 1.0.700.18 or later. These firmware gates apply only to the fixed 400 mA range, not 10 mA, 100 mA, or 10 A. The fixed 400 mA range is blocked only when parseable version evidence is explicitly below that mode's threshold; a semantic `*IDN?` version has priority, with manually verified OutG SW as fallback when IDN contains only a date/time marker. InG SW is recorded but does not affect the gate. Unknown or unparseable firmware does not cause rejection. ACI's 100 µA and 1 mA ranges are 8846A-only. The supplied Programmer's Manual documents `SYST:VERS?` as returning the SCPI command version and does not document a query for OutG/InG SW; the Users Manual directs users to the front-panel `SYSTEM > VERSIONS + SN` page. Manual panel entries are labelled separately from SCPI data in experiment metadata.
 
 ### 3. Measurement settings and speed
 
-DCV ranges are 100 mV–1000 V; ACV ranges are 100 mV–750 V. DCI ranges are 100 µA–10 A and ACI ranges 10 mA–10 A, subject to firmware and terminal conditions. Resistance ranges are 100 Ω–100 MΩ. DC voltage/current and resistance provide NPLC values 0.02, 0.2, 1, 10, and 100. AC voltage/current provide 3, 20, and 200 Hz bandwidth settings; these are filter bandwidths, not sample rates.
+DCV ranges are 100 mV–1000 V; ACV ranges are 100 mV–750 V. DCI ranges are 100 µA–10 A and ACI ranges 10 mA–10 A, subject to firmware and terminal conditions. Resistance ranges are 100 Ω–100 MΩ. DC voltage/current and resistance provide NPLC values 0.02, 0.2, 1, 10, and 100. AC voltage/current provide 3, 20, and 200 Hz bandwidth settings; these are filter bandwidths, not sample rates. The high input impedance setting is DCV-only and effective on 100 mV, 1 V, and 10 V ranges.
 
 Instrument conversion speed and the application's target interval are independent. Actual rate depends on range, auto-zero, filtering, serial settings, instrument conversion, and communication. During acquisition, a speed change applies only after instrument readback confirms it. A target interval of zero means no additional host delay, not zero instrument or serial latency.
 
@@ -138,7 +140,7 @@ Enter an experiment name and output directory, then start a single reading or co
 
 The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Timestamps are host-side: the CSV records the time before `READ?`, and `read_duration_s` records the read and range-query communication period. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
 
-Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. `config.json` preserves the raw instrument identity and IDN revision field, the semantic firmware version only when the instrument supplies one, separately recorded front-panel OutG/InG software versions when entered, and the source selected for the 400 mA check. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, sample notifications are coalesced and at most the latest 10,000 pending display points are kept; the SCPI display-log mailbox also stays bounded at 5,000 lines and reports when earlier display entries are dropped. The curve may skip intermediate display points while the CSV and full-run statistics remain complete.
+Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`, and `run.log`. `config.json` preserves the raw instrument identity and IDN revision field, the semantic firmware version only when the instrument supplies one, separately recorded front-panel OutG/InG software versions when entered, and the source selected for the 400 mA check. Measurement rows preserve raw instrument text separately from the SI value and include host local/UTC timestamps, elapsed time, communication duration, mode, range, NPLC or AC bandwidth, filter/zero state, the DCV input impedance setting where applicable, and error status. CSV is UTF-8 with BOM. Acquisition and file writing run in a worker thread; rows are flushed as they arrive. The graph retains at most 100,000 display points. If the GUI thread stalls, sample notifications are coalesced and at most the latest 10,000 pending display points are kept; the SCPI display-log mailbox also stays bounded at 5,000 lines and reports when earlier display entries are dropped. The curve may skip intermediate display points while the CSV and full-run statistics remain complete.
 
 ### 5. Analysis, events, and history
 
@@ -155,3 +157,6 @@ Mock mode supports six-mode simulated readings, step response/recovery, long-ter
 Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It listens only on `127.0.0.1:8765`, uses no remote pages or CDN, and shares the instrument driver, acquisition worker, and per-reading recorder with the desktop application. The main page keeps the reading, acquisition state, controls, and one large plot; **Settings & Analysis** opens a separate dialog. It supports all six modes, wheel/modifier zoom, auto scale, statistics, reference changes, event logging, CSV history, and PNG export.
 
 Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection. Mock readings remain simulated.
+### 事件导出
+
+实验目录中的 `events.csv` 是原始记录，软件不会为表格软件打开而改写它。若事件文字来自外部输入且可能以 `=`, `+`, `-` 或 `@` 开头，可在桌面“实验事件”页或 localhost 图表工具栏导出 `*_events_excel_safe.csv` 副本。该副本只给事件文本字段增加文本前缀，其他时间戳、读数和数值字段保持原样；请将原始 CSV 用于科研数据处理。安全副本仅支持停止采集后导出。

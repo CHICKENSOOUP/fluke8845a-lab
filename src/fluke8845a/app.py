@@ -809,10 +809,18 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 "deadline": time.monotonic() + 20.0,
                 "finished": False,
                 "error": None,
+                "cleanup_pending": False,
             }
             gui_warnings: list[str] = []
             timer = QTimer()
             timer.setInterval(10)
+
+            def begin_shutdown() -> None:
+                timer.stop()
+                if window is not None:
+                    window.close()
+                    if not window._worker_thread.isRunning() and app is not None:
+                        app.quit()
 
             def finish(error: str | None = None) -> None:
                 if state["finished"]:
@@ -824,28 +832,35 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     report["error"] = error
                 report["finished_local"] = datetime.now().astimezone().isoformat(timespec="microseconds")
                 save_progress("closing_after_error" if error else "closing_after_success")
-                timer.stop()
-                if window is not None:
-                    window.close()
-                if app is not None:
-                    app.quit()
+                if error and window is not None and window._acquiring:
+                    # Stop through the same worker/bridge path as the GUI button,
+                    # but keep the event loop and temporary experiment directory
+                    # alive until the final CSV flush completes.
+                    state["cleanup_pending"] = True
+                    state["phase"] = "stopping_after_error"
+                    save_progress("stopping_after_error")
+                    window._stop()
+                    return
+                begin_shutdown()
 
             def select_mode(mode: Mode) -> None:
-                previous_signals = window.mode_combo.blockSignals(True)
                 index = window.mode_combo.findData(mode.value)
                 if index < 0:
-                    window.mode_combo.blockSignals(previous_signals)
                     raise RuntimeError(f"GUI缺少测量模式：{mode.value}")
-                window.mode_combo.setCurrentIndex(index)
-                window.mode_combo.blockSignals(previous_signals)
-                window._current_mode = mode
-                window._load_mode_controls(mode)
-                window._clear_plot()
+                if window.mode_combo.currentIndex() != index:
+                    window.mode_combo.setCurrentIndex(index)
+                if window._current_mode != mode:
+                    raise RuntimeError(f"GUI未能切换到测量模式：{mode.value}")
                 window.experiment_name.setText(f"冻结包Mock验收 {mode.value}")
 
             def start_current_mode() -> None:
                 mode = modes[state["mode_index"]]
                 select_mode(mode)
+                if window._active_settings_by_mode.get(mode.value) is None:
+                    state["phase"] = "configuring"
+                    state["deadline"] = time.monotonic() + 15.0
+                    save_progress(f"configuring_{mode.value}")
+                    return
                 state["phase"] = "acquiring"
                 state["deadline"] = time.monotonic() + 15.0
                 window._start_continuous()
@@ -906,6 +921,9 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
 
             def pump() -> None:
                 if state["finished"]:
+                    if state["cleanup_pending"] and window is not None and not window._acquiring:
+                        state["cleanup_pending"] = False
+                        begin_shutdown()
                     return
                 if gui_warnings:
                     finish(f"GUI操作告警：{gui_warnings[-1]}")
@@ -925,9 +943,14 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     state["deadline"] = time.monotonic() + 10.0
                     save_progress(f"stopping_{modes[state['mode_index']].value}")
                     window._stop()
+                elif state["phase"] == "configuring":
+                    mode = modes[state["mode_index"]]
+                    if window._active_settings_by_mode.get(mode.value) is not None:
+                        start_current_mode()
 
             receiver = _MockE2EReceiver(on_experiment_finished)
             window._worker.experiment_finished.connect(receiver.experiment_finished)
+            window._worker_thread.finished.connect(app.quit)
             timer.timeout.connect(pump)
             try:
                 with patch.object(
@@ -947,6 +970,17 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 timer.stop()
                 if not state["finished"]:
                     finish("Mock GUI事件循环意外结束")
+                if window._worker_thread.isRunning():
+                    # app.exec() can return unexpectedly (for example, an
+                    # external quit request). The worker and recorder still
+                    # own files under temporary_root, so drain the worker
+                    # before closing the window or leaving TemporaryDirectory.
+                    window._worker.request_stop()
+                    window._bridge.stop.emit()
+                    window._bridge.close_app.emit()
+                    while window._worker_thread.isRunning():
+                        app.processEvents()
+                        window._worker_thread.wait(50)
                 window.close()
                 app.processEvents()
             report["mode_count"] = len(report["modes"])

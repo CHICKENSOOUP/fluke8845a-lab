@@ -65,9 +65,10 @@ class UnsupportedRange(InstrumentError):
 class ReadingError(InstrumentError):
     """Invalid/overflow reading; never convert such a value to zero."""
 
-    def __init__(self, message: str, raw: str = "") -> None:
+    def __init__(self, message: str, raw: str = "", status: str = "invalid") -> None:
         super().__init__(message)
         self.raw = raw
+        self.status = status
 
 
 class FlowControl(StrEnum):
@@ -96,6 +97,8 @@ class SerialSettings:
             raise ValueError("不支持的8845A波特率")
         if self.bytesize not in (7, 8) or self.parity not in ("N", "E", "O"):
             raise ValueError("数据位或校验位设置无效")
+        if (self.bytesize, self.parity) not in {(8, "N"), (7, "E"), (7, "O")}:
+            raise ValueError("8845A 串口格式仅支持 8N、7E 或 7O")
         if self.stopbits not in (1, 2):
             raise ValueError("停止位必须为1或2")
         if self.eol not in ("CR", "LF", "CRLF"):
@@ -133,6 +136,8 @@ class ModeSettings:
     ac_bandwidth_hz: int | None = None
     analog_filter: bool = False
     autozero: bool = True
+    digital_filter: bool = False
+    input_impedance_auto: bool = False
 
     def __post_init__(self) -> None:
         spec = descriptor(self.mode)
@@ -141,8 +146,10 @@ class ModeSettings:
         if self.ac_bandwidth_hz is None and spec.ac_bandwidths_hz:
             object.__setattr__(self, "ac_bandwidth_hz", 20)
 
-    def validate(self) -> ModeDescriptor:
+    def validate(self, *, allow_inactive_digital_filter: bool = False) -> ModeDescriptor:
         spec = descriptor(self.mode)
+        if not isinstance(self.input_impedance_auto, bool):
+            raise ValueError("自动输入阻抗必须为布尔值")
         if not self.autorange and self.range_si not in spec.ranges_si:
             raise ValueError(f"{spec.label}的固定量程不在8845A支持列表中")
         if self.nplc is not None and (not spec.nplc_values or self.nplc not in spec.nplc_values):
@@ -151,12 +158,31 @@ class ModeSettings:
             raise ValueError(f"{spec.label}不支持此交流滤波档")
         if self.analog_filter and not spec.analog_filter:
             raise ValueError(f"{spec.label}不支持直流模拟滤波器")
+        if self.digital_filter and not spec.digital_filter:
+            raise ValueError(f"{spec.label}不支持直流数字滤波")
+        if self.input_impedance_auto and not spec.input_impedance_auto:
+            raise ValueError(f"{spec.label}不支持DCV自动输入阻抗设置")
+        if (
+            self.digital_filter
+            and not digital_filter_nplc_is_slow(self.mode, self.nplc)
+            and not allow_inactive_digital_filter
+        ):
+            raise ValueError("8845A数字滤波仅适用于积分时间大于1 NPLC的直流测量")
         return spec
 
 
 READ_RESPONSE_TIMEOUT_MARGIN_S = 3.0
 AC_READ_RESPONSE_TIMEOUT_FLOOR_S = 8.0
 CONSERVATIVE_LINE_FREQUENCY_HZ = 50.0
+DIGITAL_FILTER_DISABLED_REASON = (
+    "软件当前保持数字滤波关闭：官方手册未给出最大READ?响应时间，"
+    "当前超时保护无法保证覆盖滤波等待"
+)
+DIGITAL_FILTER_MINIMUM_FIRMWARE = (2, 0)
+
+
+def _digital_filter_minimum_firmware_text() -> str:
+    return ".".join(str(part) for part in DIGITAL_FILTER_MINIMUM_FIRMWARE)
 
 
 def measurement_read_timeout_s(settings: ModeSettings, base_timeout_s: float) -> float:
@@ -339,6 +365,53 @@ def compare_firmware(firmware: str, minimum: tuple[int, ...]) -> bool | None:
     return found + (0,) * (size - len(found)) >= minimum + (0,) * (size - len(minimum))
 
 
+def digital_filter_requires_known_firmware(mode: Mode, nplc: float | None, firmware: str) -> bool:
+    """Whether slow DC operation lacks firmware verified by the current policy.
+
+    The supplied manuals do not document the OutG SW 2.0 cutoff. A known older
+    version is still unverified for this software policy; it must not be treated
+    as evidence that the filter command is supported or that the filter is off.
+    """
+    return (
+        digital_filter_nplc_is_slow(mode, nplc)
+        and digital_filter_firmware_support(mode, firmware) is not True
+    )
+
+
+def digital_filter_nplc_is_slow(mode: Mode, nplc: float | None) -> bool:
+    """Whether this 8845A mode/NPLC pair can activate its digital filter."""
+    return descriptor(mode).digital_filter and nplc is not None and nplc > 1
+
+
+def digital_filter_blocked_nplc_values(mode: Mode, firmware: str) -> tuple[float, ...]:
+    """Return slow NPLC values lacking firmware verified by the software policy."""
+    spec = descriptor(mode)
+    if not spec.digital_filter or digital_filter_firmware_support(mode, firmware) is True:
+        return ()
+    return tuple(value for value in spec.nplc_values if digital_filter_nplc_is_slow(mode, value))
+
+
+def digital_filter_slow_read_block_reason(mode: Mode, nplc: float | None, firmware: str) -> str | None:
+    """Explain why a slow read cannot proceed without verified filter control."""
+    if not digital_filter_requires_known_firmware(mode, nplc, firmware):
+        return None
+    support = digital_filter_firmware_support(mode, firmware)
+    if support is False:
+        version = f"已记录的OutG SW {firmware}低于"
+    else:
+        version = "尚未核实OutG SW"
+    return (
+        f"{version}当前软件兼容策略的{_digital_filter_minimum_firmware_text()}门槛；官方手册未证实该门槛。"
+        "CONF会预设开启数字滤波，而慢速READ?的最长等待时间未在手册中规定，"
+        "软件无法安全确认滤波状态。请核对面板OutG SW版本，或将积分时间设为1 NPLC及以下。"
+    )
+
+
+def digital_filter_firmware_support(mode: Mode, firmware: str) -> bool | None:
+    """Return the software's current classification, not a manual-confirmed capability."""
+    return compare_firmware(firmware, DIGITAL_FILTER_MINIMUM_FIRMWARE) if descriptor(mode).digital_filter else False
+
+
 def select_range_firmware(idn_firmware: str, outguard_version: str) -> tuple[str, str]:
     """Select parseable version evidence for range gating without losing provenance."""
     if compare_firmware(idn_firmware, (0, 0)) is not None:
@@ -506,9 +579,26 @@ class Serial8845A:
             return self.settings.timeout_s
         return measurement_read_timeout_s(self._active_settings, self.settings.timeout_s)
 
-    def connect(self) -> InstrumentInfo:
-        self._client.open()
+    def connect(
+        self,
+        *,
+        progress_callback: Callable[[str, str, str], None] | None = None,
+    ) -> InstrumentInfo:
+        """Open the serial port and identify the meter, optionally reporting progress.
+
+        The callback is observational only: it does not change the SCPI command
+        sequence or instrument configuration.
+        """
+        report = progress_callback or (lambda _stage, _status, _message: None)
+        report("port", "running", f"正在打开串口 {self.port}…")
         try:
+            self._client.open()
+        except Exception as exc:
+            report("port", "failure", f"串口打开失败：{exc}")
+            raise
+        report("port", "success", f"串口 {self.port} 已打开")
+        try:
+            report("identify", "running", "正在查询并核验 Fluke 8845A 身份…")
             idn = self._client.query("*IDN?")
             info = parse_idn(idn)
             if "FLUKE" not in info.manufacturer.upper() or info.model != "8845A":
@@ -516,8 +606,10 @@ class Serial8845A:
             self.info = info
             self._client.write("SYST:REM")
             self._drain_errors("连接时仪器已有错误", fail=False)
+            report("identify", "success", f"已识别 Fluke 8845A，序列号 {info.serial_number or '未提供'}")
             return info
-        except Exception:
+        except Exception as exc:
+            report("identify", "failure", f"8845A 身份识别失败：{exc}")
             self._client.close()
             raise
 
@@ -595,6 +687,19 @@ class Serial8845A:
             self._readback_boolean("模拟滤波", self._client.query(f"{prefix}:FILT:STAT?"))
             if spec.analog_filter else False
         )
+        range_firmware, _firmware_source = self.range_firmware
+        digital_filter_supported = digital_filter_firmware_support(mode, range_firmware)
+        filter_block_reason = digital_filter_slow_read_block_reason(mode, nplc, range_firmware)
+        if filter_block_reason:
+            raise UnsupportedRange(filter_block_reason)
+        digital_filter = (
+            self._readback_boolean("数字滤波", self._client.query(f"{prefix}:FILT:DIG?"))
+            if spec.digital_filter and digital_filter_supported is True else False
+        )
+        input_impedance_auto = (
+            self._readback_boolean("自动输入阻抗", self._client.query("INP:IMP:AUTO?"))
+            if spec.input_impedance_auto else False
+        )
         autozero = self._readback_boolean("自动零点", self._client.query("ZERO:AUTO?"))
         settings = ModeSettings(
             mode=mode,
@@ -604,8 +709,12 @@ class Serial8845A:
             ac_bandwidth_hz=ac_bandwidth_hz,
             analog_filter=analog_filter,
             autozero=autozero,
+            digital_filter=digital_filter,
+            input_impedance_auto=input_impedance_auto,
         )
-        settings.validate()
+        # Preserve the read-back switch state even when NPLC makes the filter
+        # inactive; user-supplied configuration still rejects that combination.
+        settings.validate(allow_inactive_digital_filter=True)
         return settings
 
     def _drain_errors(self, heading: str, *, fail: bool) -> list[str]:
@@ -660,10 +769,24 @@ class Serial8845A:
         spec = settings.validate()
         if not self.connected:
             raise InstrumentError("仪器未连接")
+        if settings.digital_filter:
+            # Users Manual Rev. 3, PDF p.75 / printed p.4-5: the number of
+            # readings averaged varies by DC function and range, with no
+            # documented worst-case response time for this host's READ? guard.
+            raise UnsupportedRange(
+                "数字滤波暂未开放于真实仪器采集：官方手册未给出最大READ?响应时间，"
+                "当前超时保护无法保证覆盖滤波等待；请关闭数字滤波后采集"
+            )
         assert self.info is not None
+        range_firmware, firmware_source = self.range_firmware
+        digital_filter_supported = digital_filter_firmware_support(settings.mode, range_firmware)
+        filter_block_reason = digital_filter_slow_read_block_reason(
+            settings.mode, settings.nplc, range_firmware
+        )
+        if filter_block_reason:
+            raise UnsupportedRange(f"{filter_block_reason}本次尚未发送模式配置命令。")
         self._drain_errors("配置前仪器错误", fail=False)
         terminals = self._client.query("ROUT:TERM?") if spec.quantity == "current" else None
-        range_firmware, firmware_source = self.range_firmware
         unsupported = unsupported_current_ranges(settings.mode, range_firmware, terminals)
         if spec.quantity == "current" and settings.autorange:
             reason = current_autorange_block_reason(settings.mode, range_firmware, terminals)
@@ -698,6 +821,16 @@ class Serial8845A:
             self._client.write(f"SENS:DET:BAND {settings.ac_bandwidth_hz}")
         if spec.analog_filter:
             self._client.write(f"{prefix}:FILT:STAT {'ON' if settings.analog_filter else 'OFF'}")
+        if spec.input_impedance_auto:
+            # Programmers Manual Rev. 3, PDF pp. 60–61 (printed pp. 50–51):
+            # AUTO ON selects >10 GΩ only on 100 mV, 1 V, and 10 V DCV ranges;
+            # OFF is 10 MΩ on every range. Table 18 presets AUTO OFF.
+            self._client.write(
+                f"INP:IMP:AUTO {'ON' if settings.input_impedance_auto else 'OFF'}"
+            )
+        digital_filter_supported_by_firmware = spec.digital_filter and digital_filter_supported is True
+        if digital_filter_supported_by_firmware:
+            self._client.write(f"{prefix}:FILT:DIG {'ON' if settings.digital_filter else 'OFF'}")
         self._client.write(f"ZERO:AUTO {'ON' if settings.autozero else 'OFF'}")
         self._drain_errors("配置后仪器报告错误", fail=True)
         actual_range = self._client.query(f"{prefix}:RANG?")
@@ -705,6 +838,13 @@ class Serial8845A:
         actual_nplc = self._client.query(f"{prefix}:NPLC?") if settings.nplc is not None else None
         actual_band = self._client.query("SENS:DET:BAND?") if settings.ac_bandwidth_hz is not None else None
         actual_filter = self._client.query(f"{prefix}:FILT:STAT?") if spec.analog_filter else None
+        actual_input_impedance_auto = (
+            self._client.query("INP:IMP:AUTO?") if spec.input_impedance_auto else None
+        )
+        actual_digital_filter = (
+            self._client.query(f"{prefix}:FILT:DIG?")
+            if digital_filter_supported_by_firmware else None
+        )
         actual_zero = self._client.query("ZERO:AUTO?")
         terminal = self._client.query("ROUT:TERM?")
         actual_function = self._client.query("SENS:FUNC?")
@@ -752,6 +892,23 @@ class Serial8845A:
                     f"模拟滤波回读不符：期望{'ON' if settings.analog_filter else 'OFF'}，"
                     f"实际{actual_filter}"
                 )
+        if spec.input_impedance_auto:
+            actual_input_impedance_value = self._readback_boolean(
+                "自动输入阻抗", actual_input_impedance_auto
+            )
+            if actual_input_impedance_value != settings.input_impedance_auto:
+                raise ScpiProtocolError(
+                    "自动输入阻抗回读不符：期望"
+                    f"{'ON' if settings.input_impedance_auto else 'OFF'}，"
+                    f"实际{actual_input_impedance_auto}"
+                )
+        if digital_filter_supported_by_firmware:
+            actual_digital_filter_value = self._readback_boolean("数字滤波", actual_digital_filter)
+            if actual_digital_filter_value != settings.digital_filter:
+                raise ScpiProtocolError(
+                    f"数字滤波回读不符：期望{'ON' if settings.digital_filter else 'OFF'}，"
+                    f"实际{actual_digital_filter}"
+                )
         actual_zero_value = self._readback_boolean("自动零点", actual_zero)
         if actual_zero_value != settings.autozero:
             raise ScpiProtocolError(
@@ -772,6 +929,14 @@ class Serial8845A:
             "nplc_response": actual_nplc,
             "ac_bandwidth_response": actual_band,
             "analog_filter_response": actual_filter,
+            "input_impedance_auto_response": actual_input_impedance_auto,
+            "digital_filter_response": (
+                actual_digital_filter if digital_filter_supported_by_firmware else
+                f"not probed (software policy for OutG SW <{_digital_filter_minimum_firmware_text()}; threshold unverified)"
+                if spec.digital_filter and digital_filter_supported is False else
+                "unknown (OutG SW unverified; inactive at NPLC <= 1)"
+                if spec.digital_filter and digital_filter_supported is None else None
+            ),
             "autozero_response": actual_zero,
             "input_terminals": terminal,
             "measurement_read_timeout_s": read_timeout,
@@ -784,6 +949,14 @@ class Serial8845A:
             raise InstrumentError("仪器未连接")
         if self._mode is None or settings.mode != self._mode:
             raise InstrumentError("实时调速只能用于当前已配置的测量模式")
+
+        range_firmware, _firmware_source = self.range_firmware
+        digital_filter_supported = digital_filter_firmware_support(settings.mode, range_firmware)
+        filter_block_reason = digital_filter_slow_read_block_reason(
+            settings.mode, settings.nplc, range_firmware
+        )
+        if filter_block_reason:
+            raise UnsupportedRange(f"{filter_block_reason}本次实时调速尚未发送SCPI命令。")
 
         prefix = spec.sense_prefix
         self._drain_errors("调速前仪器错误", fail=False)
@@ -836,14 +1009,25 @@ class Serial8845A:
         raw = self._client.query("READ?", timeout_s=self.measurement_read_timeout_s)
         parsed = parse_reading(raw)
         if parsed.value_si is None:
-            raise ReadingError(parsed.detail, parsed.raw)
+            raise ReadingError(parsed.detail, parsed.raw, parsed.status)
         spec = descriptor(self._mode)
         range_response = self._client.query(f"{spec.sense_prefix}:RANG?")
         range_value = parse_reading(range_response)
+        if range_value.value_si is None:
+            raise ScpiProtocolError(
+                f"量程回读不是有效数值：{range_response!r}"
+            )
+        if not any(
+            self._close_numeric(range_value.value_si, supported_range)
+            for supported_range in spec.ranges_si
+        ):
+            raise ScpiProtocolError(
+                f"量程回读不在8845A {spec.label}支持列表中：{range_response!r}"
+            )
         received_ns = time.monotonic_ns()
         return Reading(
             raw=raw, value_si=parsed.value_si,
-            range_si=range_value.value_si if range_value.status == "ok" else None,
+            range_si=range_value.value_si,
             started_monotonic_ns=started_ns, received_monotonic_ns=received_ns,
             timestamp_utc=timestamp_utc, timestamp_local=timestamp_local,
         )
@@ -863,7 +1047,7 @@ class Serial8845A:
         parsed = parse_reading(raw)
         received_ns = time.monotonic_ns()
         if parsed.value_si is None:
-            raise ReadingError(parsed.detail)
+            raise ReadingError(parsed.detail, parsed.raw, parsed.status)
         return Reading(raw, parsed.value_si, None, started_ns, received_ns, timestamp_utc, timestamp_local)
 
     def diagnose(self) -> dict[str, str | None]:

@@ -26,7 +26,9 @@ class FakeTransport:
         self.range_value = 10
         self.autorange = "1"
         self.filters = {}
+        self.digital_filters = {}
         self.autozero = "1"
+        self.input_impedance_auto = "0"
         self.bandwidth_response_override = None
         self.local_error_on_read = False
 
@@ -44,9 +46,12 @@ class FakeTransport:
         if upper_command.startswith("CONF:"):
             function = command.split(":", 1)[1]
             self.function = function
+            self.input_impedance_auto = "0"
             mode = mode_from_scpi_function(function)
             if mode is not None:
                 self.range_value = descriptor(mode).ranges_si[0]
+                if descriptor(mode).digital_filter:
+                    self.digital_filters[descriptor(mode).sense_prefix.upper()] = "1"
         elif upper_command.endswith(":RANG:AUTO ON"):
             self.autorange = "1"
         elif upper_command.endswith(":RANG:AUTO OFF"):
@@ -56,8 +61,13 @@ class FakeTransport:
         elif ":FILT:STAT " in upper_command:
             prefix = command[:upper_command.index(":FILT:STAT")]
             self.filters[prefix.upper()] = "1" if upper_command.endswith(" ON") else "0"
+        elif ":FILT:DIG " in upper_command:
+            prefix = command[:upper_command.index(":FILT:DIG")]
+            self.digital_filters[prefix.upper()] = "1" if upper_command.endswith(" ON") else "0"
         elif upper_command.startswith("ZERO:AUTO "):
             self.autozero = "1" if upper_command.endswith(" ON") else "0"
+        elif upper_command.startswith("INP:IMP:AUTO "):
+            self.input_impedance_auto = "1" if upper_command.endswith(" ON") else "0"
         elif ":NPLC " in upper_command:
             self.nplc = command.rsplit(" ", 1)[1]
         elif upper_command.startswith("SENS:DET:BAND "):
@@ -89,6 +99,9 @@ class FakeTransport:
         elif command.endswith(":FILT:STAT?"):
             prefix = command.removesuffix(":FILT:STAT?")
             response = self.filters.get(prefix, "0")
+        elif command.endswith(":FILT:DIG?"):
+            prefix = command.removesuffix(":FILT:DIG?")
+            response = self.digital_filters.get(prefix, "0")
         elif command == "SENS:DET:BAND?":
             response = (
                 self.bandwidth_response_override
@@ -97,6 +110,8 @@ class FakeTransport:
             )
         elif command == "ZERO:AUTO?":
             response = self.autozero
+        elif command == "INP:IMP:AUTO?":
+            response = self.input_impedance_auto
         elif command == "READ?":
             response = '+550,"Command not allowed in local"' if self.local_error_on_read else "+1.2345678901234567E+00"
         elif command.startswith("MEAS:"):

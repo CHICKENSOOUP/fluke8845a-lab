@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 from datetime import datetime
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from fluke8845a.modes import DESCRIPTORS, Mode
 from fluke8845a.mock import Mock8845A, MockScenario
 from fluke8845a.scpi import ModeSettings
+from scripts.generate_demo import generate
 
 
 @pytest.mark.parametrize("mode", list(Mode))
@@ -42,6 +44,19 @@ def test_mock_timeout_and_disconnect_are_injected_without_values():
     assert not disconnected.connected
 
 
+def test_mock_labels_input_impedance_as_simulated_and_preserves_it_during_speed_change():
+    mock = Mock8845A(MockScenario(read_latency_s=0))
+    mock.connect()
+    settings = ModeSettings(Mode.DCV, input_impedance_auto=True)
+    result = mock.configure(settings)
+    assert result["input_impedance_auto_response"] == "True"
+    assert mock.read_settings(Mode.DCV).input_impedance_auto is True
+
+    mock.set_measurement_speed(ModeSettings(Mode.DCV, nplc=0.2))
+    assert mock.read_settings(Mode.DCV).input_impedance_auto is True
+    mock.close()
+
+
 def test_mock_step_drift_and_noise_are_repeatably_configurable():
     settings = ModeSettings(Mode.RES2, nplc=1)
     mock = Mock8845A(MockScenario(
@@ -60,4 +75,20 @@ def test_mock_step_drift_and_noise_are_repeatably_configurable():
     another.configure(settings)
     b = another.read().raw
     assert a == b
+
+
+def test_demo_generator_writes_explicit_six_mode_experiment_bundles(tmp_path):
+    output = tmp_path / "mock_examples"
+
+    generate(output)
+
+    assert {path.name for path in output.iterdir() if path.is_dir()} == {mode.value for mode in Mode}
+    assert "全部由内置 MOCK" in (output / "README.md").read_text(encoding="utf-8")
+    for mode in Mode:
+        experiment = output / mode.value
+        config = json.loads((experiment / "config.json").read_text(encoding="utf-8"))
+        assert config["simulation"] is True
+        assert "不是8845A实测数据" in config["example_data_notice"]
+        for filename in ("measurements.csv", "events.csv", "run.log"):
+            assert (experiment / filename).is_file()
 

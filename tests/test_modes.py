@@ -1,5 +1,7 @@
 """Regression checks for model-specific ranges in the supplied Fluke specs."""
 
+import pytest
+
 from fluke8845a.modes import AC_BANDWIDTHS_HZ, DESCRIPTORS, Mode, NPLC_VALUES
 
 
@@ -15,6 +17,7 @@ def test_descriptors_match_documented_8845a_ranges_and_applicable_controls():
     nplc_modes = {Mode.DCV, Mode.DCI, Mode.RES2, Mode.RES4}
     ac_bandwidth_modes = {Mode.ACV, Mode.ACI}
     analog_filter_modes = {Mode.DCV, Mode.DCI, Mode.RES2, Mode.RES4}
+    digital_filter_modes = {Mode.DCV, Mode.DCI, Mode.RES2, Mode.RES4}
 
     assert set(DESCRIPTORS) == set(Mode)
     for mode, ranges in expected_ranges.items():
@@ -23,6 +26,8 @@ def test_descriptors_match_documented_8845a_ranges_and_applicable_controls():
         assert spec.nplc_values == (NPLC_VALUES if mode in nplc_modes else ())
         assert spec.ac_bandwidths_hz == (AC_BANDWIDTHS_HZ if mode in ac_bandwidth_modes else ())
         assert spec.analog_filter is (mode in analog_filter_modes)
+        assert spec.digital_filter is (mode in digital_filter_modes)
+        assert spec.input_impedance_auto is (mode == Mode.DCV)
 
     # These ranges belong to 8846A-only capabilities and must never reach the 8845A GUI.
     assert 10 not in DESCRIPTORS[Mode.RES2].ranges_si
@@ -30,4 +35,12 @@ def test_descriptors_match_documented_8845a_ranges_and_applicable_controls():
     assert 100e-6 not in DESCRIPTORS[Mode.ACI].ranges_si
     assert 1e-3 not in DESCRIPTORS[Mode.ACI].ranges_si
     assert DESCRIPTORS[Mode.ACV].ranges_si[-1] == 750
+
+
+@pytest.mark.parametrize("mode", [Mode.ACV, Mode.DCI, Mode.ACI, Mode.RES2, Mode.RES4])
+def test_auto_input_impedance_is_rejected_outside_dcv(mode):
+    from fluke8845a.scpi import ModeSettings
+
+    with pytest.raises(ValueError, match="输入阻抗"):
+        ModeSettings(mode, input_impedance_auto=True).validate()
 

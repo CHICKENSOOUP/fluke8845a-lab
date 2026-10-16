@@ -27,6 +27,8 @@ class ModeDescriptor:
     nplc_values: tuple[float, ...] = ()
     ac_bandwidths_hz: tuple[int, ...] = ()
     analog_filter: bool = False
+    digital_filter: bool = False
+    input_impedance_auto: bool = False
     rms: bool = False
     wiring_group: str = "voltage"
     safety: str = ""
@@ -47,7 +49,8 @@ AC_BANDWIDTHS_HZ: Final[tuple[int, ...]] = (3, 20, 200)
 DESCRIPTORS: Final[dict[Mode, ModeDescriptor]] = {
     Mode.DCV: ModeDescriptor(
         Mode.DCV, "直流电压 DCV", "VOLT:DC", "voltage", "V",
-        (0.1, 1, 10, 100, 1000), NPLC_VALUES, analog_filter=True,
+        (0.1, 1, 10, 100, 1000), NPLC_VALUES, analog_filter=True, digital_filter=True,
+        input_impedance_auto=True,
         wiring_group="voltage",
         safety="断开危险电压后接入电压 HI/LO 端子；电压测量并联在被测节点。核对输入电压和 CAT 等级。",
     ),
@@ -60,7 +63,7 @@ DESCRIPTORS: Final[dict[Mode, ModeDescriptor]] = {
     Mode.DCI: ModeDescriptor(
         Mode.DCI, "直流电流 DCI", "CURR:DC", "current", "A",
         (100e-6, 1e-3, 10e-3, 100e-3, 400e-3, 1, 3, 10), NPLC_VALUES,
-        analog_filter=True, wiring_group="current",
+        analog_filter=True, digital_filter=True, wiring_group="current",
         safety="电流测量必须串联：先关闭被测回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。",
     ),
     Mode.ACI: ModeDescriptor(
@@ -72,13 +75,13 @@ DESCRIPTORS: Final[dict[Mode, ModeDescriptor]] = {
     Mode.RES2: ModeDescriptor(
         Mode.RES2, "两线电阻 2W", "RES", "resistance", "Ohm",
         (100, 1e3, 10e3, 100e3, 1e6, 10e6, 100e6), NPLC_VALUES,
-        analog_filter=True, wiring_group="resistance-2w",
+        analog_filter=True, digital_filter=True, wiring_group="resistance-2w",
         safety="电阻测量前必须使被测电路断电并确认无外加电压；两线法使用相应 HI/LO 端子。引线电阻会进入读数，可在适当条件下执行仪器 ZERO。",
     ),
     Mode.RES4: ModeDescriptor(
         Mode.RES4, "四线电阻 4W", "FRES", "resistance", "Ohm",
         (100, 1e3, 10e3, 100e3, 1e6, 10e6, 100e6), NPLC_VALUES,
-        analog_filter=True, wiring_group="resistance-4w",
+        analog_filter=True, digital_filter=True, wiring_group="resistance-4w",
         safety="电阻测量前必须使被测电路断电并确认无外加电压；四线法将 FORCE 端接电流线、SENSE 端接被测电阻两端。",
     ),
 }

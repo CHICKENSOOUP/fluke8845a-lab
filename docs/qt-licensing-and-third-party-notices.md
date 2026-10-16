@@ -21,7 +21,7 @@
 - [Qt 动态库替换和运行步骤草稿](licenses/windows-replace-qt.md)
 - LGPLv3 完整文本：`docs/licenses/LGPL-3.0.txt`
 
-当前 6.12.0 候选包不含 Qt PDF、Qt WebEngine 或 `qpdf.dll`，相应的历史源码匹配问题已排除。构建脚本现在会从确切运行环境复制 CPython、NumPy/OpenBLAS、pyqtgraph、pySerial、OpenSSL 和 Nuitka 运行库的许可材料，并在 Windows ZIP 内生成带 SHA-256 的 `windows-runtime-license-manifest.json`。这完善了可追溯材料，但还没有关闭 Microsoft Visual C++ 再分发资格及全部本机依赖的最终核对。Qt 模块/嵌入式第三方声明、修改或重新链接 Qt 后在该 ZIP 上运行的验证也仍未完成。源码归档和校验值见源码登记表；在核对 wheel 补丁来源并建立稳定源码交付方式前，不把它视为已完成源码提供要约。
+当前候选包不含 Qt PDF、Qt WebEngine 或 `qpdf.dll`，相应的历史源码匹配问题已排除。构建脚本会复制 CPython、NumPy/OpenBLAS、pyqtgraph、pySerial、OpenSSL 和 Nuitka 运行库的许可材料，并在 `windows-runtime-license-manifest.json` 中记录许可文件哈希，以及本次冻结目录中所有 DLL、PYD、EXE 的文件大小和 SHA-256。ZIP 校验会要求这份本机二进制清单与归档完全一致；家族标签仅用于审查定位，不代表许可证结论。Microsoft Visual C++ 再分发资格、Qt 模块/嵌入式第三方声明及 Qt 库替换后运行验证仍未完成。源码归档和校验值见源码登记表；在核对 wheel 补丁来源并建立稳定源码交付方式前，不把它视为已完成源码提供要约。
 
 ## Windows 二进制发布要求
 
@@ -63,7 +63,7 @@ The following materials were prepared for the read-only portable candidate audit
 - [Draft Qt library replacement and launch procedure](licenses/windows-replace-qt.md)
 - Full LGPLv3 text: `docs/licenses/LGPL-3.0.txt`
 
-The current Qt 6.12.0 candidate contains no Qt PDF, Qt WebEngine, or `qpdf.dll`; the historical source-match issue is removed. The build now copies license materials from the exact CPython, NumPy/OpenBLAS, pyqtgraph, pySerial, OpenSSL, and Nuitka runtime used and creates a SHA-256 manifest inside the Windows ZIP. This improves traceability, but Microsoft Visual C++ redistribution eligibility and the full mapping of every native dependency remain unverified. Exact Qt module/embedded third-party notices and a modified/relinked Qt library replacement-and-run check against this ZIP remain open. Source archive URLs and checksums are listed in the source register, but wheel build patches/provenance and a durable recipient source offer have not been verified.
+The current candidate contains no Qt PDF, Qt WebEngine, or `qpdf.dll`; the historical source-match issue is removed. The build copies license materials from the exact CPython, NumPy/OpenBLAS, pyqtgraph, pySerial, OpenSSL, and Nuitka runtime used. Its `windows-runtime-license-manifest.json` records those license-file hashes plus sizes and SHA-256 hashes for every DLL, PYD, and EXE in the frozen directory. ZIP verification requires this native-binary inventory to match the archive exactly; family labels are review hints, not license conclusions. Microsoft Visual C++ redistribution eligibility, exact Qt module/embedded third-party notices, and a modified/relinked Qt library replacement-and-run check remain open. Source archive URLs and checksums are listed in the source register, but wheel build patches/provenance and a durable recipient source offer have not been verified.
 
 ## Requirements for a Windows binary release
 

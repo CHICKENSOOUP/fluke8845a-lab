@@ -75,6 +75,10 @@ class Mock8845A:
             "nplc_response": str(settings.nplc) if settings.nplc is not None else None,
             "ac_bandwidth_response": str(settings.ac_bandwidth_hz) if settings.ac_bandwidth_hz is not None else None,
             "analog_filter_response": str(settings.analog_filter) if spec.analog_filter else None,
+            "digital_filter_response": str(settings.digital_filter) if spec.digital_filter else None,
+            "input_impedance_auto_response": (
+                str(settings.input_impedance_auto) if spec.input_impedance_auto else None
+            ),
             "autozero_response": str(settings.autozero),
             "input_terminals": "FRONT (simulated)",
         }
@@ -93,6 +97,8 @@ class Mock8845A:
             ac_bandwidth_hz=settings.ac_bandwidth_hz,
             analog_filter=self._settings.analog_filter,
             autozero=self._settings.autozero,
+            digital_filter=self._settings.digital_filter,
+            input_impedance_auto=self._settings.input_impedance_auto,
         )
         self._log(
             f"MOCK调速：NPLC={self._settings.nplc}；交流带宽={self._settings.ac_bandwidth_hz} Hz"
@@ -160,4 +166,11 @@ class Mock8845A:
             raise ConnectionError("MOCK未连接")
         self._zeroed = True
         self._log("MOCK零点命令已模拟执行；未操作任何真实仪器")
+
+    def read_settings(self, mode: Mode) -> ModeSettings:
+        if not self.connected or self._settings is None:
+            raise ConnectionError("MOCK未连接或尚未配置")
+        if mode != self._settings.mode:
+            raise ValueError("拒绝读取其他模拟测量模式的配置")
+        return self._settings
 

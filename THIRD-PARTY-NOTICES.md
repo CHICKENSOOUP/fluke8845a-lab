@@ -4,7 +4,9 @@
 
 ## 简体中文
 
-本源码仓库不包含第三方运行时二进制文件。依赖按 `pyproject.toml` 和 `requirements.txt` 单独安装，各依赖继续适用其自身许可证。
+本项目的源码 ZIP 不包含第三方运行时二进制文件；源码依赖按 `pyproject.toml` 和 `requirements.txt` 单独安装，各依赖继续适用其自身许可证。本文件也随 Windows 便携包提供，而 Windows 便携包会捆绑 CPython、Qt/PySide、NumPy 等第三方运行时二进制文件，并受各自许可证约束。
+
+下方日期为 2026-10-15 的便携包审查材料只适用于其中明确命名的旧候选包，不能作为 A3 或其他更新构建的许可证审查结论。新构建的状态以该包内的运行时清单和对应版本的审查记录为准；只要清单标为 `partial` 或存在未关闭事项，就不能据此认定该二进制包已获准分发。
 
 ### Qt for Python（PySide6）与 Qt
 
@@ -22,7 +24,9 @@
 
 ## English
 
-This source repository does not bundle third-party runtime binaries. Dependencies are installed separately as declared in `pyproject.toml` and `requirements.txt`; each dependency remains under its own license.
+The project's source ZIP does not bundle third-party runtime binaries. Source dependencies are installed separately as declared in `pyproject.toml` and `requirements.txt`; each dependency remains under its own license. This notice is also included in the Windows portable package, which bundles third-party runtime binaries such as CPython, Qt/PySide, and NumPy under their respective licenses.
+
+The portable-package review dated 2026-10-15 below applies only to the older candidate named in that report; it is not a license-review result for A3 or any newer build. A new build must be assessed using its own bundled runtime manifest and corresponding review record. A manifest marked `partial` or listing open items does not establish that binary redistribution is cleared.
 
 ## Qt for Python (PySide6) and Qt
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -509,6 +513,111 @@ def test_mock_e2e_cli_routes_report_path(tmp_path, monkeypatch):
 
     assert result == 19
     assert captured["report_path"] == report_path
+
+
+def test_mock_e2e_subprocess_completes_all_six_modes_and_saves_each_run(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    report_path = tmp_path / "mock-e2e-report.json"
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["FLUKE8845A_CONFIG_DIR"] = str(tmp_path / "config")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+        str(repository_root / "src"), env.get("PYTHONPATH", ""),
+    ]))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "fluke8845a.app", "--mock-e2e", "--report", str(report_path)],
+        cwd=repository_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=50,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "ok"
+    assert report["simulation"] is True
+    assert report["mode_count"] == 6
+    assert {result["mode"] for result in report["modes"]} == {
+        mode.value for mode in Mode
+    }
+    assert all(result["valid_sample_count"] >= 3 for result in report["modes"])
+
+
+def test_mock_e2e_failure_stops_active_acquisition_before_temp_cleanup(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    report_path = tmp_path / "mock-e2e-failure-report.json"
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["FLUKE8845A_CONFIG_DIR"] = str(tmp_path / "config")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+        str(repository_root / "src"), env.get("PYTHONPATH", ""),
+    ]))
+    script = r"""
+import sys
+from pathlib import Path
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QMessageBox
+import fluke8845a.app as app_module
+
+original_start = app_module.MainWindow._start_continuous
+def start_then_fail(window):
+    original_start(window)
+    QTimer.singleShot(0, lambda: QMessageBox.warning(window, "forced test error", "forced"))
+app_module.MainWindow._start_continuous = start_then_fail
+raise SystemExit(app_module.run_mock_six_mode_gui_probe(Path(sys.argv[1])))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(report_path)],
+        cwd=repository_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "error"
+    assert "forced" in report["error"]
+
+
+def test_mock_e2e_unexpected_event_loop_exit_waits_for_active_worker(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    report_path = tmp_path / "mock-e2e-loop-exit-report.json"
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["FLUKE8845A_CONFIG_DIR"] = str(tmp_path / "config")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+        str(repository_root / "src"), env.get("PYTHONPATH", ""),
+    ]))
+    script = r"""
+import sys
+from pathlib import Path
+from PySide6.QtCore import QTimer, QCoreApplication
+import fluke8845a.app as app_module
+
+original_start = app_module.MainWindow._start_continuous
+def start_then_quit_loop(window):
+    original_start(window)
+    QTimer.singleShot(0, QCoreApplication.quit)
+app_module.MainWindow._start_continuous = start_then_quit_loop
+raise SystemExit(app_module.run_mock_six_mode_gui_probe(Path(sys.argv[1])))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(report_path)],
+        cwd=repository_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "error"
+    assert "事件循环意外结束" in report["error"]
 
 
 def test_serial_runtime_smoke_imports_pyserial_and_enumerates_ports_without_gui():

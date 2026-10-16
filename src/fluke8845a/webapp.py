@@ -7,6 +7,7 @@ import json
 import mimetypes
 import signal
 import sys
+import tempfile
 import threading
 import webbrowser
 from datetime import datetime
@@ -18,17 +19,24 @@ from PySide6.QtCore import QCoreApplication, QStandardPaths
 
 from . import __version__
 from .modes import DESCRIPTORS
+from .scpi import DIGITAL_FILTER_DISABLED_REASON
+from .storage import complete_csv_prefix_size, write_excel_safe_events_csv
 from .webservice import WebRuntime
 
 _WEB_ROOT = Path(__file__).with_name("web")
 _MAX_COMMAND_BYTES = 32 * 1024
 _SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
     "Cache-Control": "no-store",
 }
+
+
+def _complete_csv_prefix_size(path: Path, chunk_size: int = 64 * 1024) -> int:
+    """Return the byte length through the last complete CSV record boundary."""
+    return complete_csv_prefix_size(path, chunk_size=chunk_size)
 
 
 class LocalWebServer(ThreadingHTTPServer):
@@ -104,10 +112,14 @@ class LocalWebHandler(BaseHTTPRequestHandler):
                     "label": spec.label,
                     "quantity": spec.quantity,
                     "unit": spec.unit_si,
+                    "wiring_group": spec.wiring_group,
+                    "rms": spec.rms,
                     "ranges": list(spec.ranges_si),
                     "nplc": list(spec.nplc_values),
                     "bandwidths": list(spec.ac_bandwidths_hz),
                     "analog_filter": spec.analog_filter,
+                    "digital_filter": spec.digital_filter,
+                    "input_impedance_auto": spec.input_impedance_auto,
                     "safety": spec.safety,
                 })
             documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
@@ -115,6 +127,7 @@ class LocalWebHandler(BaseHTTPRequestHandler):
                 documents = str(Path.home() / "Documents")
             self._send_json(200, {
                 "version": __version__, "modes": modes, "server": "loopback",
+                "digital_filter_disabled_reason": DIGITAL_FILTER_DISABLED_REASON,
                 "default_root": str(Path(documents) / "Fluke8845A_Experiments"),
             })
             return
@@ -143,12 +156,15 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/latest.csv":
             self._send_latest_csv()
             return
+        if parsed.path == "/api/latest-events-safe.csv":
+            self._send_latest_events_safe_csv()
+            return
         if parsed.path.startswith("/api/"):
             self._not_found()
             return
         if parsed.path == "/":
             path = _WEB_ROOT / "index.html"
-        elif parsed.path in ("/app.css", "/app.js"):
+        elif parsed.path in ("/app.css", "/app.js", "/history_worker.js"):
             path = _WEB_ROOT / parsed.path.lstrip("/")
         else:
             self._not_found()
@@ -163,7 +179,9 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         self._send_bytes(200, body, mime + charset)
 
     def _send_latest_csv(self) -> None:
-        directory = self.server.runtime.store.snapshot().get("last_experiment_dir", "")
+        state = self.server.runtime.store.snapshot()
+        active_snapshot = bool(state.get("experiment_dir"))
+        directory = state.get("experiment_dir") or state.get("last_experiment_dir", "")
         if not directory:
             self._send_json(404, {"error": "当前还没有实验 CSV"})
             return
@@ -172,12 +190,19 @@ class LocalWebHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "实验 CSV 不可读取"})
             return
         try:
-            size = path.stat().st_size
-            filename = quote(f"{Path(directory).name}_measurements.csv")
+            snapshot_time = datetime.now().astimezone().isoformat(timespec="seconds")
+            size = _complete_csv_prefix_size(path) if active_snapshot else path.stat().st_size
+            if size <= 0:
+                self._send_json(404, {"error": "实验 CSV 中还没有可导出的完整记录"})
+                return
+            marker = "进行中快照" if active_snapshot else "已保存"
+            filename = quote(f"{Path(directory).name}_{marker}_{snapshot_time.replace(':', '-')}_measurements.csv")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8-sig")
             self.send_header("Content-Length", str(size))
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{filename}")
+            self.send_header("X-8845A-Export-State", "in-progress-snapshot" if active_snapshot else "saved")
+            self.send_header("X-8845A-Snapshot-Time", snapshot_time)
             for key, value in _SECURITY_HEADERS.items():
                 self.send_header(key, value)
             self.end_headers()
@@ -192,6 +217,42 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         except OSError:
             # Headers may already be sent; dropping this connection is safer than inventing data.
             self.close_connection = True
+
+    def _send_latest_events_safe_csv(self) -> None:
+        state = self.server.runtime.store.snapshot()
+        if state.get("experiment_dir"):
+            self._send_json(409, {"error": "请停止采集后再导出事件安全副本；原始 events.csv 始终保留不变"})
+            return
+        directory = state.get("last_experiment_dir", "")
+        if not directory:
+            self._send_json(404, {"error": "当前还没有已完成实验的事件 CSV"})
+            return
+        path = (Path(directory) / "events.csv").resolve()
+        if path.name != "events.csv" or not path.is_file():
+            self._send_json(404, {"error": "实验事件 CSV 不可读取"})
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="fluke8845a-events-safe-") as temporary_directory:
+                safe_path = Path(temporary_directory) / "events_excel_safe.csv"
+                write_excel_safe_events_csv(path, safe_path)
+                size = safe_path.stat().st_size
+                filename = quote(f"{Path(directory).name}_events_excel_safe.csv")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8-sig")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{filename}")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                try:
+                    with safe_path.open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            self.wfile.write(chunk)
+                except OSError:
+                    # Once headers are sent, dropping the connection is safer than inventing data.
+                    self.close_connection = True
+        except (OSError, ValueError) as exc:
+            self._send_json(400, {"error": f"无法生成事件安全副本：{exc}"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if not self._check_local_request(require_origin=True):
@@ -246,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         server = create_server(runtime, args.port)
     except OSError as exc:
-        runtime.stop()
+        while not runtime.stop():
+            print("localhost 服务线程仍在收尾；等待采集线程安全关闭。", file=sys.stderr, flush=True)
         print(f"无法启动 localhost 服务：{exc}", file=sys.stderr)
         return 2
     url = f"http://127.0.0.1:{server.server_port}/"
@@ -268,7 +330,8 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGINT, previous_sigint)
         server.shutdown()
         server.server_close()
-        runtime.stop()
+        while not runtime.stop():
+            print("采集线程仍在完成当前操作；等待串口与数据文件安全关闭。", file=sys.stderr, flush=True)
     return 0
 
 
