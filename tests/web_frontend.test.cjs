@@ -1183,6 +1183,9 @@ test("settings labels remain readable and secondary text meets contrast target",
   const buttonRule = css.match(/\.button\s*\{([^}]*)\}/);
   assert.ok(buttonRule, "primary and secondary buttons share a readable base size");
   assert.match(buttonRule[1], /font-size:\s*12px/);
+  const statCountRule = css.match(/\.stat-card \.stat-count\s*\{([^}]*)\}/);
+  assert.ok(statCountRule, "statistic sample counts have a readable rule");
+  assert.match(statCountRule[1], /font-size:\s*12px/);
   const hintRule = css.match(/\.field-hint, \.rail-footnote\s*\{([^}]*)\}/);
   assert.ok(hintRule, "settings hint rule exists");
   const colorMatch = hintRule[1].match(/color:\s*(#[\da-fA-F]{6})/);
@@ -2545,6 +2548,20 @@ test("events export is a separate safety copy and stays disabled during acquisit
   assert.match(javascript, /downloadEventsSafe"\)\.disabled = !state\.last_experiment_dir \|\| !!state\.experiment_dir/);
   assert.match(javascript, /\/api\/latest-events-safe\.csv/);
   assert.match(javascript, /已导出事件安全副本；原始 events\.csv 未修改/);
+});
+
+test("measurement export is a separate safety copy and stays disabled during acquisition", () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const javascript = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
+  assert.match(html, /id="downloadMeasurementsSafe"[^>]*disabled[^>]*原始 measurements\.csv 不会更改/);
+  assert.match(javascript, /downloadMeasurementsSafe"\)\.disabled = !state\.last_experiment_dir \|\| !!state\.experiment_dir/);
+  assert.match(javascript, /\/api\/latest-measurements-safe\.csv/);
+  assert.match(javascript, /已导出测量安全副本；原始 measurements\.csv 未修改/);
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ experiment_dir: "D:\\experiments\\active", last_experiment_dir: "D:\\experiments\\active" }));
+  assert.equal(element(elements, "downloadMeasurementsSafe").disabled, true);
+  api.updateStateDisplay(connectedState({ experiment_dir: "", last_experiment_dir: "D:\\experiments\\done" }));
+  assert.equal(element(elements, "downloadMeasurementsSafe").disabled, false);
 });
 
 test("PNG export includes experiment, mode, time range, local export time, and baseline context", () => {

@@ -153,6 +153,19 @@ def test_excel_safe_event_export_preserves_quoted_newlines_and_rejects_wrong_sch
         excel_safe_events_csv_bytes(b"event,elapsed_s\nordinary,0.5,unexpected\n")
 
 
+def test_safe_csv_exports_reject_unrecognized_formula_like_headers(tmp_path):
+    with pytest.raises(ValueError, match="未知列"):
+        excel_safe_events_csv_bytes(b"=1+1,event\n=HYPERLINK,ordinary\n")
+
+    source = tmp_path / "measurements.csv"
+    destination = tmp_path / "measurements_safe.csv"
+    source.write_bytes(b"=1+1,raw_reading,error\n=HYPERLINK,1.0,\n")
+    with pytest.raises(ValueError, match="未知列"):
+        storage_module.write_excel_safe_measurements_csv(source, destination)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".measurements-safe-*.tmp"))
+
+
 def test_streaming_excel_safe_export_preserves_raw_source_and_replaces_only_destination(tmp_path):
     source = tmp_path / "events.csv"
     destination = tmp_path / "events_excel_safe.csv"
@@ -180,7 +193,7 @@ def test_streaming_excel_safe_export_preserves_raw_source_and_replaces_only_dest
 def test_streaming_excel_safe_export_never_overwrites_an_existing_destination(tmp_path):
     source = tmp_path / "events.csv"
     destination = tmp_path / "user-notes.csv"
-    source.write_text("event,value\n=1+1,2\n", encoding="utf-8")
+    source.write_text("event,value_si\n=1+1,2\n", encoding="utf-8")
     destination.write_bytes(b"user data that must remain unchanged")
 
     with pytest.raises(FileExistsError, match="目标已存在"):
@@ -193,7 +206,7 @@ def test_streaming_excel_safe_export_never_overwrites_an_existing_destination(tm
 def test_streaming_excel_safe_export_does_not_replace_destination_on_malformed_csv(tmp_path):
     source = tmp_path / "events.csv"
     destination = tmp_path / "events_excel_safe.csv"
-    source.write_text("event,value\ntext,1,extra\n", encoding="utf-8")
+    source.write_text("event,value_si\ntext,1,extra\n", encoding="utf-8")
     destination.write_bytes(b"prior export")
     with pytest.raises(ValueError, match="列数不一致"):
         write_excel_safe_events_csv(source, destination)
@@ -203,7 +216,7 @@ def test_streaming_excel_safe_export_does_not_replace_destination_on_malformed_c
 
 def test_streaming_excel_safe_export_refuses_to_overwrite_the_raw_events_file(tmp_path):
     source = tmp_path / "events.csv"
-    original = b"event,value\n=1+1,3\n"
+    original = b"event,value_si\n=1+1,3\n"
     source.write_bytes(original)
     with pytest.raises(ValueError, match="不能覆盖原始事件 CSV"):
         write_excel_safe_events_csv(source, source)
@@ -213,6 +226,64 @@ def test_streaming_excel_safe_export_refuses_to_overwrite_the_raw_events_file(tm
     with pytest.raises(ValueError, match="不能覆盖原始事件 CSV"):
         write_excel_safe_events_csv(source, alias)
     assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", " \t=", "\u00a0+", "\x01@"])
+def test_measurement_safe_copy_escapes_untrusted_text_and_preserves_raw_file(tmp_path, prefix):
+    source = tmp_path / "measurements.csv"
+    destination = tmp_path / "measurements_excel_safe.csv"
+    original = (
+        "experiment_id,value_si,voltage_v,raw_reading,error,elapsed_s\r\n"
+        f"run-1,-1.2345678901234567,-1.2345678901234567,{prefix}READ,{prefix}DETAIL,0.25\r\n"
+        "run-1,2.5,2.5,+2.50000000E+00,,0.50\r\n"
+    ).encode("utf-8-sig")
+    source.write_bytes(original)
+
+    storage_module.write_excel_safe_measurements_csv(source, destination)
+
+    assert source.read_bytes() == original
+    with destination.open("r", encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["raw_reading"] == "'" + prefix + "READ"
+    assert rows[0]["error"] == "'" + prefix + "DETAIL"
+    assert rows[0]["value_si"] == "-1.2345678901234567"
+    assert rows[0]["voltage_v"] == "-1.2345678901234567"
+    assert rows[0]["elapsed_s"] == "0.25"
+    assert rows[1]["raw_reading"] == "'+2.50000000E+00"
+    assert rows[1]["value_si"] == "2.5"
+    assert rows[1]["error"] == ""
+    assert not list(tmp_path.glob(".measurements-safe-*.tmp"))
+
+
+def test_measurement_safe_export_rejects_wrong_schema_and_malformed_rows(tmp_path):
+    source = tmp_path / "measurements.csv"
+    destination = tmp_path / "safe.csv"
+    source.write_text("value_si,error\n1,=1+1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="raw_reading"):
+        storage_module.write_excel_safe_measurements_csv(source, destination)
+    assert not destination.exists()
+
+    source.write_text("raw_reading,error\ntext,detail,extra\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="列数不一致"):
+        storage_module.write_excel_safe_measurements_csv(source, destination)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".measurements-safe-*.tmp"))
+
+
+def test_measurement_safe_export_refuses_to_overwrite_source_or_existing_destination(tmp_path):
+    source = tmp_path / "measurements.csv"
+    original = b"raw_reading,error\n=1+1,details\n"
+    source.write_bytes(original)
+    with pytest.raises(ValueError, match="不能覆盖原始测量 CSV"):
+        storage_module.write_excel_safe_measurements_csv(source, source)
+    assert source.read_bytes() == original
+
+    destination = tmp_path / "user-notes.csv"
+    destination.write_bytes(b"preserve user file")
+    with pytest.raises(FileExistsError, match="目标已存在"):
+        storage_module.write_excel_safe_measurements_csv(source, destination)
+    assert destination.read_bytes() == b"preserve user file"
+    assert not list(tmp_path.glob(".measurements-safe-*.tmp"))
 
 
 def test_measurement_and_event_csv_share_a_persisted_experiment_identifier(tmp_path):
@@ -289,6 +360,35 @@ def test_validate_experiment_name_rejects_windows_path_and_control_characters(na
 
 def test_validate_experiment_name_preserves_valid_name():
     assert storage_module.validate_experiment_name("  阶跃响应 测试  ") == "阶跃响应 测试"
+
+
+def test_get_available_space_bytes_reports_free_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        storage_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=100, used=25, free=75),
+    )
+
+    assert storage_module.get_available_space_bytes(tmp_path) == 75
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "expected"),
+    [(int(4.5 * 1024**3), "4.5 GiB"), (512 * 1024**2, "512 MiB")],
+)
+def test_format_available_space_uses_readable_binary_units(free_bytes, expected):
+    assert storage_module.format_available_space(free_bytes) == expected
+
+
+def test_require_minimum_free_space_accepts_exact_startup_reserve():
+    assert storage_module.require_minimum_free_space(
+        storage_module.MINIMUM_FREE_SPACE_BYTES
+    ) == storage_module.MINIMUM_FREE_SPACE_BYTES
+
+
+def test_require_minimum_free_space_rejects_one_byte_below_startup_reserve():
+    with pytest.raises(OSError, match="可用空间不足"):
+        storage_module.require_minimum_free_space(storage_module.MINIMUM_FREE_SPACE_BYTES - 1)
 
 
 def test_prepare_experiment_storage_probes_and_cleans_writable_directory(tmp_path, monkeypatch):

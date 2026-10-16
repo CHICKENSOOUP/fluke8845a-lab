@@ -16,6 +16,7 @@ from fluke8845a.modes import Mode
 from fluke8845a.scpi import FlowControl
 from fluke8845a.webapp import _complete_csv_prefix_size, create_server
 from fluke8845a import webservice as webservice_module
+from fluke8845a import storage as storage_module
 from fluke8845a.webservice import WebRuntime, mode_settings_from_payload, serial_settings_from_payload
 from tests.fakes import FakeTransport
 
@@ -167,6 +168,57 @@ def test_safe_event_export_streams_source_without_reading_it_all_into_memory(
     assert original_read_bytes(event_path) == original
 
 
+def test_safe_measurement_export_escapes_text_columns_and_preserves_raw_file(
+    tmp_path, local_service, monkeypatch,
+):
+    app, runtime, server = local_service
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    run_dir = tmp_path / "finished-run"
+    run_dir.mkdir()
+    measurement_path = run_dir / "measurements.csv"
+    original = (
+        b"sample_index,value_si,raw_reading,error\r\n"
+        b"1,-1.25,-1.25000000E+00,\r\n"
+        b"2,2.5,=1+1,+device error\r\n"
+    )
+    measurement_path.write_bytes(original)
+    runtime.store.update(experiment_dir="", last_experiment_dir=str(run_dir))
+
+    original_read_bytes = Path.read_bytes
+
+    def reject_source_read_bytes(path):
+        if path.resolve() == measurement_path.resolve():
+            raise AssertionError("measurement safe export must stream the source")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_source_read_bytes)
+    status, headers, body = _main_thread_wait(
+        app, lambda: _http(base_url + "/api/latest-measurements-safe.csv")
+    )
+
+    assert status == 200
+    assert headers.get("Content-Type", "").startswith("text/csv")
+    assert "measurements_excel_safe.csv" in headers.get("Content-Disposition", "")
+    assert b"-1.25,'-1.25000000E+00" in body
+    assert b"'=1+1,'+device error" in body
+    assert original_read_bytes(measurement_path) == original
+
+
+def test_safe_measurement_export_is_rejected_while_experiment_is_active(tmp_path, local_service):
+    app, runtime, server = local_service
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    run_dir = tmp_path / "active-run"
+    run_dir.mkdir()
+    runtime.store.update(experiment_dir=str(run_dir), last_experiment_dir=str(run_dir))
+
+    status, _headers, body = _main_thread_wait(
+        app, lambda: _http(base_url + "/api/latest-measurements-safe.csv")
+    )
+
+    assert status == 409
+    assert "停止采集" in json.loads(body)["error"]
+
+
 @pytest.mark.parametrize("chunk_size", [1, 2, 3, 7])
 def test_csv_snapshot_prefix_respects_quoted_newlines_and_chunk_boundaries(tmp_path, chunk_size):
     path = tmp_path / "measurements.csv"
@@ -290,10 +342,13 @@ def test_web_payload_accepts_each_supported_nplc_value(nplc):
     assert settings.nplc == nplc
 
 
-def test_mock_preflight_checks_connection_configuration_wiring_and_storage(tmp_path, local_service):
+def test_mock_preflight_checks_connection_configuration_wiring_and_storage(tmp_path, local_service, monkeypatch):
     app, runtime, server = local_service
     base_url = f"http://127.0.0.1:{server.server_port}"
     settings = {"mode": "DCV", "autorange": True, "nplc": 1, "autozero": True}
+    monkeypatch.setattr(
+        webservice_module, "get_available_space_bytes", lambda _root: int(4.5 * 1024**3), raising=False
+    )
 
     status, _headers, body = _api_command(app, base_url, "preflight", {
         "settings": settings, "name": "短测", "root": str(tmp_path), "interval_s": 0,
@@ -314,6 +369,10 @@ def test_mock_preflight_checks_connection_configuration_wiring_and_storage(tmp_p
     assert any("仪器已连接" in item for item in result["checks"])
     assert any("模式" in item and "回读" in item for item in result["checks"])
     assert any("可写" in item for item in result["checks"])
+    assert any("当前可用 4.5 GiB" in item for item in result["checks"])
+    assert any("不预测长期实验总空间" in item for item in result["checks"])
+    assert any("停止采集并尝试收尾文件" in item for item in result["checks"])
+    assert any("记录可能不完整" in item for item in result["checks"])
     assert any("MOCK无需实体接线" in item for item in result["checks"])
     assert runtime.worker.state.value == "stopped"
     assert not runtime.store.snapshot()["experiment_dir"]
@@ -326,6 +385,29 @@ def test_mock_preflight_checks_connection_configuration_wiring_and_storage(tmp_p
     assert status == 200, body
     assert json.loads(body)["duplicate_name"] is True
     assert any("同名实验目录" in item for item in json.loads(body)["checks"])
+
+
+def test_web_preflight_rejects_space_below_reserve_on_final_check(tmp_path, local_service, monkeypatch):
+    app, _runtime, server = local_service
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    settings = {"mode": "DCV", "autorange": True, "nplc": 1, "autozero": True}
+    monkeypatch.setattr(webservice_module, "prepare_experiment_storage", lambda root: Path(root))
+    monkeypatch.setattr(
+        webservice_module,
+        "get_available_space_bytes",
+        lambda _root: storage_module.MINIMUM_FREE_SPACE_BYTES - 1,
+    )
+    status, _headers, body = _api_command(app, base_url, "connect_mock", {
+        "settings": settings, "scenario": "阶跃响应与恢复",
+    })
+    assert status == 200, body
+
+    status, _headers, body = _api_command(app, base_url, "preflight", {
+        "settings": settings, "name": "低空间", "root": str(tmp_path), "interval_s": 0,
+    })
+
+    assert status == 400
+    assert "可用空间不足" in json.loads(body)["message"]
 
 
 def test_preflight_rejects_unconfirmed_real_wiring_without_starting(tmp_path, local_service, monkeypatch):

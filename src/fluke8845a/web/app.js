@@ -975,6 +975,7 @@ function updateStateDisplay(state) {
   el("downloadCsv").disabled = !state.last_experiment_dir;
   el("downloadCsv").textContent = state.experiment_dir ? "下载进行中快照 CSV" : state.last_experiment_dir ? "下载最近已保存 CSV" : "暂无可下载 CSV";
   el("downloadEventsSafe").disabled = !state.last_experiment_dir || !!state.experiment_dir;
+  el("downloadMeasurementsSafe").disabled = !state.last_experiment_dir || !!state.experiment_dir;
   el("downloadCsv").title = state.experiment_dir
     ? "下载时生成进行中快照，只包含最后一条完整 CSV 记录；响应会标明服务器快照时间。"
     : state.last_experiment_dir ? "下载最近一次已完成并保存的原始 CSV。" : "开始并保存一次实验后即可下载原始 CSV。";
@@ -2309,6 +2310,27 @@ async function downloadLatestEventsSafeCsv() {
   }
 }
 
+async function downloadLatestMeasurementsSafeCsv() {
+  try {
+    const response = await fetch("/api/latest-measurements-safe.csv", { cache: "no-store" });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(await response.blob());
+    link.href = url;
+    link.download = encodedName ? decodeURIComponent(encodedName) : "measurements_excel_safe.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+    toast("已导出测量安全副本；原始 measurements.csv 未修改");
+  } catch (error) {
+    toast(`测量 CSV 导出失败：${error.message}`, true);
+  }
+}
+
 async function copyExperimentPath() {
   const directory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
   if (!directory) { toast("实验目录将在开始采集后创建", true); return; }
@@ -2441,6 +2463,7 @@ function bindControls() {
   el("eventText").addEventListener("keydown", (event) => { if (event.key === "Enter") el("markEvent").click(); });
   el("downloadCsv").addEventListener("click", downloadLatestCsv);
   el("downloadEventsSafe").addEventListener("click", downloadLatestEventsSafeCsv);
+  el("downloadMeasurementsSafe").addEventListener("click", downloadLatestMeasurementsSafeCsv);
   el("savePlot").addEventListener("click", savePlot);
   el("historyFile").addEventListener("change", (event) => loadHistory(event.target.files[0]));
   el("historyDirectory").addEventListener("change", async (event) => {

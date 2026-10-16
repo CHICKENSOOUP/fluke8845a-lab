@@ -20,7 +20,11 @@ from PySide6.QtCore import QCoreApplication, QStandardPaths
 from . import __version__
 from .modes import DESCRIPTORS
 from .scpi import DIGITAL_FILTER_DISABLED_REASON
-from .storage import complete_csv_prefix_size, write_excel_safe_events_csv
+from .storage import (
+    complete_csv_prefix_size,
+    write_excel_safe_events_csv,
+    write_excel_safe_measurements_csv,
+)
 from .webservice import WebRuntime
 
 _WEB_ROOT = Path(__file__).with_name("web")
@@ -159,6 +163,9 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/latest-events-safe.csv":
             self._send_latest_events_safe_csv()
             return
+        if parsed.path == "/api/latest-measurements-safe.csv":
+            self._send_latest_measurements_safe_csv()
+            return
         if parsed.path.startswith("/api/"):
             self._not_found()
             return
@@ -253,6 +260,41 @@ class LocalWebHandler(BaseHTTPRequestHandler):
                     self.close_connection = True
         except (OSError, ValueError) as exc:
             self._send_json(400, {"error": f"无法生成事件安全副本：{exc}"})
+
+    def _send_latest_measurements_safe_csv(self) -> None:
+        state = self.server.runtime.store.snapshot()
+        if state.get("experiment_dir"):
+            self._send_json(409, {"error": "请停止采集后再导出测量安全副本；原始 measurements.csv 始终保留不变"})
+            return
+        directory = state.get("last_experiment_dir", "")
+        if not directory:
+            self._send_json(404, {"error": "当前还没有已完成实验的测量 CSV"})
+            return
+        path = (Path(directory) / "measurements.csv").resolve()
+        if path.name != "measurements.csv" or not path.is_file():
+            self._send_json(404, {"error": "实验测量 CSV 不可读取"})
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="fluke8845a-measurements-safe-") as temporary_directory:
+                safe_path = Path(temporary_directory) / "measurements_excel_safe.csv"
+                write_excel_safe_measurements_csv(path, safe_path)
+                size = safe_path.stat().st_size
+                filename = quote(f"{Path(directory).name}_measurements_excel_safe.csv")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8-sig")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{filename}")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                try:
+                    with safe_path.open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            self.wfile.write(chunk)
+                except OSError:
+                    self.close_connection = True
+        except (OSError, ValueError) as exc:
+            self._send_json(400, {"error": f"无法生成测量安全副本：{exc}"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if not self._check_local_request(require_origin=True):

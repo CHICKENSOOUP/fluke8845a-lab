@@ -41,8 +41,9 @@ from .scpi import (
 )
 from .storage import (
     complete_csv_prefix_size, find_existing_experiment_directories,
+    format_available_space, get_available_space_bytes, require_minimum_free_space,
     prepare_experiment_storage, validate_experiment_name,
-    write_excel_safe_events_csv,
+    write_excel_safe_events_csv, write_excel_safe_measurements_csv,
 )
 from .worker import MeasurementWorker
 
@@ -410,6 +411,24 @@ class _SafeEventsExportTask(QRunnable):
         error = None
         try:
             write_excel_safe_events_csv(self.source, self.destination)
+        except Exception as exc:
+            error = str(exc)
+        self.signals.completed.emit(str(self.destination), error)
+
+
+class _SafeMeasurementsExportTask(QRunnable):
+    """Stream a spreadsheet-safe measurement copy outside the GUI thread."""
+
+    def __init__(self, source: Path, destination: Path) -> None:
+        super().__init__()
+        self.source = source
+        self.destination = destination
+        self.signals = _SafeEventsExportSignals()
+
+    def run(self) -> None:
+        error = None
+        try:
+            write_excel_safe_measurements_csv(self.source, self.destination)
         except Exception as exc:
             error = str(exc)
         self.signals.completed.emit(str(self.destination), error)
@@ -821,6 +840,7 @@ class MainWindow(QMainWindow):
         self._experiment_csv_path: Path | None = None
         self._snapshot_pending = False
         self._snapshot_task: _CsvSnapshotTask | None = None
+        self._safe_measurements_export_task: _SafeMeasurementsExportTask | None = None
         self._region_stats_request_id = 0
         self._region_stats_tasks: dict[int, _RegionStatisticsTask] = {}
         self._region_stats_scanning = False
@@ -1048,12 +1068,18 @@ class MainWindow(QMainWindow):
         self.files_snapshot_button.clicked.connect(self._export_running_snapshot)
         self.files_safe_events_button = QPushButton("导出事件安全副本")
         self.files_safe_events_button.clicked.connect(self._export_safe_events_csv)
+        self.files_safe_measurements_button = QPushButton("导出测量安全副本")
+        self.files_safe_measurements_button.setToolTip(
+            "仅处理原始响应和错误文本；原始 measurements.csv 保持不变。请停止采集后导出。"
+        )
+        self.files_safe_measurements_button.clicked.connect(self._export_safe_measurements_csv)
         self.files_close_button = QPushButton("关闭")
         self.files_close_button.clicked.connect(self.files_dialog.hide)
         for button in (
             self.refresh_files_button, self.files_open_directory_button,
             self.files_copy_path_button, self.files_load_history_button,
             self.files_snapshot_button, self.files_safe_events_button,
+            self.files_safe_measurements_button,
             self.files_close_button,
         ):
             button.setProperty("class", "secondaryButton")
@@ -3811,6 +3837,9 @@ class MainWindow(QMainWindow):
         if active is None or active.get("mode") != settings.mode.value:
             raise ValueError("当前仪器配置没有可用的回读结果；请先应用仪器参数并确认回读")
         prepared_root = prepare_experiment_storage(root)
+        available_space = format_available_space(
+            require_minimum_free_space(get_available_space_bytes(prepared_root))
+        )
         duplicates = find_existing_experiment_directories(prepared_root, self.experiment_name.text())
         identity = self.idn_label.text().replace("设备身份：", "").strip() or "已连接仪器"
         wiring = "模拟器无需实体接线" if self._simulation else (
@@ -3820,7 +3849,9 @@ class MainWindow(QMainWindow):
             "采集预检通过：\n"
             f"✓ 仪器已连接：{identity}\n"
             f"✓ 当前功能已回读：{descriptor(settings.mode).label}；本次参数将在开始时再次应用并回读\n"
-            f"✓ 保存目录可写：{prepared_root}（至少需要 10 MiB 可用空间；剩余空间无法核实时拒绝启动）\n"
+            f"✓ 保存目录可写：{prepared_root}（当前可用 {available_space}；启动至少预留 10 MiB，"
+            "采集中每 5 秒复查；低于预留值时停止采集并尝试收尾文件，若收尾失败会提示记录可能不完整；"
+            "不预测长期实验总空间）\n"
             f"✓ {wiring}\n"
             "✓ 实验名称有效；不会覆盖旧数据。"
         )
@@ -4822,10 +4853,70 @@ class MainWindow(QMainWindow):
             f"已导出事件安全副本；原始 events.csv 未修改：{destination}", 10000
         )
 
+    def _export_safe_measurements_csv(self) -> None:
+        if self._experiment_active:
+            QMessageBox.information(
+                self, "请先停止采集",
+                "停止采集后再导出测量副本，原始 measurements.csv 会保持不变。",
+            )
+            return
+        directory = self._experiment_directory()
+        source = None if directory is None else directory / "measurements.csv"
+        if source is None or not source.is_file():
+            self.statusBar().showMessage("没有可导出的实验测量 CSV。", 8000)
+            return
+        suggestion = source.with_name(f"{source.stem}_excel_safe.csv")
+        destination_text, _selected_filter = QFileDialog.getSaveFileName(
+            self, "导出测量表格软件安全副本", str(suggestion), "CSV 文件 (*.csv)"
+        )
+        if not destination_text:
+            return
+        destination = Path(destination_text)
+        if destination.suffix.casefold() != ".csv":
+            destination = destination.with_suffix(".csv")
+        try:
+            task = _SafeMeasurementsExportTask(source, destination)
+            task.signals.completed.connect(self._on_safe_measurements_exported)
+            self._safe_measurements_export_task = task
+            self.files_safe_measurements_button.setEnabled(False)
+            self.statusBar().showMessage(
+                "正在后台生成测量安全副本；原始 measurements.csv 保持不变。"
+            )
+            QThreadPool.globalInstance().start(task)
+        except Exception as exc:
+            self._show_error(f"测量安全副本导出失败：{exc}")
+
+    @Slot(str, object)
+    def _on_safe_measurements_exported(self, destination: str, error: object) -> None:
+        self._safe_measurements_export_task = None
+        if self._shutdown_started:
+            return
+        directory = self._experiment_directory()
+        self.files_safe_measurements_button.setEnabled(
+            directory is not None and not self._experiment_active
+            and (directory / "measurements.csv").is_file()
+        )
+        if error:
+            self._show_error(f"测量安全副本导出失败：{error}")
+            return
+        self.statusBar().showMessage(
+            f"已导出测量安全副本；原始 measurements.csv 未修改：{destination}", 10000
+        )
+
     def _update_experiment_directory_controls(self) -> None:
         directory = self._experiment_directory()
         if hasattr(self, "export_events_safe_button"):
             self.export_events_safe_button.setEnabled(directory is not None and not self._experiment_active)
+        if hasattr(self, "files_safe_events_button"):
+            self.files_safe_events_button.setEnabled(
+                directory is not None and not self._experiment_active
+                and (directory / "events.csv").is_file()
+            )
+        if hasattr(self, "files_safe_measurements_button"):
+            self.files_safe_measurements_button.setEnabled(
+                directory is not None and not self._experiment_active
+                and (directory / "measurements.csv").is_file()
+            )
         available = directory is not None
         self.recent_experiment_path.setText(str(directory) if available else "尚无可用实验目录")
         self.recent_experiment_files_label.setText(
@@ -4854,6 +4945,9 @@ class MainWindow(QMainWindow):
         )
         self.files_safe_events_button.setEnabled(
             available and not self._experiment_active and (directory / "events.csv").is_file()
+        )
+        self.files_safe_measurements_button.setEnabled(
+            available and not self._experiment_active and (directory / "measurements.csv").is_file()
         )
         if directory is None:
             self.experiment_file_list.addItem("尚无实验文件；完成一次测量后会在此列出原始数据和导出结果。")

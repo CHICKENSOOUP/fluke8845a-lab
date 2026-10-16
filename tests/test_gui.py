@@ -22,6 +22,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QPushButton
 
 from fluke8845a import gui as gui_module
+from fluke8845a import storage as storage_module
 from fluke8845a.gui import MainWindow
 from fluke8845a.mock import MockScenario
 from fluke8845a.modes import DESCRIPTORS, Mode
@@ -3689,6 +3690,69 @@ def test_desktop_safe_events_export_saves_safe_copy_and_preserves_raw_csv(
         qt_app.processEvents()
 
 
+def test_desktop_safe_measurements_export_saves_separate_copy_and_preserves_raw_csv(
+    qt_app, monkeypatch, tmp_path
+):
+    directory = tmp_path / "experiment-run"
+    directory.mkdir()
+    source = directory / "measurements.csv"
+    original = (
+        b"sample_index,value_si,raw_reading,error\r\n"
+        b"1,-1.25,-1.25000000E+00,\r\n"
+        b"2,2.5,=1+1,+device error\r\n"
+    )
+    source.write_bytes(original)
+    destination = tmp_path / "measurements_excel_safe.csv"
+    monkeypatch.setattr(
+        gui_module.QFileDialog, "getSaveFileName",
+        lambda *_args: (str(destination), "CSV 文件 (*.csv)"),
+    )
+    window = MainWindow()
+    try:
+        window._experiment_csv_path = source
+        window._experiment_active = False
+        window._refresh_file_workspace()
+        assert window.files_safe_measurements_button.isEnabled()
+        window._export_safe_measurements_csv()
+        deadline = time.monotonic() + 3.0
+        while window._safe_measurements_export_task is not None and time.monotonic() < deadline:
+            QTest.qWait(10)
+
+        assert window._safe_measurements_export_task is None, "后台测量安全副本导出超时"
+        assert source.read_bytes() == original
+        with destination.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        assert rows[0]["value_si"] == "-1.25"
+        assert rows[0]["raw_reading"] == "'-1.25000000E+00"
+        assert rows[1]["value_si"] == "2.5"
+        assert rows[1]["raw_reading"] == "'=1+1"
+        assert rows[1]["error"] == "'+device error"
+        assert "原始 measurements.csv 未修改" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_desktop_safe_measurements_export_is_disabled_during_acquisition(qt_app, tmp_path):
+    directory = tmp_path / "experiment-run"
+    directory.mkdir()
+    (directory / "measurements.csv").write_text(
+        "raw_reading,error\n1.0,\n", encoding="utf-8"
+    )
+    window = MainWindow()
+    try:
+        window._experiment_csv_path = directory / "measurements.csv"
+        window._experiment_active = False
+        window._refresh_file_workspace()
+        assert window.files_safe_measurements_button.isEnabled()
+        window._experiment_active = True
+        window._refresh_file_workspace()
+        assert not window.files_safe_measurements_button.isEnabled()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_desktop_log_filter_exports_only_the_selected_category(qt_app, monkeypatch, tmp_path):
     window = MainWindow()
     export_path = tmp_path / "filtered-log.txt"
@@ -3824,6 +3888,9 @@ def test_duplicate_experiment_dialog_choices_preserve_existing_data_and_gate_sta
 def test_desktop_preflight_lists_connection_readback_storage_and_mock_wiring(qt_app, tmp_path, monkeypatch):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "preflight-config"))
     monkeypatch.setattr(gui_module, "prepare_experiment_storage", lambda root: Path(root))
+    monkeypatch.setattr(
+        gui_module, "get_available_space_bytes", lambda _root: int(4.5 * 1024**3), raising=False
+    )
     window = MainWindow()
     try:
         window._connected = True
@@ -3838,6 +3905,10 @@ def test_desktop_preflight_lists_connection_readback_storage_and_mock_wiring(qt_
         assert "仪器已连接" in text
         assert "当前功能已回读" in text
         assert "保存目录可写" in text
+        assert "当前可用 4.5 GiB" in text
+        assert "不预测长期实验总空间" in text
+        assert "停止采集并尝试收尾文件" in text
+        assert "记录可能不完整" in text
         assert "模拟器无需实体接线" in text
     finally:
         window.close()
@@ -3872,6 +3943,33 @@ def test_preflight_fails_closed_when_free_space_cannot_be_verified(qt_app, tmp_p
         window._start_continuous()
         assert reported_errors and "无法检查剩余空间" in reported_errors[-1]
         assert starts == []
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_preflight_rejects_space_that_falls_below_reserve_on_final_check(
+    qt_app, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "space-final-check-config"))
+    monkeypatch.setattr(gui_module, "prepare_experiment_storage", lambda root: Path(root))
+    monkeypatch.setattr(
+        gui_module,
+        "get_available_space_bytes",
+        lambda _root: storage_module.MINIMUM_FREE_SPACE_BYTES - 1,
+    )
+    window = MainWindow()
+    try:
+        window._connected = True
+        window._simulation = True
+        window._active_settings_by_mode[Mode.DCV.value] = {"mode": Mode.DCV.value}
+        with pytest.raises(OSError, match="可用空间不足"):
+            window._prepare_start_preflight(
+                ModeSettings(Mode.DCV, autorange=True, nplc=1),
+                tmp_path / "runs",
+                wiring_confirmed=False,
+            )
+        assert not window.preflight_status.text().startswith("采集预检通过")
     finally:
         window.close()
         qt_app.processEvents()

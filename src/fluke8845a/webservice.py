@@ -24,7 +24,8 @@ from .scpi import (
     digital_filter_slow_read_block_reason, select_range_firmware, unsupported_current_ranges,
 )
 from .storage import (
-    find_existing_experiment_directories, prepare_experiment_storage, validate_experiment_name,
+    find_existing_experiment_directories, format_available_space, get_available_space_bytes,
+    prepare_experiment_storage, require_minimum_free_space, validate_experiment_name,
 )
 from .state import AcquisitionState
 from .worker import MeasurementWorker
@@ -830,6 +831,9 @@ class WebCommandRouter(QObject):
             raise ValueError("采集预检失败：请填写实验保存目录")
         self._interval(payload.get("interval_s", 1.0))
         root = prepare_experiment_storage(Path(root_text).expanduser())
+        available_space = format_available_space(
+            require_minimum_free_space(get_available_space_bytes(root))
+        )
         duplicates = find_existing_experiment_directories(root, name)
 
         device = self.store.snapshot().get("device") or {}
@@ -838,7 +842,9 @@ class WebCommandRouter(QObject):
         checks = [
             f"仪器已连接：{identity}",
             f"当前模式已回读：{descriptor(settings.mode).label}；启动时将再次写入并回读所选参数",
-            f"保存目录可写：{root}；启动预留 10 MiB，并在采集中每 5 秒检查空间；低于预留时停止继续写入",
+            f"保存目录可写：{root}；当前可用 {available_space}，启动预留 10 MiB，"
+            "采集中每 5 秒复查；低于预留值时停止采集并尝试收尾文件，"
+            "若收尾失败会提示记录可能不完整；不预测长期实验总空间",
             wiring,
             f"实验名称有效：{name}；已有数据不会被覆盖",
         ]

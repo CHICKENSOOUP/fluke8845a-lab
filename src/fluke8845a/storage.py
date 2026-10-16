@@ -40,6 +40,35 @@ SAMPLE_FIELDS = (
 EVENT_FIELDS = ("experiment_id", "event_index", "timestamp_local", "timestamp_utc", "elapsed_s", "sample_index", "mode", "value_si", "unit_si", "event")
 
 
+def get_available_space_bytes(directory: Path | str) -> int:
+    """Return the currently available bytes on the filesystem containing directory."""
+    path = Path(directory)
+    try:
+        return shutil.disk_usage(path).free
+    except OSError as exc:
+        raise OSError(f"无法检查实验保存位置剩余空间：{path}：{exc}") from exc
+
+
+def require_minimum_free_space(free_bytes: int) -> int:
+    """Reject a preflight snapshot that is below the startup reserve."""
+    if free_bytes < MINIMUM_FREE_SPACE_BYTES:
+        raise OSError(
+            f"实验保存位置可用空间不足：当前 {free_bytes / (1024 * 1024):.1f} MiB，"
+            f"启动至少需要 {MINIMUM_FREE_SPACE_BYTES // (1024 * 1024)} MiB。"
+            "此检查只保证可创建启动文件，不能预测长期实验的总空间。"
+        )
+    return free_bytes
+
+
+def format_available_space(free_bytes: int) -> str:
+    """Format free space using binary units for human-readable preflight messages."""
+    gibibyte = 1024**3
+    mebibyte = 1024**2
+    if free_bytes >= gibibyte:
+        return f"{free_bytes / gibibyte:.1f} GiB"
+    return f"{free_bytes / mebibyte:.0f} MiB"
+
+
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, Path):
         return str(obj)
@@ -48,15 +77,39 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"无法序列化类型：{type(obj).__name__}")
 
 
-def _escape_excel_event(row: dict[str, str | None]) -> dict[str, str | None]:
+def _escape_excel_text_fields(
+    row: dict[str | None, str | None], fields: tuple[str, ...]
+) -> dict[str | None, str | None]:
     if None in row or any(value is None for value in row.values()):
-        raise ValueError("事件 CSV 存在列数不一致的记录，已拒绝导出以免丢失字段")
-    value = row.get("event")
-    if value is not None:
+        raise ValueError("CSV 存在列数不一致的记录，已拒绝导出以免丢失字段")
+    for field in fields:
+        value = row.get(field)
+        if value is None:
+            continue
         first_visible = next((char for char in value if not (char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F)), "")
         if first_visible in {"=", "+", "-", "@"}:
-            row["event"] = "'" + value
+            row[field] = "'" + value
     return row
+
+
+def _escape_excel_event(row: dict[str | None, str | None]) -> dict[str | None, str | None]:
+    return _escape_excel_text_fields(row, ("event",))
+
+
+def _validate_excel_safe_header(
+    fieldnames: list[str] | None,
+    *,
+    csv_label: str,
+    required_column: str,
+    allowed_columns: tuple[str, ...],
+) -> list[str]:
+    if not fieldnames or required_column not in fieldnames:
+        raise ValueError(f"{csv_label} CSV 缺少 {required_column} 列")
+    if len(fieldnames) != len(set(fieldnames)) or any(
+        field is None or field not in allowed_columns for field in fieldnames
+    ):
+        raise ValueError(f"{csv_label} CSV 含未知列或重复列名，已拒绝生成安全副本")
+    return fieldnames
 
 
 def excel_safe_events_csv_bytes(source: bytes) -> bytes:
@@ -70,44 +123,61 @@ def excel_safe_events_csv_bytes(source: bytes) -> bytes:
     except UnicodeDecodeError as exc:
         raise ValueError("事件 CSV 不是有效的 UTF-8 文件") from exc
     reader = csv.DictReader(io.StringIO(text, newline=""))
-    if not reader.fieldnames or "event" not in reader.fieldnames:
-        raise ValueError("事件 CSV 缺少 event 列")
+    fieldnames = _validate_excel_safe_header(
+        reader.fieldnames,
+        csv_label="事件",
+        required_column="event",
+        allowed_columns=EVENT_FIELDS,
+    )
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=reader.fieldnames, extrasaction="ignore", lineterminator="\r\n")
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\r\n")
     writer.writeheader()
     for row in reader:
         writer.writerow(_escape_excel_event(row))
     return output.getvalue().encode("utf-8-sig")
 
 
-def write_excel_safe_events_csv(source_path: Path, destination_path: Path) -> None:
-    """Stream an Excel-safe copy and atomically create a new destination without clobbering."""
+def _write_excel_safe_csv(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    csv_label: str,
+    required_column: str,
+    allowed_columns: tuple[str, ...],
+    protected_text_columns: tuple[str, ...],
+    staging_prefix: str,
+) -> None:
+    """Stream a formula-safe text-field copy and atomically publish a new file."""
     source_path = Path(source_path)
     destination_path = Path(destination_path)
     if source_path.resolve() == destination_path.resolve():
-        raise ValueError("导出目标不能覆盖原始事件 CSV")
+        raise ValueError(f"导出目标不能覆盖原始{csv_label} CSV")
     try:
         if destination_path.exists() and os.path.samefile(source_path, destination_path):
-            raise ValueError("导出目标不能覆盖原始事件 CSV")
+            raise ValueError(f"导出目标不能覆盖原始{csv_label} CSV")
     except OSError as exc:
-        raise OSError(f"无法核对事件安全副本导出目标：{exc}") from exc
+        raise OSError(f"无法核对{csv_label}安全副本导出目标：{exc}") from exc
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     staged_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            prefix=".events-safe-", suffix=".tmp", dir=destination_path.parent, delete=False
+            prefix=staging_prefix, suffix=".tmp", dir=destination_path.parent, delete=False
         ) as staged:
             staged_path = Path(staged.name)
         with source_path.open("r", encoding="utf-8-sig", newline="") as source, staged_path.open(
             "w", encoding="utf-8-sig", newline=""
         ) as destination:
             reader = csv.DictReader(source)
-            if not reader.fieldnames or "event" not in reader.fieldnames:
-                raise ValueError("事件 CSV 缺少 event 列")
-            writer = csv.DictWriter(destination, fieldnames=reader.fieldnames, extrasaction="ignore", lineterminator="\r\n")
+            fieldnames = _validate_excel_safe_header(
+                reader.fieldnames,
+                csv_label=csv_label,
+                required_column=required_column,
+                allowed_columns=allowed_columns,
+            )
+            writer = csv.DictWriter(destination, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\r\n")
             writer.writeheader()
             for row in reader:
-                writer.writerow(_escape_excel_event(row))
+                writer.writerow(_escape_excel_text_fields(row, protected_text_columns))
             destination.flush()
             os.fsync(destination.fileno())
         try:
@@ -115,18 +185,43 @@ def write_excel_safe_events_csv(source_path: Path, destination_path: Path) -> No
                 # Windows rename is same-volume atomic and refuses to replace an
                 # existing path, including a file created after the dialog check.
                 os.rename(staged_path, destination_path)
-                staged_path = None
             else:
                 # POSIX rename replaces existing files, so publish with an
                 # exclusive hard link instead; staging is in the same directory.
                 os.link(staged_path, destination_path)
-                staged_path.unlink()
-                staged_path = None
         except FileExistsError as exc:
             raise FileExistsError("导出目标已存在，请另选文件名") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{csv_label} CSV 不是有效的 UTF-8 文件") from exc
     finally:
         if staged_path is not None:
             staged_path.unlink(missing_ok=True)
+
+
+def write_excel_safe_events_csv(source_path: Path, destination_path: Path) -> None:
+    """Stream a spreadsheet-safe event copy while leaving the original unchanged."""
+    _write_excel_safe_csv(
+        source_path,
+        destination_path,
+        csv_label="事件",
+        required_column="event",
+        allowed_columns=EVENT_FIELDS,
+        protected_text_columns=("event",),
+        staging_prefix=".events-safe-",
+    )
+
+
+def write_excel_safe_measurements_csv(source_path: Path, destination_path: Path) -> None:
+    """Stream a spreadsheet-safe measurement copy without changing numeric fields or source."""
+    _write_excel_safe_csv(
+        source_path,
+        destination_path,
+        csv_label="测量",
+        required_column="raw_reading",
+        allowed_columns=SAMPLE_FIELDS,
+        protected_text_columns=("raw_reading", "error"),
+        staging_prefix=".measurements-safe-",
+    )
 
 
 def _slug(value: str) -> str:
@@ -177,16 +272,7 @@ def prepare_experiment_storage(root: Path | str) -> Path:
     if not directory.is_dir():
         raise OSError(f"实验保存路径不是文件夹：{directory}")
 
-    try:
-        free_bytes = shutil.disk_usage(directory).free
-    except OSError as exc:
-        raise OSError(f"无法检查实验保存位置剩余空间：{directory}：{exc}") from exc
-    if free_bytes < MINIMUM_FREE_SPACE_BYTES:
-        raise OSError(
-            f"实验保存位置可用空间不足：当前 {free_bytes / (1024 * 1024):.1f} MiB，"
-            f"启动至少需要 {MINIMUM_FREE_SPACE_BYTES // (1024 * 1024)} MiB。"
-            "此检查只保证可创建启动文件，不能预测长期实验的总空间。"
-        )
+    require_minimum_free_space(get_available_space_bytes(directory))
 
     try:
         with tempfile.NamedTemporaryFile(

@@ -71,6 +71,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/licenses/third-party/Apache-2.0.txt",
     "docs/licenses/third-party/pyserial-3.5-LICENSE.txt",
     "docs/hardware-validation.md",
+    "docs/release-notes-v1.0.7.md",
     "docs/release-notes-v1.0.6.md",
     "docs/release-notes-v1.0.5.md",
     "docs/release-notes-v1.0.4.md",

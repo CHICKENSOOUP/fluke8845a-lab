@@ -4,11 +4,11 @@
 
 ## 简体中文
 
-版本 1.0.6 · 中文 Windows 桌面应用
+版本 1.0.7 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v1.0.6 可在连接模拟仪器前选择模拟场景，连接后场景选择会锁定，避免误以为运行中的模拟实验已切换场景。本版本发布源码 ZIP，不包含预编译 Windows 程序。本版本的验证范围见[硬件验证说明](hardware-validation.md)；不宣称测量准确度或当前源码快照已通过真机验证。
+v1.0.7 增加 `measurements.csv` 的表格软件安全副本导出，并在采集预检中显示可用空间。本版本发布源码 ZIP，不包含预编译 Windows 程序。Web 模拟场景可在连接前选择，连接后会锁定。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时本程序查询 `*IDN?`，只接受设备型号字段为 `8845A` 的 Fluke 仪器；不会重置仪器。
 - **MOCK**：勾选模拟模式后点击“启动MOCK模拟仪器”。状态栏和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
@@ -59,7 +59,7 @@ DCV 的自动输入阻抗默认关闭，表示 10 MΩ。启用后，8845A 只在
 
 采集中调整速度下拉框只修改“所选值”，不会立即改变仪表。读数卡会分别显示仪表已回读生效的参数和“待应用”值；点击“应用采集速度”且仪表回读成功后，新速度才从下一读数起生效。若应用失败，采集会安全停止并保留失败记录，不会把所选值误记为仪表当前值。
 
-桌面主窗口以单张曲线和当前读数/采集状态为主。顶栏“采集”返回波形主界面，“实验文件”打开独立文件窗口，集中列出当前实验目录中的测量 CSV、事件 CSV、配置、运行日志和导出结果；文件窗口也提供打开/复制目录、加载历史 CSV、导出进行中快照及事件安全副本。“通讯”“分析”及右下角“设置与分析…”打开设置窗口：“连接与采集”页含串口、测量模式、仪器速度、实验目录和目标间隔；“分析与事件”页含统计、基准、局部区间和事件。完整SCPI通信日志可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
+桌面主窗口以单张曲线和当前读数/采集状态为主。顶栏“采集”返回波形主界面，“实验文件”打开独立文件窗口，集中列出当前实验目录中的测量 CSV、事件 CSV、配置、运行日志和导出结果；文件窗口也提供打开/复制目录、加载历史 CSV、导出进行中快照及事件和测量 CSV 的表格软件安全副本。“通讯”“分析”及右下角“设置与分析…”打开设置窗口：“连接与采集”页含串口、测量模式、仪器速度、实验目录和目标间隔；“分析与事件”页含统计、基准、局部区间和事件。完整SCPI通信日志可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
 
 采集速率会受测量模式、量程、NPLC/交流带宽、自动零点、串口波特率和被测条件共同影响。请以当前实验中实际记录的时间戳和有效读数为准，不要把某一台设备或某次接线的速率当作准确度或通用性能保证。
 
@@ -112,7 +112,7 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 ## English
 
-Version 1.0.6 lets users select a Mock scenario before connecting the simulated instrument; the selection is locked after connection so a running experiment cannot appear to change scenarios. This source release does not include a prebuilt Windows executable. See the root [README](../README.md) for installation and startup instructions.
+Version 1.0.7 adds a spreadsheet-safe copy export for `measurements.csv` and shows available disk space during acquisition preflight. This source release does not include a prebuilt Windows executable. Mock scenario selection remains available before connection and is locked afterward. See the root [README](../README.md) for installation and startup instructions.
 
 ### 1. Connection and modes
 
@@ -159,4 +159,4 @@ Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`.
 Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection. Mock readings remain simulated.
 ### 事件导出
 
-实验目录中的 `events.csv` 是原始记录，软件不会为表格软件打开而改写它。若事件文字来自外部输入且可能以 `=`, `+`, `-` 或 `@` 开头，可在桌面“实验事件”页或 localhost 图表工具栏导出 `*_events_excel_safe.csv` 副本。该副本只给事件文本字段增加文本前缀，其他时间戳、读数和数值字段保持原样；请将原始 CSV 用于科研数据处理。安全副本仅支持停止采集后导出。
+`measurements.csv` 与 `events.csv` 始终是原始记录，软件不会为表格软件打开而改写它们。若需用 Excel 等表格软件查看，可在桌面“实验文件”窗口或 localhost 图表工具栏分别导出 `*_measurements_excel_safe.csv` 和 `*_events_excel_safe.csv` 副本。测量副本只给原始响应 `raw_reading` 和错误说明 `error` 文本字段增加文本前缀；SI 数值列（如 `value_si`、`voltage_v`、`current_a` 和 `resistance_ohm`）不变。事件副本只处理自由文本 `event` 列。安全副本仅支持停止采集后导出。科研分析请优先使用未修改的原始 CSV；安全副本用于表格软件查看。

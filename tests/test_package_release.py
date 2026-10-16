@@ -520,6 +520,7 @@ def test_source_archive_includes_first_run_windows_launchers():
         "run_web.bat",
         "scripts/launch_windows.py",
         "scripts/generate_demo.py",
+        "docs/release-notes-v1.0.7.md",
         "docs/release-notes-v1.0.6.md",
         "docs/release-notes-v1.0.5.md",
         "docs/release-notes-v1.0.4.md",
