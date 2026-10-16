@@ -9,6 +9,12 @@ const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "..");
 
+function expectedLocalDateTime(value) {
+  const date = new Date(value);
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 test("desktop and web explain that elapsed time includes pauses and freezes while paused", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   const gui = fs.readFileSync(path.join(ROOT, "src/fluke8845a/gui.py"), "utf8");
@@ -1641,7 +1647,7 @@ test("the accessible chart table shows escaped raw readings and local sample tim
 
   const table = element(elements, "pointTableBody").innerHTML;
   assert.match(table, /#9/);
-  assert.match(table, /2026-10-15 12:34:56/);
+  assert.ok(table.includes(expectedLocalDateTime("2026-10-15T12:34:56+08:00")));
   assert.match(table, /&lt;reading&gt;/);
   assert.doesNotMatch(table, /<reading>/);
   assert.match(table, /1\.25 V/);
@@ -1730,7 +1736,7 @@ test("the point table can be copied as tab-separated text", async () => {
   await api.copyAccessiblePointTable();
 
   assert.match(clipboard.text, /样本\t本地时间\t原始响应 \/ 实际量程/);
-  assert.match(clipboard.text, /#4\t2026-10-15 12:00:00\t1\.02\t1\.02 V\t有效/);
+  assert.ok(clipboard.text.includes(`#4\t${expectedLocalDateTime("2026-10-15T12:00:00+08:00")}\t1.02\t1.02 V\t有效`));
   assert.match(element(elements, "toast").textContent, /已复制/);
 });
 
@@ -2177,7 +2183,8 @@ test("manual panning cannot move the viewport completely away from measured data
 });
 
 test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence", async () => {
-  const python = process.env.PYTHON || path.join(ROOT, ".venv-build", "Scripts", "python.exe");
+  const localPython = path.join(ROOT, ".venv-build", "Scripts", "python.exe");
+  const python = process.env.PYTHON || (fs.existsSync(localPython) ? localPython : "python");
   const desktopMapping = spawnSync(python, ["-c", [
     "import json",
     "from PySide6.QtCore import Qt",

@@ -571,6 +571,15 @@ def test_release_workflow_runs_web_frontend_tests_with_a_one_minute_limit():
     assert "timeout-minutes: 1" in step
 
 
+def test_release_workflow_installs_python_dependencies_before_web_frontend_tests():
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+    install_marker = "- name: Install locked test environment"
+    web_marker = "- name: Run Web frontend JavaScript tests (60-second limit)"
+    assert workflow.index(install_marker) < workflow.index(web_marker)
+    web_step = workflow.split(web_marker, 1)[1].split("      - name:", 1)[0]
+    assert "PYTHON: python" in web_step
+
+
 def test_source_archive_includes_python311_dependency_lock():
     assert "requirements-lock-python311.txt" in REQUIRED_ARCHIVE_PATHS
 
