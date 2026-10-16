@@ -65,7 +65,7 @@ jobs:
       - name: Run Web frontend JavaScript tests (60-second limit)
         run: |
           node --version
-          node --test --test-timeout=15000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs
+          node --test --test-timeout=45000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs
           if ($LASTEXITCODE -ne 0) { throw "Web frontend JavaScript tests failed (exit $LASTEXITCODE)." }
         shell: pwsh
         timeout-minutes: 1

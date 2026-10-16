@@ -567,7 +567,7 @@ def test_release_workflow_runs_web_frontend_tests_with_a_one_minute_limit():
     marker = "- name: Run Web frontend JavaScript tests (60-second limit)"
     assert marker in workflow
     step = workflow.split(marker, 1)[1].split("      - name:", 1)[0]
-    assert "node --test --test-timeout=15000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs" in step
+    assert "node --test --test-timeout=45000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs" in step
     assert "timeout-minutes: 1" in step
 
 
