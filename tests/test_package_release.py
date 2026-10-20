@@ -282,6 +282,8 @@ def test_source_archive_file_collection_rejects_symbolic_links(tmp_path, monkeyp
 def test_source_archive_manifest_includes_archive_path_guard():
     assert "scripts/archive_paths.py" in REQUIRED_ARCHIVE_PATHS
     assert "scripts/run_tests_sharded.py" in REQUIRED_ARCHIVE_PATHS
+    assert "scripts/latest_verified_launcher.py" in REQUIRED_ARCHIVE_PATHS
+    assert "tests/test_latest_verified_launcher.py" in REQUIRED_ARCHIVE_PATHS
 
 
 @pytest.mark.parametrize(

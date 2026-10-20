@@ -30,6 +30,7 @@ SHARDS = {
         "tests/test_build_identity.py",
         "tests/test_build_provenance.py",
         "tests/test_hardware_probe_manifest.py",
+        "tests/test_latest_verified_launcher.py",
         "tests/test_package_release.py",
         "tests/test_runtime_licenses.py",
         "tests/test_share_export.py",

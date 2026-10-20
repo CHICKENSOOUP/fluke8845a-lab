@@ -282,6 +282,16 @@ try {
         --provenance $provenancePath
     if ($LASTEXITCODE -ne 0) { throw "Source project archive creation or verification failed." }
 
+    if ($SideBySide) {
+        & $python (Join-Path $PSScriptRoot "scripts\latest_verified_launcher.py") `
+            --dist-root $distRoot `
+            --executable $exe
+        if ($LASTEXITCODE -ne 0) { throw "Latest verified Windows launcher update failed." }
+        Write-Host "Updated latest verified launcher $(Join-Path $distRoot 'Start-Latest-Verified-Fluke8845A.bat')"
+    } else {
+        Write-Host "Stable launcher unchanged; use -SideBySide to promote an immutable verified build."
+    }
+
     Write-Host "Created and smoke-checked $exe"
     Write-Host "Created portable package $portableArchive"
     Write-Host "Created source project package $sourceArchive"

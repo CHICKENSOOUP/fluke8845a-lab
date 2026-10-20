@@ -1770,6 +1770,8 @@ test("settings labels remain readable and secondary text meets contrast target",
   const shortcutRule = readableTextRule(".application-shortcut-help", "#252d31", "acquisition shortcut help");
   assert.match(shortcutRule, /font-size:\s*12px/);
   readableTextRule(".version-label", "#30383c", "top-bar version label");
+  readableTextRule(".telemetry-heading span", "#f4f4ed", "telemetry secondary heading");
+  readableTextRule(".mock-note p", "#e9f4ed", "Mock explanatory text");
   readableTextRule("#chartGestureHint", "#f1efe6", "plot gesture hint");
   readableTextRule(".stat-card .stat-count", "#f5f5ee", "statistic sample count");
 

@@ -150,7 +150,7 @@ button { cursor: pointer; }
 .port-selection-info { margin-top: 6px; color: #4d5b5f; font-size: 12px; }
 .telemetry-panel { margin-top: 10px; padding: 9px; border: 1px solid #dfe2da; border-radius: 5px; background: #f4f4ed; }
 .telemetry-heading { margin-bottom: 7px; display: flex; justify-content: space-between; gap: 8px; color: #45555a; font-size: 12px; }
-.telemetry-heading span { color: #68736e; text-align: right; }
+.telemetry-heading span { color: #626e68; text-align: right; }
 .telemetry-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 6px; }
 .telemetry-grid > div { min-width: 0; padding: 5px 7px; border: 1px solid #e1e3db; border-radius: 4px; background: #fffefa; }
 .telemetry-grid span { display: block; color: #4f5c5e; font-size: 12px; }
@@ -223,7 +223,7 @@ input::placeholder { color: #68736e; }
 .safety-note { margin-top: 10px; padding: 9px; display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 7px; border: 1px solid #e4cb94; border-radius: 5px; color: #73551f; background: #fff4d9; }
 .mock-note { border-color: #a9cbbb; color: #315d51; background: #e9f4ed; }
 .mock-note strong { color: #356654; }
-.mock-note p { color: #567767; }
+.mock-note p { color: #526f5e; }
 .mock-note .safety-symbol { background: #4d9676; }
 .safety-symbol { width: 18px; height: 18px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: var(--amber); font-size: 12px; font-weight: 750; }
 .safety-note strong { display: block; margin: 1px 0 3px; color: #75531a; font-size: 12px; }

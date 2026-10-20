@@ -94,6 +94,8 @@ REQUIRED_ARCHIVE_PATHS = (
     "scripts/release_publication.py",
     "scripts/archive_paths.py",
     "scripts/run_tests_sharded.py",
+    "scripts/latest_verified_launcher.py",
+    "tests/test_latest_verified_launcher.py",
     "assets/fluke8845a_app_icon_v3.png",
     ".github/workflows/publish-release.yml",
 )
