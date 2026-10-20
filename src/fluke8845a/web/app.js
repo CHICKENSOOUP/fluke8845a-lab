@@ -15,13 +15,24 @@ const app = {
   logRows: [], logFilter: "all",
   activePointers: new Map(), pinchState: null,
   activeDeviceSerial: "",
+  chartOverview: [], chartOverviewJobId: null, chartOverviewStatus: "idle", chartOverviewRevision: -1,
+  chartOverviewInFlight: false, chartOverviewSequence: 0, chartOverviewNextAt: 0,
+  chartRangeRows: null, chartRangeView: null,
+  chartRangeRequest: null, chartRangeSequence: 0,
   safetyReadback: null,
-  xView: null, yView: null, dragging: null, cursor: null, selectedPointIndex: null, bufferTruncated: false,
+  xView: null, yView: null, yOrigin: null, dragging: null, cursor: null, selectedPointIndex: null, bufferTruncated: false,
   awaitInitialSettings: false, awaitSettingsReadback: false, awaitSpeedReadback: false,
-  mockConnectPending: false, startPending: false, pendingCommands: new Set(), commandOriginalDisabled: new Map(),
+  mockConnectPending: false, startPending: false, zeroPending: false, pendingCommands: new Set(), commandOriginalDisabled: new Map(),
+  uncertainCommands: new Map(), commandMessages: new Map(), commandRecovery: new Map(),
   historyEventsWorker: null, cancelEventImport: null,
+  historyImportWorker: null, historyImportJob: null, cancelHistoryImport: null, importedStats: null,
 };
 const COLORS = { ink: "#526064", muted: "#87918b", grid: "#e5e4da", axis: "#aeb6ad", line: "#138b92", lineFill: "#138b9218", event: "#d39130" };
+const COMMAND_RECOVERY_STORAGE_KEY = "8845a-unresolved-command";
+
+function commandRecoveryKey(action) {
+  return `${COMMAND_RECOVERY_STORAGE_KEY}:${action}`;
+}
 
 function htmlText(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -162,7 +173,6 @@ function populateModeOptions(spec) {
   html += `<label class="option-check" title="仪表自动测量内部零点并补偿偏移，可提升稳定性但会增加测量时间；不会把被测读数强制改成0。"><input id="autozero" type="checkbox" checked> 自动零点校正</label>`;
   html += `<p id="autozeroSpeedHint" class="mode-parameter-hint">启用自动零点会增加测量时间；不会把被测读数强制改成 0。</p>`;
   ui.options.innerHTML = html;
-  applyDigitalFilterNplcGuard(app.state);
   el("autorange").addEventListener("change", () => {
     el("range").disabled = el("autorange").checked;
     clearSafetyConfirmation();
@@ -176,6 +186,9 @@ function populateModeOptions(spec) {
     if (control) control.addEventListener("change", () => { clearPreflightSummary(); renderSettingsComparison(app.state); });
   }
   ui.safety.textContent = spec.safety;
+  const safetyLimits = el("modeSafetyLimits");
+  safetyLimits.textContent = spec.safety_limits || "";
+  safetyLimits.classList.toggle("hidden", !safetyLimits.textContent);
   const diagram = el("terminalDiagram");
   const current = spec.quantity === "current";
   const fourWire = spec.value === "RES4";
@@ -271,7 +284,11 @@ function updateCurrentRangeGuidance(state = app.state, selectedSpec = null) {
   const active = state?.active_settings;
   if (state?.connected && !state.simulation && state.control_mode !== "local") {
     if (active?.mode && active.mode !== mode) pieces.push(`设备当前回读 ${active.mode}，与界面选择不同`);
-    else if (active?.mode === mode && active.autorange) pieces.push("设备当前回读自动量程");
+    else if (active?.mode === mode && active.autorange) {
+      const range = Number(active.range_readback_si);
+      if (Number.isFinite(range)) pieces.push(`设备当前回读自动量程，当前档位 ${rangeLabel(range, spec.unit)}（快照，可能随输入变化）`);
+      else pieces.push("设备当前回读自动量程；当前档位未回读");
+    }
     else if (active?.mode === mode && active.range_si !== null && active.range_si !== undefined && active.range_si !== "" && Number.isFinite(Number(active.range_si))) pieces.push(`设备当前回读 ${rangeLabel(active.range_si, spec.unit)}`);
     else pieces.push("设备当前量程未回读");
   } else if (state?.control_mode === "local") {
@@ -316,13 +333,13 @@ function renderIdnFirmwareInfo(state, device = state?.device || {}) {
   if (!state?.connected) {
     info.textContent = "未连接，尚未读取 *IDN?。";
   } else if (state.simulation) {
-    info.textContent = "MOCK 模拟器身份不是实测 *IDN? 固件版本证据；面板 OutG/InG 手工记录另行显示。";
-  } else if (device.firmware) {
+    info.textContent = "MOCK 身份字段是模拟数据，不代表仪器固件；真实仪器的 400 mA 门槛只依据人工核对的面板 OutG SW。";
+  } else if (device.idn_version_candidate) {
     const revision = String(device.idn_revision || "未返回");
-    info.textContent = `来源：*IDN? 自动解析 · 版本 ${device.firmware}（已解析） · 原始修订字段：${revision}。`;
+    info.textContent = `*IDN? 修订字段中有数字候选 ${device.idn_version_candidate}，但未验证为 OutG SW，不作为 400 mA 固件门槛依据；原始修订字段：${revision}。`;
   } else {
     const revision = String(device.idn_revision || "未返回");
-    info.textContent = `来源：*IDN? 自动读取 · 版本无法解析 · 原始修订字段：${revision}。`;
+    info.textContent = `*IDN? 修订字段：${revision}。不将该字段作为仪器固件版本；400 mA 门槛只依据人工核对的面板 OutG SW。`;
   }
 }
 
@@ -338,6 +355,7 @@ function renderAcquisitionFeedback(state, telemetry, activeExperiment) {
   const invalidText = [currentInvalidPoint?.error, currentInvalidPoint?.raw].map((value) => String(value || "")).join(" ");
   const scpiTimeout = /SCPI\s*响应超时/i.test(status) || /SCPI\s*响应超时/i.test(invalidText);
   const readTimeout = currentInvalidPoint?.status === "timeout" || /READ\??[^\n]*(?:响应)?超时/i.test(invalidText);
+  const communicationFailure = /串口通信(?:失败|故障|异常)|通信(?:失败|故障|异常)|通讯(?:失败|故障|异常)/i.test(`${status} ${invalidText}`);
   const attempts = telemetry.attempt_count ?? 0;
   const valid = telemetry.valid_count ?? 0;
   const abnormal = telemetry.abnormal_count ?? 0;
@@ -346,70 +364,441 @@ function renderAcquisitionFeedback(state, telemetry, activeExperiment) {
   const disconnectDetails = `${status} ${String(state.connection_text || "")}`;
   const explicitConnectionFailure = /连接中断|(?:串口|端口|COM\d*)[^。\n]{0,24}(?:故障|失败|断开|关闭|不存在)|仪器已切回LOCAL|RS-232[^。\n]*(?:终端模式|不是Computer模式)|控制方式切换失败/i.test(disconnectDetails);
 
-  if (scpiTimeout) {
+  if (state.simulation && (scpiTimeout || readTimeout || communicationFailure)) {
+    const mockKind = readTimeout ? "模拟读取超时已记录为异常样本" : "模拟通信异常已记录";
+    const recovery = readTimeout
+      ? "连续 3 次模拟超时会停止模拟采集"
+      : "请查看模拟场景设置和运行日志";
+    output.textContent = `MOCK 模拟模式：${mockKind}；${recovery}。不涉及真实串口或仪器连接，也无需仪器重连。已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}${savedFile}。`;
+  } else if (scpiTimeout) {
     output.textContent = `SCPI 响应超时，立即停止采集并关闭连接；不会自动重连。已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}${savedFile}。安全恢复：检查 COM 端口、波特率、结束符和仪表 Computer 模式；修正后手动重新连接并新建实验。`;
+  } else if (readTimeout || communicationFailure) {
+    const failureKind = readTimeout ? "READ 超时" : "串口通信异常";
+    output.textContent = `${failureKind}：立即停止采集、保存已完成的数据并关闭连接；不会自动重试或重连。已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}${savedFile}。安全恢复：检查 COM 端口、波特率、结束符和仪表 Computer 模式；人工确认恢复后手动重新连接，并开始新实验/分段。`;
   } else if (!activeExperiment && state.connected === false && !state.simulation && state.last_experiment_dir && explicitConnectionFailure) {
-    output.textContent = `仪器连接已中断，采集已停止；不会自动重连。已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}${savedFile}。安全恢复：检查 COM 端口、波特率、结束符和仪表 Computer 模式；手动重新连接后新建实验。`;
-  } else if (/连续超时.*停止/.test(status)) {
-    output.textContent = `普通 READ 超时连续 3 次后停止采集；已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}${savedFile}。检查连接和仪表 Computer 模式，恢复后重新连接并新建实验。`;
-  } else if (activeExperiment && readTimeout) {
-    output.textContent = `普通 READ 超时会在下一采样周期重试；连续 3 次才停止。当前统计：尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal} · 样本逐点写入 CSV。`;
+    output.textContent = `仪器连接已中断，采集已停止；不会自动重试或重连。已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}${savedFile}。安全恢复：检查 COM 端口、波特率、结束符和仪表 Computer 模式；人工确认恢复后手动重新连接，并开始新实验/分段。`;
   } else if (activeExperiment) {
     const paused = status.includes("暂停");
     const kind = state.single_shot ? "单次测量" : "连续采集";
-    output.textContent = `${kind}${paused ? "已暂停" : "中"} · 当前统计：尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}。普通 READ 超时在下一采样周期重试，连续 3 次才停止；SCPI 响应超时会立即停止并关闭连接。样本逐点写入 CSV。`;
+    output.textContent = `${kind}${paused ? "已暂停" : "中"} · 当前统计：尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal}。READ 超时或串口通信失败会立即停止采集、保存记录并关闭连接；不会自动重试或重连，需人工确认后重新连接并开始新实验/分段。样本逐点写入 CSV。`;
   } else if (state.last_experiment_dir) {
     const kind = /单次/.test(status) ? "单次测量完成" : "实验已结束";
     output.textContent = `${kind} · 已保存尝试 ${attempts} · 有效 ${valid} · 异常 ${abnormal} · ${state.last_experiment_dir}/measurements.csv${state.last_error ? " · 异常详情见运行日志" : ""}`;
   } else {
-    output.textContent = "尚未开始实验；开始后会逐点保存 CSV。普通 READ 超时按下一采样周期重试，连续 3 次才停止；SCPI 响应超时会立即停止并关闭连接。";
+    output.textContent = "尚未开始实验；开始后会逐点保存 CSV。READ 超时或串口通信失败会立即停止采集、保存记录并关闭连接；人工确认恢复后重新连接，并开始新实验/分段。";
   }
 }
 
-function axisScaleForValues(values, unit) {
-  let magnitude = 0;
+function axisScaleForValues(values, unit, visibleSpan = 0) {
+  let dataMagnitude = 0;
   for (const value of values) {
     const candidate = Math.abs(Number(value));
-    if (Number.isFinite(candidate) && candidate > magnitude) magnitude = candidate;
+    if (Number.isFinite(candidate) && candidate > dataMagnitude) dataMagnitude = candidate;
   }
-  if (unit === "V" && magnitude > 0 && magnitude < 1) return { factor: 1e-3, unit: "mV" };
-  if (unit === "A" && magnitude > 0 && magnitude < 1e-3) return { factor: 1e-6, unit: "µA" };
-  if (unit === "A" && magnitude >= 1e-3 && magnitude < 1) return { factor: 1e-3, unit: "mA" };
-  if (unit === "Ohm" && magnitude >= 1e6) return { factor: 1e6, unit: "MΩ" };
-  if (unit === "Ohm" && magnitude >= 1e3) return { factor: 1e3, unit: "kΩ" };
-  return { factor: 1, unit: unit === "Ohm" ? "Ω" : unit };
+  const magnitude = Number.isFinite(visibleSpan) && visibleSpan > 0 ? visibleSpan : dataMagnitude;
+  const baseUnit = unit === "Ohm" ? "Ω" : unit;
+  if (!(magnitude > 0) || !["V", "A", "Ohm"].includes(unit)) return { factor: 1, unit: baseUnit };
+  const minimumExponent = -12;
+  const maximumExponent = unit === "Ohm" ? 9 : 3;
+  const exponent = Math.max(minimumExponent, Math.min(maximumExponent, Math.floor(Math.log10(magnitude) / 3) * 3));
+  const prefixes = { [-12]: "p", [-9]: "n", [-6]: "µ", [-3]: "m", 0: "", 3: "k", 6: "M", 9: "G" };
+  return { factor: 10 ** exponent, unit: `${prefixes[exponent] || ""}${baseUnit}` };
 }
 
-function toast(message, isError = false) {
+function axisTickPrecision(value, step) {
+  const ratio = Math.abs(value / step);
+  if (!Number.isFinite(ratio)) return 17;
+  return Math.max(6, Math.min(17, Math.ceil(Math.log10(Math.max(1, ratio))) + 1));
+}
+
+function axisTickValues(minimum, maximum, step) {
+  if (![minimum, maximum, step].every(Number.isFinite) || maximum <= minimum || step <= 0) return [];
+  const quotient = minimum / step;
+  const globalTicksAreStable = Math.abs(quotient) <= Number.MAX_SAFE_INTEGER
+    && step >= Math.abs(minimum) * Number.EPSILON * 8;
+  const first = globalTicksAreStable
+    ? Math.ceil(quotient) * step
+    : minimum;
+  const values = [];
+  for (let index = 0; index < 16; index += 1) {
+    const value = first + index * step;
+    if (!Number.isFinite(value) || value > maximum + step * 0.01) break;
+    if (value >= minimum - step * 0.01) values.push(value);
+  }
+  return values.length ? values : [minimum + (maximum - minimum) / 2];
+}
+
+function adjacentFloatStep(magnitude) {
+  const absoluteMagnitude = Math.abs(magnitude);
+  if (!Number.isFinite(absoluteMagnitude) || absoluteMagnitude === 0) return Number.MIN_VALUE;
+  const exponent = Math.floor(Math.log2(absoluteMagnitude));
+  return 2 ** Math.max(-1074, exponent - 52);
+}
+
+function minimumRepresentableYSpan(anchor) {
+  return adjacentFloatStep(anchor) * 2;
+}
+
+function interpolateYAxisValue(minimum, maximum, fraction) {
+  const span = maximum - minimum;
+  if (Number.isFinite(span)) return minimum + span * fraction;
+  return minimum * (1 - fraction) + maximum * fraction;
+}
+
+function rebaseYAxisOrigin(nextOrigin) {
+  if (!Number.isFinite(nextOrigin)) return 0;
+  const previousOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : nextOrigin;
+  const offsetShift = previousOrigin - nextOrigin;
+  if (app.yView) {
+    const shiftedView = [app.yView[0] + offsetShift, app.yView[1] + offsetShift];
+    // Rebasing an extreme finite range can overflow one endpoint. Keep the
+    // existing origin in that case; zoomYRange can still operate on the range.
+    if (!shiftedView.every(Number.isFinite)) return 0;
+    app.yView = shiftedView;
+  }
+  app.yOrigin = nextOrigin;
+  app.pointIndexCache = null;
+  return offsetShift;
+}
+
+function currentYAxisRange(scale) {
+  if (app.yView) return app.yView.slice();
+  const chartOrigin = Number.isFinite(scale?.yOrigin) ? scale.yOrigin : 0;
+  const currentOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : chartOrigin;
+  const offsetShift = chartOrigin - currentOrigin;
+  return [scale.yMin + offsetShift, scale.yMax + offsetShift];
+}
+
+function maximumYAxisZoomSpan() {
+  // Do not impose an arbitrary data-relative ceiling on Y zoom-out. Each
+  // gesture may use any finite span representable by JavaScript numbers.
+  return Number.MAX_VALUE;
+}
+
+function zoomYRange(minimum, maximum, anchor, factor, maximumSpan) {
+  const currentSpan = maximum - minimum;
+  const minSpan = minimumRepresentableYSpan(anchor);
+  const span = Math.max(minSpan, Math.min(maximumSpan, currentSpan * factor));
+  if (span <= minSpan * 4) {
+    const halfSpan = minSpan / 2;
+    const low = anchor - halfSpan;
+    const high = anchor + halfSpan;
+    if (high > low) return [low, high];
+    return [anchor - minSpan, anchor + minSpan];
+  }
+  let relative;
+  if (Number.isFinite(currentSpan) && currentSpan > 0) {
+    relative = (anchor - minimum) / currentSpan;
+  } else {
+    const magnitude = Math.max(Math.abs(minimum), Math.abs(maximum), Math.abs(anchor));
+    const scaledMinimum = minimum / magnitude;
+    const scaledMaximum = maximum / magnitude;
+    const scaledAnchor = anchor / magnitude;
+    relative = (scaledAnchor - scaledMinimum) / (scaledMaximum - scaledMinimum);
+  }
+  if (!Number.isFinite(relative)) relative = 0.5;
+  const low = anchor - span * relative;
+  const high = anchor + span * (1 - relative);
+  if (Number.isFinite(low) && Number.isFinite(high) && high > low) return [low, high];
+  const halfSpan = span / 2;
+  const centeredLow = anchor - halfSpan;
+  const centeredHigh = anchor + halfSpan;
+  if (Number.isFinite(centeredLow) && Number.isFinite(centeredHigh) && centeredHigh > centeredLow) {
+    return [centeredLow, centeredHigh];
+  }
+  return [anchor >= 0 ? Math.max(-Number.MAX_VALUE, anchor - span) : anchor,
+    anchor >= 0 ? anchor : Math.min(Number.MAX_VALUE, anchor + span)];
+}
+
+function toast(message, isError = false, isWarning = false) {
   clearTimeout(app.toastTimer);
   ui.toast.textContent = message;
   ui.toast.classList.toggle("error", isError);
+  ui.toast.classList.toggle("warning", isWarning);
   ui.toast.classList.add("visible");
   app.toastTimer = setTimeout(() => ui.toast.classList.remove("visible"), 3300);
 }
 
+function persistCommandRecovery(action) {
+  try {
+    const record = app.commandRecovery.get(action);
+    if (record) {
+      localStorage.setItem(commandRecoveryKey(action), JSON.stringify(record));
+    } else {
+      localStorage.removeItem(commandRecoveryKey(action));
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function saveCommandRecovery(action, updates) {
+  const previous = app.commandRecovery.get(action) || {};
+  app.commandRecovery.set(action, {
+    ...previous, ...updates, action, updated_at: Date.now(),
+  });
+  return persistCommandRecovery(action);
+}
+
+function clearCommandRecovery(action) {
+  app.commandRecovery.delete(action);
+  return persistCommandRecovery(action);
+}
+
 async function command(action, payload = {}) {
   if (app.pendingCommands.has(action)) {
-    return { success: false, message: "此操作正在执行，请等待完成" };
+    return { success: false, blocked: true, message: "此操作正在执行，请等待完成；本次命令未发送" };
   }
+  if (!navigator.locks?.request) {
+    const message = "当前浏览器不支持跨标签操作锁定；为避免重复控制仪器，请使用最新版 Edge 或 Chrome。";
+    toast(message, true);
+    return { success: false, blocked: true, message: `${message} 本次命令未发送。` };
+  }
+  let outcome;
+  try {
+    outcome = await navigator.locks.request(commandRecoveryKey(action), {
+      mode: "exclusive", ifAvailable: true,
+    }, async (lock) => {
+      if (!lock) return { success: false, blocked: true, message: "相同操作正在另一个标签页中执行" };
+      const existing = readCommandRecovery(action);
+      if (existing) {
+        adoptCommandRecovery(existing);
+        if (existing.state === "pending" && /^[0-9a-f]{32}$/.test(existing.operation_id || "")) {
+          return resumeCommandRecovery(action, existing.operation_id);
+        }
+        return {
+          success: false, blocked: true,
+          message: "另一个标签页留有未确认操作；请先核对仪器状态并解除阻止。",
+        };
+      }
+      return executeCommand(action, payload);
+    });
+  } catch (error) {
+    const message = `无法取得跨标签操作锁，命令未发送：${error.message}`;
+    toast(message, true);
+    return { success: false, blocked: true, message };
+  }
+  if (outcome?.blocked) {
+    toast(outcome.message, true);
+    return outcome;
+  }
+  return outcome;
+}
+
+async function executeCommand(action, payload) {
   app.pendingCommands.add(action);
+  if (!saveCommandRecovery(action, { state: "sending", operation_id: null, started_at: Date.now() })) {
+    app.commandRecovery.delete(action);
+    app.pendingCommands.delete(action);
+    toast("浏览器无法保存操作恢复状态；为避免页面重载后重复执行，本次命令未发送。请检查浏览器存储设置。", true);
+    renderCommandProgress();
+    return { success: false, cancelled: true, message: "浏览器无法保存操作恢复状态，命令未发送" };
+  }
   renderCommandProgress();
+  let requiresAcknowledgment = false;
   try {
     const response = await fetch("/api/command", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action, payload }),
     });
-    const result = await response.json();
+    let result = await response.json();
+    if (response.status === 202 && result.pending && result.operation_id) {
+      saveCommandRecovery(action, { state: "pending", operation_id: result.operation_id });
+      result = await waitForCommandResult(result.operation_id, action);
+    }
+    if (result.uncertain) {
+      requiresAcknowledgment = true;
+      app.uncertainCommands.set(action, result.message || "无法确认命令是否已经完成。");
+      saveCommandRecovery(action, { state: "uncertain", message: result.message || "命令结果未确认" });
+      app.commandMessages.delete(action);
+      toast(`${result.message}。核对设备状态后，可使用下方按钮解除阻止。`, true);
+      return result;
+    }
     toast(result.message || result.error || (result.success ? "操作完成" : "操作失败"), !result.success);
     return result;
   } catch (error) {
-    toast(`本地服务没有响应：${error.message}`, true);
-    return { success: false, message: String(error) };
+    const message = `无法确认命令是否已执行：${error.message}。请先核对仪器状态，再决定是否重试。`;
+    requiresAcknowledgment = true;
+    app.uncertainCommands.set(action, message);
+    saveCommandRecovery(action, { state: "uncertain", message });
+    toast(message, true);
+    return { success: false, uncertain: true, message };
   } finally {
-    app.pendingCommands.delete(action);
+    if (!requiresAcknowledgment) {
+      app.pendingCommands.delete(action);
+      app.commandMessages.delete(action);
+      clearCommandRecovery(action);
+    }
     renderCommandProgress();
     if (app.state) updateStateDisplay(app.state);
   }
+}
+
+function readCommandRecovery(action) {
+  try {
+    const raw = localStorage.getItem(commandRecoveryKey(action));
+    if (!raw) return null;
+    const record = JSON.parse(raw);
+    return record && record.action === action ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+function adoptCommandRecovery(record) {
+  const action = record.action;
+  app.commandRecovery.set(action, record);
+  app.pendingCommands.add(action);
+  if (record.state === "pending" && /^[0-9a-f]{32}$/.test(record.operation_id || "")) {
+    app.commandMessages.set(action, "检测到另一个标签页中的未完成操作；正在恢复状态查询。");
+  } else {
+    app.uncertainCommands.set(
+      action,
+      record.message || "另一个标签页中的操作结果尚未确认；请先核对仪器面板和采集文件。",
+    );
+  }
+  renderCommandProgress();
+}
+
+function handleCommandRecoveryStorage(event) {
+  const prefix = `${COMMAND_RECOVERY_STORAGE_KEY}:`;
+  if (!event?.key?.startsWith(prefix)) return;
+  const action = event.key.slice(prefix.length);
+  if (!Object.hasOwn(COMMAND_LABELS, action)) return;
+  if (!event.newValue) {
+    app.commandRecovery.delete(action);
+    app.pendingCommands.delete(action);
+    app.uncertainCommands.delete(action);
+    app.commandMessages.delete(action);
+  } else {
+    try {
+      const record = JSON.parse(event.newValue);
+      if (!record || record.action !== action) return;
+      adoptCommandRecovery(record);
+      if (record.state === "pending" && /^[0-9a-f]{32}$/.test(record.operation_id || "")) {
+        void resumeCommandRecovery(action, record.operation_id);
+      }
+    } catch {
+      return;
+    }
+  }
+  renderCommandProgress();
+  if (app.state) updateStateDisplay(app.state);
+}
+
+async function waitForCommandResult(operationId, action) {
+  let failures = 0;
+  while (true) {
+    const retryDelay = Math.min(400 * (2 ** Math.min(failures, 4)), 5000);
+    await new Promise((resolve) => setTimeout(resolve, retryDelay));
+    let response;
+    try {
+      response = await fetch(`/api/command-status?id=${encodeURIComponent(operationId)}`);
+    } catch (error) {
+      // Retry briefly with backoff, then require a manual state check instead of waiting forever.
+      failures += 1;
+      if (failures >= 3) {
+        return {
+          success: false,
+          uncertain: true,
+          message: `命令已开始，但连续 ${failures} 次无法查询状态（${error.message}）；请核对仪器面板和采集文件后再操作`,
+        };
+      }
+      app.commandMessages.set(action, "状态查询暂时无响应；系统正在退避重试，请勿重复提交。");
+      renderCommandProgress();
+      continue;
+    }
+    const status = await response.json();
+    if (response.status === 404) {
+      return {
+        success: false,
+        uncertain: true,
+        message: status.error || "命令状态无法查询；请核对仪器状态后再操作",
+      };
+    }
+    if (!response.ok) {
+      throw new Error(status.error || "命令状态查询失败");
+    }
+    failures = 0;
+    app.commandMessages.delete(action);
+    renderCommandProgress();
+    if (!status.pending) {
+      return status.result || { success: false, message: "命令结束但没有返回结果" };
+    }
+  }
+}
+
+async function restoreUnresolvedCommands() {
+  // Migrate recovery records written by earlier builds before reading per-action keys.
+  try {
+    const legacy = JSON.parse(localStorage.getItem(COMMAND_RECOVERY_STORAGE_KEY) || "[]");
+    if (Array.isArray(legacy)) {
+      for (const record of legacy) {
+        if (!record || typeof record.action !== "string" || !Object.hasOwn(COMMAND_LABELS, record.action)) continue;
+        if (!localStorage.getItem(commandRecoveryKey(record.action))) {
+          localStorage.setItem(commandRecoveryKey(record.action), JSON.stringify(record));
+        }
+      }
+      localStorage.removeItem(COMMAND_RECOVERY_STORAGE_KEY);
+    }
+  } catch {
+    return [];
+  }
+  const resume = [];
+  for (const action of Object.keys(COMMAND_LABELS)) {
+    const record = readCommandRecovery(action);
+    if (!record) continue;
+    adoptCommandRecovery(record);
+    if (record.state === "pending" && /^[0-9a-f]{32}$/.test(record.operation_id || "")) {
+      app.commandMessages.set(record.action, "检测到上次页面中未完成的操作；正在恢复状态查询。");
+      resume.push(resumeCommandRecovery(record.action, record.operation_id));
+    }
+  }
+  renderCommandProgress();
+  return Promise.all(resume);
+}
+
+async function resumeCommandRecovery(action, operationId) {
+  let result;
+  try {
+    result = await waitForCommandResult(operationId, action);
+  } catch (error) {
+    result = {
+      success: false,
+      uncertain: true,
+      message: `恢复查询失败：${error.message}；请核对仪器面板和采集文件后再操作`,
+    };
+  }
+  if (result.uncertain) {
+    app.uncertainCommands.set(action, result.message);
+    saveCommandRecovery(action, { state: "uncertain", message: result.message });
+    toast(`${result.message}。核对设备状态后，可使用下方按钮解除阻止。`, true);
+  } else {
+    app.pendingCommands.delete(action);
+    app.commandMessages.delete(action);
+    clearCommandRecovery(action);
+    toast(result.message || (result.success ? "上次操作已完成" : "上次操作已结束"), !result.success);
+  }
+  renderCommandProgress();
+  if (app.state) updateStateDisplay(app.state);
+  return result;
+}
+
+function acknowledgeUncertainCommands() {
+  const actions = [...app.uncertainCommands.keys()];
+  if (!actions.length) return false;
+  const labels = actions.map((action) => COMMAND_LABELS[action] || "操作").join("、");
+  if (!window.confirm(`请先检查仪器面板、接线和采集文件。只有确认 ${labels} 不再运行且状态安全后，才解除重复命令阻止。继续？`)) return false;
+  for (const action of actions) {
+    app.uncertainCommands.delete(action);
+    app.pendingCommands.delete(action);
+    app.commandMessages.delete(action);
+    clearCommandRecovery(action);
+  }
+  renderCommandProgress();
+  toast("已按人工确认解除命令阻止；操作前仍请核对当前设备状态。");
+  return true;
 }
 
 const COMMAND_LABELS = {
@@ -440,11 +829,16 @@ function renderCommandProgress() {
   status.classList.toggle("hidden", pending.length === 0);
   status.textContent = pending.map((action) => {
     const label = COMMAND_LABELS[action] || "操作";
+    if (app.uncertainCommands.has(action)) {
+      return `${label}结果未确认：${app.uncertainCommands.get(action)} 请勿重复提交。`;
+    }
+    if (app.commandMessages.has(action)) return `${label}${app.commandMessages.get(action)}`;
     if (COMMAND_PROGRESS_DETAILS[action]) return COMMAND_PROGRESS_DETAILS[action];
     return action.startsWith("connect_")
       ? `${label}正在等待打开串口、识别仪器和配置回读…`
       : `${label}进行中…`;
   }).join("；");
+  el("acknowledgeUncertainCommand").classList.toggle("hidden", app.uncertainCommands.size === 0);
   for (const [action, ids] of Object.entries(COMMAND_BUTTONS)) {
     for (const id of ids) {
       const button = el(id);
@@ -657,11 +1051,17 @@ async function submitAcquisition(action) {
         el("experimentName").select();
         return;
       }
-      if (choice !== "create-copy") {
+      if (choice === "overwrite") {
+        payload.expected_duplicate_path = String(preflight.duplicate_path || "");
+        payload.duplicate_name_action = "overwrite";
+        summary.textContent = "将先把最近一次同名实验移到可恢复备份目录，再开始本次实验。";
+      } else if (choice === "create-copy") {
+        payload.duplicate_name_action = "create-copy";
+        summary.textContent = "将创建新的独立目录；旧实验数据不会覆盖。";
+      } else {
         summary.textContent = "已取消启动；旧实验数据未修改。";
         return;
       }
-      summary.textContent = "将创建新的独立目录；旧实验数据不会覆盖。";
     }
     await command(action, payload);
   } finally {
@@ -783,6 +1183,204 @@ function exportFilteredLogs() {
   toast(`已导出 ${rows.length} 条日志`);
 }
 
+function chartPointFromApi(row) {
+  const id = Number(row?.id);
+  const x = Number(row?.x);
+  const y = Number(row?.y);
+  if (!Number.isFinite(id) || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return {
+    id, x, y, status: "ok", raw: String(row.raw ?? row.raw_reading ?? ""),
+    mode: String(row.mode || ""), unit: String(row.unit || row.unit_si || ""),
+    range: row.range ?? row.range_si ?? null, timestamp: String(row.timestamp || row.timestamp_local || ""),
+    error: "", breakBefore: Boolean(row.break_before ?? row.breakBefore),
+    summary: row.summary !== false,
+  };
+}
+
+function cancelChartRangeRequest(request = app.chartRangeRequest) {
+  if (!request || request.cancelled) return;
+  request.cancelled = true;
+  if (request.submitted || request.started) {
+    const params = new URLSearchParams({ request_id: request.id });
+    fetch(`/api/chart/range/cancel?${params}`, { cache: "no-store" }).catch(() => {});
+  }
+  if (app.chartRangeRequest === request) app.chartRangeRequest = null;
+}
+
+function clearChartOverview() {
+  app.chartOverviewSequence += 1;
+  app.chartOverviewInFlight = false;
+  cancelChartRangeRequest();
+  app.chartOverview = [];
+  app.chartOverviewJobId = null;
+  app.chartOverviewStatus = "idle";
+  app.chartOverviewRevision = -1;
+  app.chartOverviewWidth = 0;
+  app.chartRangeRows = null;
+  app.chartRangeView = null;
+}
+
+function mergeChartRows(overview, recent) {
+  const byId = new Map();
+  for (const point of overview || []) byId.set(Number(point.id), point);
+  let previousRecentId = null;
+  for (const point of recent || []) {
+    const id = Number(point.id);
+    const previous = byId.get(id);
+    const missingRecentSamples = Number.isFinite(id) && Number.isFinite(previousRecentId) && id > previousRecentId + 1;
+    byId.set(id, {
+      ...point,
+      breakBefore: Boolean(point.breakBefore || previous?.breakBefore || missingRecentSamples),
+      summary: false,
+    });
+    if (Number.isFinite(id)) previousRecentId = id;
+  }
+  return Array.from(byId.values()).sort((left, right) => left.x - right.x || left.id - right.id);
+}
+
+function chartPointsForPlot() {
+  const recent = validPoints();
+  if (app.imported) return recent;
+  if (app.xView) {
+    const [start, end] = app.xView;
+    const details = app.chartRangeView;
+    if (app.chartRangeRows?.length && details?.jobId === app.chartOverviewJobId
+      && details.start <= start && details.end >= end) return app.chartRangeRows;
+    if (recent.length && start >= recent[0].x && end <= recent.at(-1).x) return recent;
+    return mergeChartRows(app.chartOverview, recent);
+  }
+  if (el("autoFollow")?.checked) return recent;
+  return mergeChartRows(app.chartOverview, recent);
+}
+
+async function refreshChartOverview() {
+  if (app.chartOverviewInFlight) return false;
+  const requestGeneration = app.generation;
+  const requestDirectory = app.state?.experiment_dir || app.state?.last_experiment_dir;
+  if (!requestDirectory) return false;
+  const requestSequence = ++app.chartOverviewSequence;
+  app.chartOverviewInFlight = true;
+  try {
+    const width = Math.max(1, Math.floor(ui.canvas?.getBoundingClientRect?.().width || 1200));
+    const params = new URLSearchParams({ width: String(width) });
+    const response = await fetch(`/api/chart/overview?${params}`, { cache: "no-store" });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    const currentDirectory = app.state?.experiment_dir || app.state?.last_experiment_dir;
+    if (
+      requestSequence !== app.chartOverviewSequence
+      || requestGeneration !== app.generation
+      || requestDirectory !== currentDirectory
+    ) return false;
+    const previousJobId = app.chartOverviewJobId;
+    if (previousJobId && payload.job_id !== previousJobId) {
+      cancelChartRangeRequest();
+      app.chartRangeRows = null;
+      app.chartRangeView = null;
+      app.chartOverviewRevision = -1;
+    }
+    app.chartOverviewJobId = String(payload.job_id || "") || null;
+    app.chartOverviewStatus = String(payload.status || "error");
+    if (payload.revision !== app.chartOverviewRevision || width !== app.chartOverviewWidth || previousJobId !== payload.job_id) {
+      app.chartOverview = Array.isArray(payload.rows)
+        ? payload.rows.map(chartPointFromApi).filter(Boolean)
+        : [];
+      app.chartOverviewRevision = Number(payload.revision ?? -1);
+      app.chartOverviewWidth = width;
+    }
+    if (ui.canvas) drawChart();
+    return true;
+  } catch (_error) {
+    return false;
+  } finally {
+    if (requestSequence === app.chartOverviewSequence) app.chartOverviewInFlight = false;
+  }
+}
+
+function scheduleChartOverviewRefresh() {
+  const now = Date.now();
+  if (now < app.chartOverviewNextAt || app.chartOverviewInFlight) return;
+  app.chartOverviewNextAt = now + 1500;
+  void refreshChartOverview();
+}
+
+async function requestChartRange(startValue, endValue, widthValue) {
+  const start = Number(startValue), end = Number(endValue), width = Math.max(1, Math.floor(Number(widthValue) || 1));
+  const jobId = app.chartOverviewJobId;
+  if (!jobId || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || width > 4096) return false;
+  const key = `${jobId}:${start}:${end}:${width}`;
+  if (app.chartRangeView?.key === key && app.chartRangeRows) return true;
+  if (app.chartRangeRequest?.key === key) return app.chartRangeRequest.promise || false;
+  cancelChartRangeRequest();
+  const request = {
+    id: (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : `chart-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+    key, jobId, start, end, width, submitted: false, started: false, cancelled: false, sequence: ++app.chartRangeSequence,
+  };
+  app.chartRangeRequest = request;
+  app.chartRangeRows = null;
+  app.chartRangeView = null;
+  const active = () => app.chartRangeRequest === request && !request.cancelled;
+  const work = (async () => {
+    const deadline = Date.now() + 30000;
+    while (active() && Date.now() < deadline) {
+      try {
+        const params = new URLSearchParams({ request_id: request.id });
+        if (!request.started) {
+          params.set("job_id", request.jobId);
+          params.set("start", String(request.start));
+          params.set("end", String(request.end));
+          params.set("width", String(request.width));
+          request.submitted = true;
+        }
+        const response = await fetch(`/api/chart/range?${params}`, { cache: "no-store" });
+        if (!response.ok && response.status !== 202) {
+          if (active()) cancelChartRangeRequest(request);
+          return false;
+        }
+        const payload = await response.json();
+        if (!active()) {
+          request.started = request.started || payload.status === "running";
+          cancelChartRangeRequest(request);
+          return false;
+        }
+        if (payload.status === "ready") {
+          app.chartRangeRows = Array.isArray(payload.rows) ? payload.rows.map(chartPointFromApi).filter(Boolean) : [];
+          app.chartRangeView = { key, jobId, start, end, width };
+          request.started = true;
+          app.chartRangeRequest = null;
+          if (ui.canvas) drawChart();
+          return true;
+        }
+        if (["error", "cancelled", "expired"].includes(payload.status)) {
+          if (active()) app.chartRangeRequest = null;
+          return false;
+        }
+        request.started = payload.status === "running";
+        await new Promise((resolve) => setTimeout(resolve, payload.status === "indexing" ? 350 : 180));
+      } catch (_error) {
+        if (!active()) return false;
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+    }
+    if (active()) cancelChartRangeRequest(request);
+    return false;
+  })();
+  request.promise = work;
+  return work;
+}
+
+function ensureChartRangeForView(start, end, width) {
+  if (!app.xView || app.imported || !app.chartOverviewJobId) return;
+  const recent = validPoints();
+  if (recent.length && start >= recent[0].x && end <= recent.at(-1).x) {
+    cancelChartRangeRequest();
+    return;
+  }
+  const details = app.chartRangeView;
+  if (details?.jobId === app.chartOverviewJobId && details.start <= start && details.end >= end) return;
+  void requestChartRange(start, end, width);
+}
+
 function appendSampleRows(rows) {
   if (!rows?.length) return;
   for (const row of rows) {
@@ -820,10 +1418,13 @@ async function pollState() {
       app.latestInvalidPoint = null;
       app.lastSample = 0;
       app.imported = null;
+      app.importedStats = null;
       app.importedFileName = "";
       app.xView = null;
       app.yView = null;
+      app.yOrigin = null;
       app.bufferTruncated = false;
+      clearChartOverview();
       el("restoreLive").classList.add("hidden");
     }
     app.generation = state.generation;
@@ -832,13 +1433,14 @@ async function pollState() {
     appendLogRows(state.logs);
     app.lastLog = Math.max(app.lastLog, Number(state.log_seq || 0));
     app.state = state;
+    if (!app.imported) scheduleChartOverviewRefresh();
     if (wasConnected && !state.connected) clearSafetyConfirmation();
     updateStateDisplay(state);
     if (state.events && !app.imported) renderEvents(state.events);
     if (state.logs?.some((line) => String(line.text).startsWith("! "))) {
       // The actual error remains in the status panel; avoid repeated popups during polling.
     }
-    drawChart();
+    scheduleChartRedraw();
     updateStats();
   } catch (error) {
     setServiceStatus(false, error.message);
@@ -853,7 +1455,6 @@ function updateStateDisplay(state) {
   syncSettingsReadback(state);
   const device = state.device || {};
   renderIdnFirmwareInfo(state, device);
-  applyDigitalFilterNplcGuard(state);
   const serialNumber = state.connected && !state.simulation ? String(device.serial_number || "") : "";
   if (serialNumber !== app.activeDeviceSerial) {
     app.activeDeviceSerial = serialNumber;
@@ -867,6 +1468,11 @@ function updateStateDisplay(state) {
   badge.classList.toggle("connected", state.connected && !state.simulation);
   badge.classList.toggle("mock", state.connected && state.simulation);
   badgeText.textContent = !state.connected ? "未连接" : state.simulation ? "MOCK 模拟" : `已连接 · 8845A / ${state.control_mode === "local" ? "LOCAL" : "COMPUTER"}`;
+  const connectionSummary = el("connectionSummary");
+  connectionSummary.textContent = !state.connected ? "未连接"
+    : state.simulation ? "模拟器" : `真实仪器 · ${state.control_mode === "local" ? "Local" : "Computer"}`;
+  connectionSummary.classList.toggle("mock", !!state.connected && !!state.simulation);
+  connectionSummary.classList.toggle("connected", !!state.connected && !state.simulation);
   el("connectionText").textContent = state.connection_text || "串口尚未打开";
   updatePortSelectionInfo(state);
   el("connectionText").parentElement.classList.toggle("is-connected", !!state.connected);
@@ -898,6 +1504,11 @@ function updateStateDisplay(state) {
   const scenario = state.simulation
     ? String(state.mock_scenario?.name ?? state.mock_scenario ?? "")
     : "";
+  el("scenarioSummary").textContent = scenario ? `模拟场景：${scenario}` : "";
+  el("scenarioSummary").classList.toggle("hidden", !scenario);
+  el("mockScenario").title = state.connected && state.simulation
+    ? "模拟器已连接；更换场景请先断开，再重新连接。"
+    : "连接模拟器前选择场景；场景会决定生成的模拟测量变化和故障行为。";
   if (scenario) {
     el("mockScenario").value = scenario;
     el("scenarioBadge").textContent = `模拟 · ${scenario}`;
@@ -976,6 +1587,7 @@ function updateStateDisplay(state) {
   el("downloadCsv").textContent = state.experiment_dir ? "下载进行中快照 CSV" : state.last_experiment_dir ? "下载最近已保存 CSV" : "暂无可下载 CSV";
   el("downloadEventsSafe").disabled = !state.last_experiment_dir || !!state.experiment_dir;
   el("downloadMeasurementsSafe").disabled = !state.last_experiment_dir || !!state.experiment_dir;
+  el("downloadSharePackage").disabled = !state.last_experiment_dir || !!state.experiment_dir;
   el("downloadCsv").title = state.experiment_dir
     ? "下载时生成进行中快照，只包含最后一条完整 CSV 记录；响应会标明服务器快照时间。"
     : state.last_experiment_dir ? "下载最近一次已完成并保存的原始 CSV。" : "开始并保存一次实验后即可下载原始 CSV。";
@@ -991,13 +1603,16 @@ function updateStateDisplay(state) {
     && Number.isFinite(invalidSampleIndex)
     && latestSampleIndex > invalidSampleIndex;
   const criticalError = recoveredAfterInvalid ? "" : String(state.last_error || "").trim();
-  const invalidText = invalid && !recoveredAfterInvalid
+  const invalidText = invalid
     ? `最近无效样本 #${invalid.id} · ${invalid.status || "无效"} · ${invalid.error || invalid.raw || "仪器未返回有效读数"}`
+      + ` · ${recoveredAfterInvalid ? "后续有效读数已恢复" : "等待有效读数"}`
     : "";
   const failureText = invalidText || (criticalError ? `最近异常：${criticalError}` : "");
   el("criticalError").textContent = failureText ? `${failureText} · 查看日志` : "";
   el("criticalError").classList.toggle("hidden", !failureText);
-  const zeroResult = String(state.zero_result || "").trim();
+  const zeroResult = app.zeroPending
+    ? "ZERO执行中；等待本次操作反馈。"
+    : String(state.zero_result || "").trim();
   el("zeroResult").textContent = zeroResult;
   el("zeroResult").classList.toggle("hidden", !zeroResult);
   const running = /采集中|测量中/.test(state.status || "");
@@ -1011,6 +1626,8 @@ function updateStateDisplay(state) {
   el("clearManualSoftware").disabled = !state.connected || state.simulation || acquiring ||
     !(el("outguardSoftware").value.trim() || el("inguardSoftware").value.trim());
   const computerControl = !state.connected || state.simulation || state.control_mode === "computer";
+  const zeroConfigurationReady = !!state.active_settings?.mode &&
+    String(state.active_settings.mode) === String(app.selectedMode || "");
   el("controlMode").disabled = !state.connected || state.simulation || acquiring;
   el("applyControlMode").disabled = !state.connected || state.simulation || acquiring;
   el("start").disabled = !state.connected || !computerControl || acquiring || !!nameError || app.startPending;
@@ -1060,25 +1677,36 @@ function updateStateDisplay(state) {
           ? "采集前：选择参数后点“应用仪器参数”。"
           : "可先选择模式与参数；连接仪器或模拟器后应用。";
   el("settingsApplyHint").textContent = applyHint;
-  el("zero").disabled = !state.connected || !computerControl || acquiring;
+  el("zero").disabled = !state.connected || !computerControl || acquiring || !zeroConfigurationReady;
   const localPhysicalControl = !!state.connected && !state.simulation && !computerControl;
   el("diagnose").disabled = localPhysicalControl;
   el("diagnose").title = localPhysicalControl
     ? "Local 模式下不运行通信诊断，也不发送 SCPI 查询；切换到 Computer 后再诊断。"
     : "读取仪器身份和当前通信/配置状态，不启动采集。";
-  el("controlModeHelp").textContent = "Computer：软件可发送 SCPI 命令、配置和采集，仪表 RS-232 协议须设为 COMPUTER。Local：仪表面板控制，软件采集、配置、ZERO 和诊断均禁用，串口连接保留。只能在停止采集后切换。";
+  el("controlModeHelp").textContent = "Computer：软件可发送 SCPI 命令、配置和采集，仪表 RS-232 协议须设为 COMPUTER。Local：软件发送 SYST:LOC 请求；仪表没有 Local 状态的 SCPI 回读，请核对仪表面板。软件采集、配置、ZERO 和诊断均禁用，串口连接保留。只能在停止采集后切换。";
   const lockReason = !state.connected ? "请先连接仪器或模拟器。"
     : !computerControl ? "仪表处于 Local 模式；切换到 Computer 后可操作。"
       : acquiring ? "采集中不能更改仪器参数。" : "";
-  for (const id of ["mode", "autorange", "range", "analogFilter", "inputImpedanceAuto", "autozero", "applySettings", "zero"]) {
+  for (const id of ["mode", "autorange", "range", "nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "autozero", "applySettings"]) {
     const control = el(id);
-    if (control.disabled) control.title = lockReason;
+    if (control?.disabled) control.title = lockReason;
   }
+  el("disconnect").title = acquiring
+    ? "采集中不能断开连接；请先停止并保存当前实验。"
+    : "安全关闭当前仪器或模拟器连接。";
+  el("applySpeed").title = !state.connected ? "请先连接仪器或模拟器。"
+    : !computerControl ? "Local 模式下不发送速度设置；切回 Computer 后可操作。"
+      : !canTune ? "当前测量模式没有可调整的 NPLC 或交流带宽。"
+        : !acquiring ? "连续采集期间才能应用速度；开始采集后可修改适用参数。"
+          : "应用当前 NPLC 或交流带宽，完成回读后从后续读数生效。";
   el("start").title = nameError || (!state.connected ? "请先连接仪器或模拟器。"
     : !computerControl ? "Local 模式下不能启动软件采集。"
       : acquiring ? "已有采集正在运行。" : "开始持续采集并逐点保存 CSV。");
   el("single").title = el("start").title.replace("持续采集", "单次测量");
-  el("zero").title = lockReason || "ZERO 是仪器内部零点校正，不是读数归零或校准调整。";
+  const zeroLockReason = lockReason || (!zeroConfigurationReady
+    ? "请先读取或应用当前模式配置，并确认仪器配置回读后再执行 ZERO。"
+    : "ZERO 是仪器内部零点校正，不是读数归零或校准调整。");
+  el("zero").title = zeroLockReason;
   if (state.last_error && state.last_error !== app.lastShownError) {
     app.lastShownError = state.last_error;
     // Errors stay visible inline and in the log, without interrupting long sessions.
@@ -1086,21 +1714,6 @@ function updateStateDisplay(state) {
   if (state.simulation) document.title = "Fluke 8845A · MOCK 模拟 · 实验测量台";
   else document.title = "Fluke 8845A · 实验测量台";
   updateChartAccessibilitySummary(state);
-}
-
-function applyDigitalFilterNplcGuard(state) {
-  const select = el("nplc");
-  if (!select) return;
-  const blockedValues = state?.device?.digital_filter_blocked_nplc_values?.[app.selectedMode] || [];
-  const blocked = !!state?.connected && !state?.simulation && blockedValues.length > 0;
-  const options = select.options || [];
-  for (let index = 0; index < options.length; index += 1) {
-    const option = options[index];
-    option.disabled = blocked && blockedValues.includes(Number(option.value));
-  }
-  select.title = blocked
-    ? (state?.device?.digital_filter_slow_read_block_reasons?.[app.selectedMode] || "")
-    : "";
 }
 
 function syncSettingsReadback(state) {
@@ -1143,18 +1756,27 @@ function renderSettingsComparison(state) {
   const pending = settingsPayload();
   const actual = state?.active_settings || {};
   const modeLabel = (value) => app.modes.get(value)?.label || value || "未回读";
-  const rangeLabelFor = (settings, spec) => settings?.autorange
-    ? "自动量程" : settings?.range_si === null || settings?.range_si === undefined
+  const rangeLabelFor = (settings, spec) => {
+    if (settings?.autorange) {
+      if (!Number.isFinite(Number(settings?.range_readback_si))) return "自动量程 · 当前档位未回读";
+      const label = rangeLabel(Number(settings.range_readback_si), spec?.unit || "");
+      return settings.simulation ? `自动量程 · MOCK模拟档位 ${label}` : `自动量程 · 当前档位 ${label}（快照）`;
+    }
+    return settings?.range_si === null || settings?.range_si === undefined
       ? "未回读" : rangeLabel(settings.range_si, spec?.unit || "");
+  };
   const timingLabel = (settings, spec) => spec?.bandwidths?.length
     ? settings?.ac_bandwidth_hz === null || settings?.ac_bandwidth_hz === undefined ? "未回读" : `${settings.ac_bandwidth_hz} Hz 带宽`
     : spec?.nplc?.length ? settings?.nplc === null || settings?.nplc === undefined ? "未回读" : `${settings.nplc} NPLC`
       : "不适用";
+  const analogFilterLabel = (settings, spec) => !spec?.analog_filter
+    ? "不适用"
+    : settings?.analog_filter === undefined ? "未回读" : settings.analog_filter ? "开" : "关";
   const values = [
     ["模式", modeLabel(actual.mode), modeLabel(pending.mode)],
     ["量程", rangeLabelFor(actual, app.modes.get(actual.mode)), rangeLabelFor(pending, pendingSpec)],
     ["积分 / 带宽", timingLabel(actual, app.modes.get(actual.mode)), timingLabel(pending, pendingSpec)],
-    ["模拟滤波", actual.analog_filter === undefined ? "未回读" : actual.analog_filter ? "开" : "关", pending.analog_filter ? "开" : "关"],
+    ["模拟滤波", analogFilterLabel(actual, app.modes.get(actual.mode)), analogFilterLabel(pending, pendingSpec)],
     ...(pendingSpec.input_impedance_auto ? [[
       "自动高输入阻抗",
       actual.input_impedance_auto === undefined ? "未回读" : actual.input_impedance_auto ? "开" : "关（10 MΩ）",
@@ -1164,11 +1786,14 @@ function renderSettingsComparison(state) {
       "数字滤波",
       actual.digital_filter_state === "readback_on" ? "开"
         : actual.digital_filter_state === "readback_off" ? "关"
+          : actual.digital_filter_state === "unsupported" ? "OutG SW 版本不支持"
           : actual.digital_filter_state === "unprobed_inactive" ? "未探测 / 当前不活动"
             : actual.digital_filter_state === "unprobed" ? "未探测 / 慢速设置受限"
             : actual.digital_filter_state === "simulation" ? "MOCK 模拟"
               : "未回读 / 当前不可用",
-      pending.digital_filter ? "开" : "关",
+      actual.digital_filter_state === "unsupported"
+        ? "OutG SW 版本不支持"
+        : pending.digital_filter ? "开" : "关",
     ]] : []),
     ["自动零点", actual.autozero === undefined ? "未回读" : actual.autozero ? "开" : "关", pending.autozero ? "开" : "关"],
   ];
@@ -1194,19 +1819,27 @@ function validPoints() { return dataPoints().filter((point) => point.status === 
 
 function updateStats() {
   const points = validPoints();
+  const importedStats = app.imported && app.importedStats ? app.importedStats : null;
+  const importedCount = importedStats && Number.isFinite(Number(importedStats.validCount))
+    ? Number(importedStats.validCount) : null;
+  const count = importedCount ?? points.length;
   const spec = app.imported ? { unit: app.imported.unit } : activeMode();
   const unit = points[0]?.unit || spec?.unit || "";
   const labelUnit = unit === "Ohm" ? "Ω" : unit || "—";
   configureBaselineUnits(unit);
   if (el("baselineUnit")) el("baselineUnit").textContent = `${labelUnit}（SI 基本单位）`;
   if (el("analysisContext")) {
-    const source = app.imported ? "当前历史文件" : (app.bufferTruncated ? "当前缓存（早期点已滚动）；原始 CSV 保留全程数据" : "当前实时缓存");
-    el("analysisContext").textContent = `统计范围：${source}中的全部有效读数 · n=${points.length} · 单位 ${labelUnit}`;
+    const source = app.imported
+      ? "当前历史文件（全文件）"
+      : app.bufferTruncated
+        ? "当前实时缓存（最多5000条最近记录，早期记录已滚动；原始 CSV 保留全程数据）"
+        : "当前实时缓存（最多5000条最近记录）";
+    el("analysisContext").textContent = `统计范围：${source}中的全部有效读数 · n=${count} · 单位 ${labelUnit} · 图表缩放和平移不影响统计范围`;
   }
   for (const id of ["statMeanCount", "statStdCount", "statMinCount", "statMaxCount"]) {
-    el(id).textContent = `n=${points.length}`;
+    el(id).textContent = `n=${count}`;
   }
-  if (!points.length) {
+  if (!count) {
     for (const id of ["statMean", "statStd", "statMin", "statMax"]) el(id).textContent = "—";
     updateBaseline(null, spec?.unit || "");
     updateChartAccessibilitySummary();
@@ -1214,10 +1847,17 @@ function updateStats() {
   }
   let sum = 0, min = Infinity, max = -Infinity;
   for (const point of points) { sum += point.y; min = Math.min(min, point.y); max = Math.max(max, point.y); }
-  const mean = sum / points.length;
+  const computedMean = points.length ? sum / points.length : NaN;
   let squares = 0;
-  for (const point of points) squares += (point.y - mean) ** 2;
-  const std = points.length > 1 ? Math.sqrt(squares / (points.length - 1)) : 0;
+  if (Number.isFinite(computedMean)) for (const point of points) squares += (point.y - computedMean) ** 2;
+  const computedStd = points.length > 1 ? Math.sqrt(squares / (points.length - 1)) : (points.length ? 0 : NaN);
+  const finiteStat = (key, fallback) => importedStats && importedStats[key] !== null
+    && importedStats[key] !== undefined && Number.isFinite(Number(importedStats[key]))
+    ? Number(importedStats[key]) : fallback;
+  const mean = finiteStat("mean", computedMean);
+  min = finiteStat("min", min);
+  max = finiteStat("max", max);
+  const std = finiteStat("sampleStdDev", computedStd);
   el("statMean").textContent = statWithUnit(mean, unit);
   el("statStd").textContent = statWithUnit(std, unit);
   el("statMin").textContent = statWithUnit(min, unit);
@@ -1283,8 +1923,10 @@ function updateChartAccessibilitySummary(state = app.state) {
   if (actual.unit) parts.push(`实测间隔 ${actual.value} ${actual.unit}`);
   const indexedCount = app.chartScale?.rows?.length;
   const validCount = Number(state?.stats?.valid_count);
-  const displayedValidCount = Number.isFinite(indexedCount)
-    ? indexedCount : Number.isFinite(validCount) ? validCount : validPoints().length;
+  const importedValidCount = Number(app.importedStats?.validCount);
+  const displayedValidCount = app.imported && Number.isFinite(importedValidCount)
+    ? importedValidCount : Number.isFinite(indexedCount)
+      ? indexedCount : Number.isFinite(validCount) ? validCount : validPoints().length;
   parts.push(`${displayedValidCount} 个有效读数，${attempts.length} 次测量尝试`);
   if (latest) {
     const displayed = scaledValue(latest.y, unit);
@@ -1401,10 +2043,11 @@ function plotContext(canvas = ui.canvas) {
 }
 
 function niceStep(span, divisions) {
-  const rough = span / divisions;
-  const power = 10 ** Math.floor(Math.log10(rough || 1));
+  const rough = Math.max(Number.MIN_VALUE, span / divisions);
+  const power = Math.max(Number.MIN_VALUE, 10 ** Math.floor(Math.log10(rough)));
   const normalized = rough / power;
-  return (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10) * power;
+  const step = (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10) * power;
+  return Number.isFinite(step) && step > 0 ? step : rough;
 }
 
 function timeLabel(seconds) {
@@ -1457,8 +2100,8 @@ function schedulePointerRedraw() {
 }
 
 function clampRangeToData(range, dataMin, dataMax) {
-  const span = Math.max(Number.EPSILON, range[1] - range[0]);
-  const dataSpan = Math.max(Number.EPSILON, dataMax - dataMin);
+  const span = Math.max(Number.MIN_VALUE, range[1] - range[0]);
+  const dataSpan = Math.max(Number.MIN_VALUE, dataMax - dataMin);
   const visible = Math.min(dataSpan, span * .25);
   const minimumStart = dataMin - span + visible;
   const maximumStart = dataMax - visible;
@@ -1469,6 +2112,12 @@ function clampRangeToData(range, dataMin, dataMax) {
 function updateViewStatus() {
   const label = app.imported ? "历史文件视图" : el("autoFollow").checked ? "自动跟随最新数据" : "手动视图 · 自动跟随已关闭";
   if (el("viewModeStatus")) el("viewModeStatus").textContent = label;
+  const source = el("dataSourceStatus");
+  if (source) {
+    const fileName = String(app.importedFileName || "历史 CSV");
+    source.textContent = app.imported ? `历史：${fileName}` : "实时数据";
+    source.title = app.imported ? fileName : "当前显示实时测量数据";
+  }
 }
 
 function updateEmptyPlotState(hasPoints = validPoints().length > 0) {
@@ -1513,7 +2162,7 @@ function drawChart() {
     overlay.context.clearRect(0, 0, overlay.width, overlay.height);
   }
   ctx.clearRect(0, 0, width, height);
-  const rows = validPoints();
+  const rows = chartPointsForPlot();
   updateEmptyPlotState(rows.length > 0);
   updateViewStatus();
   if (!rows.length) {
@@ -1527,6 +2176,17 @@ function drawChart() {
   const maxX = rows[rows.length - 1].x;
   const minDataX = rows[0].x;
   const values = rows.map((row) => row.y);
+  if (!Number.isFinite(app.yOrigin)) app.yOrigin = values[0];
+  const yOrigin = app.yOrigin;
+  const extentRows = app.imported ? rows : mergeChartRows(app.chartOverview, validPoints());
+  const dataMinX = extentRows[0]?.x ?? minDataX;
+  const dataMaxX = extentRows.at(-1)?.x ?? maxX;
+  let extentMinY = Infinity, extentMaxY = -Infinity;
+  for (const point of extentRows) {
+    const offset = point.y - yOrigin;
+    if (offset < extentMinY) extentMinY = offset;
+    if (offset > extentMaxY) extentMaxY = offset;
+  }
   let xMin, xMax;
   if (app.xView) {
     [xMin, xMax] = app.xView;
@@ -1545,36 +2205,62 @@ function drawChart() {
   }
   if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) { xMin = minDataX; xMax = Math.max(minDataX + 1, maxX + 1); }
   let dataMin = Infinity, dataMax = -Infinity;
+  let rawDataMin = Infinity, rawDataMax = -Infinity;
   for (const value of values) {
-    if (value < dataMin) dataMin = value;
-    if (value > dataMax) dataMax = value;
+    const offset = value - yOrigin;
+    if (offset < dataMin) dataMin = offset;
+    if (offset > dataMax) dataMax = offset;
+    if (value < rawDataMin) rawDataMin = value;
+    if (value > rawDataMax) rawDataMax = value;
   }
   const dataSpan = dataMax - dataMin;
-  const padding = dataSpan === 0 ? Math.max(Math.abs(dataMax) * .025, 1e-9) : dataSpan * .12;
+  const absoluteMagnitude = Math.max(Math.abs(rawDataMin), Math.abs(rawDataMax));
+  const padding = dataSpan === 0 ? Math.max(absoluteMagnitude * .025, 1e-9) : dataSpan * .12;
   let yMin = dataMin - padding;
   let yMax = dataMax + padding;
   if (app.yView) [yMin, yMax] = app.yView;
-  const left = plot.left, top = plot.top, right = width - plot.right, bottom = height - plot.bottom;
-  const plotWidth = Math.max(1, right - left), plotHeight = Math.max(1, bottom - top);
-  const xToPixel = (x) => left + (x - xMin) / (xMax - xMin) * plotWidth;
-  const yToPixel = (y) => bottom - (y - yMin) / (yMax - yMin) * plotHeight;
   const unit = rows[0].unit || activeMode()?.unit || "";
+  const yStep = niceStep(yMax - yMin, 5);
+  const plottedSpan = yMax - yMin;
+  const scaledAxis = axisScaleForValues(values, unit, plottedSpan);
+  const axis = plottedSpan > 0 && plottedSpan / scaledAxis.factor === 0
+    ? { factor: 1, unit: unit === "Ohm" ? "Ω" : unit }
+    : scaledAxis;
+  const originInAxisUnits = yOrigin / axis.factor;
+  const stepInAxisUnits = yStep / axis.factor;
+  const relativeYTickLabels = yOrigin !== 0
+    && (Math.abs(originInAxisUnits) * Number.EPSILON * 4 >= stepInAxisUnits
+      || Math.abs(originInAxisUnits) > Math.abs(stepInAxisUnits) * 1e6);
+  const yTicks = axisTickValues(yMin, yMax, yStep);
+  const yTickLabels = yTicks.map((offset) => {
+    const absoluteValue = yOrigin + offset;
+    const displayValue = (relativeYTickLabels ? offset : absoluteValue) / axis.factor;
+    const precisionValue = relativeYTickLabels ? offset : absoluteValue;
+    const label = numberText(displayValue, axisTickPrecision(precisionValue, yStep));
+    return relativeYTickLabels && displayValue > 0 ? `+${label}` : label;
+  });
 
   ctx.fillStyle = "#faf9f2";
+  ctx.font = "12px Segoe UI, Microsoft YaHei UI, sans-serif";
+  const widestYLabel = Math.max(0, ...yTickLabels.map((label) => ctx.measureText(label).width));
+  const left = Math.max(plot.left, Math.min(width * 0.45, widestYLabel + 18));
+  const top = plot.top, right = width - plot.right, bottom = height - plot.bottom;
+  const plotWidth = Math.max(1, right - left), plotHeight = Math.max(1, bottom - top);
+  ensureChartRangeForView(xMin, xMax, plotWidth);
+  const xToPixel = (x) => left + (x - xMin) / (xMax - xMin) * plotWidth;
+  const yOffsetToPixel = (offset) => bottom - (offset - yMin) / (yMax - yMin) * plotHeight;
+  const yToPixel = (y) => yOffsetToPixel(y - yOrigin);
   ctx.fillRect(left, top, plotWidth, plotHeight);
-  ctx.font = "11px Segoe UI, Microsoft YaHei UI, sans-serif";
   ctx.textBaseline = "middle";
   ctx.strokeStyle = COLORS.grid;
   ctx.lineWidth = 1;
-  const yStep = niceStep(yMax - yMin, 5);
-  const axis = axisScaleForValues(values, unit);
-  for (let value = Math.ceil(yMin / yStep) * yStep; value <= yMax + yStep * 0.01; value += yStep) {
-    const y = yToPixel(value);
+  for (let tickIndex = 0; tickIndex < yTicks.length; tickIndex += 1) {
+    const value = yTicks[tickIndex];
+    const y = yOffsetToPixel(value);
     ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    const label = numberText(value / axis.factor, 6);
     ctx.fillStyle = COLORS.ink;
     ctx.textAlign = "right";
-    ctx.fillText(label, left - 9, y);
+    ctx.fillText(yTickLabels[tickIndex], left - 9, y);
   }
   const xStep = niceStep(xMax - xMin, Math.max(3, Math.floor(plotWidth / 125)));
   ctx.textAlign = "center";
@@ -1595,6 +2281,14 @@ function drawChart() {
   const quantityLabel = plottedMode?.quantity === "voltage" ? "电压" : plottedMode?.quantity === "current" ? "电流" : plottedMode?.quantity === "resistance" ? "电阻" : "读数";
   ctx.fillText(`${quantityLabel} (${axis.unit})`, 0, 0);
   ctx.restore();
+  if (relativeYTickLabels) {
+    const absoluteOrigin = scaledValue(yOrigin, unit);
+    const originLabel = `${absoluteOrigin.value} ${absoluteOrigin.unit}`.trim();
+    ctx.fillStyle = "#697a80";
+    ctx.font = "12px Segoe UI, Microsoft YaHei UI, sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(`刻度相对 ${originLabel}`, right - 5, top + 11);
+  }
   ctx.fillStyle = "#697a80";
   ctx.textAlign = "center";
   ctx.fillText("实验经过时间", left + plotWidth / 2, height - 7);
@@ -1602,7 +2296,12 @@ function drawChart() {
   let previousId = null;
   const segmentedRows = rows.map((point, index) => {
     const id = Number(point.id);
-    const breakBefore = index > 0 && Number.isFinite(id) && Number.isFinite(previousId) && id > previousId + 1;
+    const explicitBreak = point.breakBefore ?? point.break_before;
+    const hasExplicitBreak = Object.prototype.hasOwnProperty.call(point, "breakBefore")
+      || Object.prototype.hasOwnProperty.call(point, "break_before");
+    const breakBefore = index > 0 && (hasExplicitBreak
+      ? Boolean(explicitBreak)
+      : Number.isFinite(id) && Number.isFinite(previousId) && id > previousId + 1);
     previousId = Number.isFinite(id) ? id : previousId;
     return { ...point, breakBefore };
   });
@@ -1611,8 +2310,9 @@ function drawChart() {
   ctx.save();
   ctx.beginPath(); ctx.rect(left, top, plotWidth, plotHeight); ctx.clip();
   const baseline = app.baseline;
-  if (Number.isFinite(baseline) && baseline >= yMin && baseline <= yMax) {
-    const y = yToPixel(baseline);
+  const baselineOffset = baseline - yOrigin;
+  if (Number.isFinite(baseline) && baselineOffset >= yMin && baselineOffset <= yMax) {
+    const y = yOffsetToPixel(baselineOffset);
     ctx.strokeStyle = "#c7842f";
     ctx.lineWidth = 1.4;
     ctx.setLineDash([6, 4]);
@@ -1664,17 +2364,71 @@ function drawChart() {
   const cached = app.pointIndexCache;
   const indexKeyMatches = cached && cached.source === source && cached.length === rows.length
     && cached.firstId === firstId && cached.lastId === lastId
+    && cached.yOrigin === yOrigin
     && cached.xMin === xMin && cached.xMax === xMax && cached.yMin === yMin && cached.yMax === yMax
     && cached.left === left && cached.right === right && cached.top === top && cached.bottom === bottom;
   const pointIndex = indexKeyMatches ? cached.index : buildPixelPointIndex(rows, xToPixel, yToPixel, xMin, xMax);
-  if (!indexKeyMatches) app.pointIndexCache = { source, length: rows.length, firstId, lastId, xMin, xMax, yMin, yMax, left, right, top, bottom, index: pointIndex };
-  app.chartScale = { xMin, xMax, yMin, yMax, dataMinX: minDataX, dataMaxX: maxX, dataMinY: dataMin, dataMaxY: dataMax, left, top, right, bottom, xToPixel, yToPixel, rows, pointIndex, unit };
+  if (!indexKeyMatches) app.pointIndexCache = { source, length: rows.length, firstId, lastId, yOrigin, xMin, xMax, yMin, yMax, left, right, top, bottom, index: pointIndex };
+  app.chartScale = { xMin, xMax, yMin, yMax, yOrigin, dataMinX, dataMaxX, dataMinY: extentMinY, dataMaxY: extentMaxY, left, top, right, bottom, xToPixel, yOffsetToPixel, yToPixel, rows, pointIndex, unit, axisFactor: axis.factor, axisUnit: axis.unit };
+  syncYAxisSpanControl(yMin, yMax, axis);
   const visibleCount = rows.reduce((count, point) => count + (point.x >= xMin && point.x <= xMax ? 1 : 0), 0);
-  const sourceLabel = app.imported ? "历史 CSV" : "实时缓存";
+  const sourceLabel = app.imported ? `历史：${app.importedFileName || "CSV"}` : "实时数据";
   el("plotRange").textContent = `${sourceLabel} · ${visibleCount.toLocaleString("en-US")} 个有效点 · t=${timeLabel(xMin)} — ${timeLabel(xMax)}`;
   el("bufferNote").textContent = app.imported ? "历史文件只在本浏览器读取；不会上传或改写文件" : app.bufferTruncated ? "图表缓存已滚动；CSV 文件仍保存完整原始记录" : "显示缓存最多保留 5000 点；完整数据持续写入 CSV";
   drawCursor();
   updateChartAccessibilitySummary();
+}
+
+function syncYAxisSpanControl(yMin, yMax, axis) {
+  const input = el("yAxisSpan");
+  const unit = el("yAxisSpanUnit");
+  if (!input || !unit || !Number.isFinite(yMin) || !Number.isFinite(yMax) || yMax <= yMin) return;
+  if (document.activeElement === input) return;
+  app.yAxisSpanEditFactor = null;
+  unit.textContent = axis?.unit || activeMode()?.unit || "";
+  const displayedSpan = (yMax - yMin) / (axis?.factor || 1);
+  input.value = Number.isFinite(displayedSpan) && displayedSpan > 0 ? Number(displayedSpan.toPrecision(8)).toString() : "";
+}
+
+function applyYAxisSpan() {
+  const input = el("yAxisSpan");
+  const displayedSpan = Number(input?.value);
+  if (!Number.isFinite(displayedSpan) || displayedSpan <= 0) {
+    toast("纵轴跨度必须是大于 0 的有限数值", true);
+    return false;
+  }
+  const scale = app.chartScale;
+  if (!scale) {
+    toast("请先显示有效测量数据，再设置纵轴跨度", true);
+    return false;
+  }
+  const editFactor = app.yAxisSpanEditFactor;
+  const axisFactor = Number.isFinite(editFactor) && editFactor > 0 ? editFactor : (scale.axisFactor || 1);
+  const requestedSpan = displayedSpan * axisFactor;
+  if (!Number.isFinite(requestedSpan) || requestedSpan <= 0) {
+    toast("纵轴跨度超出可表示范围", true);
+    return false;
+  }
+  const currentRange = currentYAxisRange(scale);
+  const center = interpolateYAxisValue(currentRange[0], currentRange[1], 0.5);
+  const currentOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : (scale.yOrigin || 0);
+  const absoluteCenter = currentOrigin + center;
+  rebaseYAxisOrigin(absoluteCenter);
+  const rebasedCenter = absoluteCenter - app.yOrigin;
+  // Base the manual floor on the target center; distant values outside this view must not widen it.
+  const minimumSpan = minimumRepresentableYSpan(rebasedCenter);
+  const span = Math.max(requestedSpan, minimumSpan);
+  const lower = rebasedCenter - span / 2;
+  const upper = rebasedCenter + span / 2;
+  if (!Number.isFinite(lower) || !Number.isFinite(upper) || upper <= lower) {
+    toast("这个纵轴跨度小于当前读数可表示的精度", true);
+    return false;
+  }
+  app.yView = [lower, upper];
+  el("autoFollow").checked = false;
+  drawChart();
+  if (span > requestedSpan) toast("输入范围低于当前浮点精度，已调整到可表示的最小跨度");
+  return true;
 }
 
 function drawCursor() {
@@ -1708,7 +2462,8 @@ function drawCursor() {
   ctx.setLineDash([3, 4]);
   ctx.beginPath(); ctx.moveTo(x, scale.top); ctx.lineTo(x, scale.bottom); ctx.moveTo(scale.left, y); ctx.lineTo(scale.right, y); ctx.stroke();
   ctx.setLineDash([]);
-  const value = scale.yMax - (y - scale.top) / (scale.bottom - scale.top) * (scale.yMax - scale.yMin);
+  const offset = scale.yMax - (y - scale.top) / (scale.bottom - scale.top) * (scale.yMax - scale.yMin);
+  const value = (scale.yOrigin || 0) + offset;
   ctx.fillStyle = "#31464f";
   ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
   const label = scaledValue(value, scale.unit || activeMode()?.unit || "");
@@ -1884,10 +2639,20 @@ ui.canvas.addEventListener("keydown", (event) => {
     const scale = app.chartScale;
     const factor = event.key === "-" ? 1.25 : .8;
     const xRange = app.xView || [scale.xMin, scale.xMax];
-    const yRange = app.yView || [scale.yMin, scale.yMax];
-    const center = (range) => (range[0] + range[1]) / 2;
-    app.xView = [center(xRange) + (xRange[0] - center(xRange)) * factor, center(xRange) + (xRange[1] - center(xRange)) * factor];
-    app.yView = [center(yRange) + (yRange[0] - center(yRange)) * factor, center(yRange) + (yRange[1] - center(yRange)) * factor];
+    const yRange = currentYAxisRange(scale);
+    const xCenter = (range) => (range[0] + range[1]) / 2;
+    app.xView = [xCenter(xRange) + (xRange[0] - xCenter(xRange)) * factor, xCenter(xRange) + (xRange[1] - xCenter(xRange)) * factor];
+    const yCenter = interpolateYAxisValue(yRange[0], yRange[1], 0.5);
+    const currentOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : (scale.yOrigin || 0);
+    const absoluteCenter = currentOrigin + yCenter;
+    const offsetShift = rebaseYAxisOrigin(absoluteCenter);
+    const rebasedRange = [yRange[0] + offsetShift, yRange[1] + offsetShift];
+    const rebasedCenter = absoluteCenter - app.yOrigin;
+      const currentYSpan = rebasedRange[1] - rebasedRange[0];
+      app.yView = zoomYRange(
+        rebasedRange[0], rebasedRange[1], rebasedCenter, factor,
+        maximumYAxisZoomSpan(currentYSpan),
+      );
     el("autoFollow").checked = false;
     drawChart();
     return;
@@ -1917,7 +2682,7 @@ ui.canvas.addEventListener("pointermove", (event) => {
       const scale = app.chartScale;
       const factor = app.pinchState ? app.pinchState.distance / distance : 1;
       const xRange = app.xView || [scale.xMin, scale.xMax];
-      const yRange = app.yView || [scale.yMin, scale.yMax];
+      const yRange = currentYAxisRange(scale);
       const xFraction = Math.max(0, Math.min(1, (centerX - scale.left) / (scale.right - scale.left)));
       const yFraction = Math.max(0, Math.min(1, (scale.bottom - centerY) / (scale.bottom - scale.top)));
       const zoomAround = (range, fraction, minimumSpan, maximumSpan) => {
@@ -1926,7 +2691,15 @@ ui.canvas.addEventListener("pointermove", (event) => {
         return [anchor - span * fraction, anchor + span * (1 - fraction)];
       };
       app.xView = zoomAround(xRange, xFraction, .05, 1e8);
-      app.yView = zoomAround(yRange, yFraction, Math.max(Math.abs(yRange[0]) * 1e-12, 1e-15), Math.max(yRange[1] - yRange[0], 1e-15) * 1e6);
+      const yAnchor = interpolateYAxisValue(yRange[0], yRange[1], yFraction);
+      const currentOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : (scale.yOrigin || 0);
+      const absoluteAnchor = currentOrigin + yAnchor;
+      const offsetShift = rebaseYAxisOrigin(absoluteAnchor);
+      const rebasedRange = [yRange[0] + offsetShift, yRange[1] + offsetShift];
+      app.yView = zoomYRange(
+        rebasedRange[0], rebasedRange[1], absoluteAnchor - app.yOrigin, factor,
+        maximumYAxisZoomSpan(yRange[1] - yRange[0], 1e-300),
+      );
       app.pinchState = { distance };
       el("autoFollow").checked = false;
       app.cursor = null;
@@ -2018,11 +2791,15 @@ ui.canvas.addEventListener("wheel", (event) => {
   const rect = ui.canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
+  const xRange = app.xView || [scale.xMin, scale.xMax];
   const xFraction = Math.max(0, Math.min(1, (x - scale.left) / (scale.right - scale.left)));
   const yFraction = Math.max(0, Math.min(1, (scale.bottom - y) / (scale.bottom - scale.top)));
-  const xAnchor = scale.xMin + xFraction * (scale.xMax - scale.xMin);
-  const yAnchor = event.altKey ? 0 : scale.yMin + yFraction * (scale.yMax - scale.yMin);
-  const factor = Math.exp(event.deltaY / 120 * 0.18);
+  const xAnchor = xRange[0] + xFraction * (xRange[1] - xRange[0]);
+  const yRange = currentYAxisRange(scale);
+  const currentOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : (scale.yOrigin || 0);
+  const yAnchor = event.altKey ? -currentOrigin : interpolateYAxisValue(yRange[0], yRange[1], yFraction);
+  const zoomSensitivity = event.altKey ? 0.18 : 0.9;
+  const factor = Math.exp(event.deltaY / 120 * zoomSensitivity);
   const zoomX = !event.altKey && (event.ctrlKey || event.shiftKey);
   const zoomY = event.altKey || event.ctrlKey || !event.shiftKey;
   const zoomRange = (min, max, anchor, minimumSpan, maximumSpan) => {
@@ -2031,17 +2808,30 @@ ui.canvas.addEventListener("wheel", (event) => {
     return [anchor - span * relative, anchor + span * (1 - relative)];
   };
   if (zoomX) {
-    app.xView = zoomRange(scale.xMin, scale.xMax, xAnchor, .05, 1e8);
+    app.xView = zoomRange(xRange[0], xRange[1], xAnchor, .05, 1e8);
   }
   if (zoomY) {
-    const span = scale.yMax - scale.yMin;
-    const minSpan = Math.max(Math.abs(yAnchor) * 1e-12, span * 1e-9, 1e-15);
-    app.yView = zoomRange(scale.yMin, scale.yMax, yAnchor, minSpan, Math.max(span, 1e-15) * 1e6);
+    const absoluteAnchor = currentOrigin + yAnchor;
+    const offsetShift = rebaseYAxisOrigin(absoluteAnchor);
+    const rebasedRange = [yRange[0] + offsetShift, yRange[1] + offsetShift];
+    const rebasedAnchor = absoluteAnchor - app.yOrigin;
+    const span = yRange[1] - yRange[0];
+    app.yView = zoomYRange(rebasedRange[0], rebasedRange[1], rebasedAnchor, factor, maximumYAxisZoomSpan(span));
   }
   if (zoomY && !zoomX && el("autoFollow").checked) app.xView = [scale.xMin, scale.xMax];
   if (zoomX || zoomY) el("autoFollow").checked = false;
-  drawChart();
+  scheduleChartRedraw();
 }, { passive: false });
+el("applyYAxisSpan").addEventListener("click", applyYAxisSpan);
+el("yAxisSpan").addEventListener("focus", () => {
+  app.yAxisSpanEditFactor = app.chartScale?.axisFactor || 1;
+});
+el("yAxisSpan").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault?.();
+    applyYAxisSpan();
+  }
+});
 el("autoFollow").addEventListener("change", () => { if (el("autoFollow").checked) app.xView = null; drawChart(); });
 el("autoScale").addEventListener("click", () => {
   app.xView = null;
@@ -2065,26 +2855,67 @@ async function loadHistory(file) {
   if (!file) return false;
   if (app.cancelEventImport) app.cancelEventImport();
   if (app.cancelHistoryImport) app.cancelHistoryImport();
-  if (file.size > 50 * 1024 * 1024) { toast("历史 CSV 超过 50 MB，请先按实验区间拆分文件", true); el("historyFile").value = ""; return false; }
   const worker = new Worker("/history_worker.js");
+  const jobId = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `history-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const job = { id: jobId, worker, cancelRequested: false, finished: false, reject: null, cancelFallback: 0 };
   app.historyImportWorker = worker;
+  app.historyImportJob = job;
+  app.cancelHistoryImport = () => cancelHistoryImport(job);
+  const hideHistoryImportStatus = () => {
+    if (app.historyImportJob !== job) return;
+    el("historyImportProgress").textContent = "";
+    el("historyImportProgress").classList.add("hidden");
+    el("cancelHistoryImport").classList.add("hidden");
+    el("cancelHistoryImport").disabled = false;
+  };
+  el("historyImportProgress").textContent = `准备后台读取 ${file.name || "历史 CSV"} · ${formatHistoryBytes(file.size)}`;
+  el("historyImportProgress").classList.remove("hidden");
+  el("cancelHistoryImport").classList.remove("hidden");
+  el("cancelHistoryImport").disabled = false;
   toast("正在后台解析历史 CSV…");
   try {
     const result = await new Promise((resolve, reject) => {
-      app.cancelHistoryImport = () => reject(Object.assign(new Error("已由更新的历史 CSV 导入替代"), { name: "AbortError" }));
-      worker.onmessage = ({ data }) => data?.ok ? resolve(data) : reject(new Error(data?.error || "历史 CSV 解析失败"));
-      worker.onerror = () => reject(new Error("历史 CSV 后台解析失败；请检查文件编码和格式后重试"));
-      worker.postMessage({ file, modes: [...app.modes.values()].map(({ value, unit }) => ({ value, unit })) });
+      job.reject = reject;
+      worker.onmessage = ({ data }) => {
+        if (data?.jobId !== undefined && String(data.jobId) !== job.id) return;
+        if (data?.type === "progress") {
+          if (!job.cancelRequested) updateHistoryImportProgress(job, data);
+          return;
+        }
+        if (job.cancelRequested || data?.cancelled) {
+          const error = new Error(data?.error || "历史 CSV 导入已取消");
+          error.name = "AbortError";
+          reject(error);
+        } else if (data?.ok === true) {
+          resolve(data);
+        } else {
+          reject(new Error(data?.error || "历史 CSV 解析失败"));
+        }
+      };
+      worker.onerror = () => {
+        const error = new Error("历史 CSV 后台解析失败；请检查文件编码和格式后重试");
+        if (job.cancelRequested) error.name = "AbortError";
+        reject(error);
+      };
+      const pixelWidth = Math.max(1, Math.floor(ui.canvas?.getBoundingClientRect?.().width || 1200));
+      worker.postMessage({
+        file, modes: [...app.modes.values()].map(({ value, unit }) => ({ value, unit })),
+        pixelWidth, reportProgress: true, jobId,
+      });
     });
-    const { rows, modeValue, unit, experimentId } = result;
+    const { rows, modeValue, unit, experimentId, stats } = result;
     const mode = app.modes.get(modeValue);
     app.imported = rows;
+    app.importedStats = stats || null;
     app.importedExperimentId = experimentId || null;
     app.importedFileName = file.name || "历史 CSV";
     app.importedEvents = null;
     app.selectedEventIndex = null;
     app.xView = null;
     app.yView = null;
+    app.yOrigin = null;
     el("autoFollow").checked = false;
     el("restoreLive").classList.remove("hidden");
     el("chartTitle").textContent = `${file.name} · 历史曲线`;
@@ -2092,18 +2923,84 @@ async function loadHistory(file) {
     el("readingMode").textContent = mode?.label || `历史数据 ${modeValue}`;
     renderEvents([]);
     updateAccessiblePointTable();
-    toast(`已在浏览器加载 ${rows.length.toLocaleString("en-US")} 行；原文件未修改`);
+    const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+    const warningText = warnings.length ? `；警告：${warnings.join("；")}` : "；原文件未修改";
+    toast(`已在浏览器加载 ${rows.length.toLocaleString("en-US")} 行${warningText}`, false, warnings.length > 0);
     updateStats(); drawChart();
     return true;
-  } catch (error) { if (error.name !== "AbortError") toast(`CSV 加载失败：${error.message}`, true); return false; }
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      const message = String(error?.message || "历史 CSV 解析失败");
+      const mixedMeasurement = /CSV 混合了不同(?:测量模式|单位)/.test(message);
+      if (mixedMeasurement) {
+        toast(`警告：${message}。未加载该文件；当前图表保持不变。`, false, true);
+      } else {
+        toast(`CSV 加载失败：${message}`, true);
+      }
+    }
+    return false;
+  }
   finally {
+    job.finished = true;
+    clearTimeout(job.cancelFallback);
     worker.terminate();
     if (app.historyImportWorker === worker) {
+      hideHistoryImportStatus();
       app.historyImportWorker = null;
       app.cancelHistoryImport = null;
+      app.historyImportJob = null;
       el("historyFile").value = "";
     }
   }
+}
+
+function formatHistoryBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "大小未知";
+  if (bytes < 1024 ** 2) return `${Math.round(bytes / 1024).toLocaleString("en-US")} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+function updateHistoryImportProgress(job, progress) {
+  if (app.historyImportJob !== job || job.finished) return;
+  const phase = progress.phase === "validate" ? "校验 CSV" : progress.phase === "sample" ? "抽稀全程曲线" : "读取 CSV";
+  const ratio = Number(progress.progress);
+  const percent = Number.isFinite(ratio) ? Math.max(0, Math.min(100, Math.floor(ratio * 100))) : null;
+  const bytesRead = Number(progress.bytesRead);
+  const totalBytes = Number(progress.totalBytes);
+  const byteText = Number.isFinite(bytesRead) && Number.isFinite(totalBytes)
+    ? `${formatHistoryBytes(bytesRead)} / ${formatHistoryBytes(totalBytes)}` : "";
+  const rowsRead = Number(progress.rowsRead);
+  const rowText = Number.isFinite(rowsRead) ? ` · ${rowsRead.toLocaleString("en-US")} 行` : "";
+  const percentText = percent === null ? "" : ` · ${percent}%`;
+  el("historyImportProgress").textContent = [phase, byteText].filter(Boolean).join(" · ") + percentText + rowText;
+  el("historyImportProgress").classList.remove("hidden");
+}
+
+function cancelHistoryImport(job = app.historyImportJob) {
+  if (!job || job.finished || job.cancelRequested) return false;
+  job.cancelRequested = true;
+  el("historyImportProgress").textContent = "正在取消历史 CSV 导入…";
+  el("historyImportProgress").classList.remove("hidden");
+  el("cancelHistoryImport").disabled = true;
+  try {
+    job.worker.postMessage({ type: "cancel", jobId: job.id });
+  } catch (_error) {
+    job.worker.terminate();
+    const error = new Error("历史 CSV 导入已取消");
+    error.name = "AbortError";
+    job.reject?.(error);
+    return true;
+  }
+  job.cancelFallback = setTimeout(() => {
+    if (job.finished || !job.cancelRequested) return;
+    job.worker.terminate();
+    const error = new Error("历史 CSV 导入已取消");
+    error.name = "AbortError";
+    job.reject?.(error);
+  }, 5000);
+  return true;
 }
 
 function historyDirectoryOf(file) {
@@ -2157,7 +3054,9 @@ async function loadHistoryEvents(file) {
     app.selectedEventIndex = null;
     renderEvents(events);
     drawChart();
-    toast(`已加载 ${events.length.toLocaleString("en-US")} 条配套事件；实验标识一致`);
+    const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+    const warningText = warnings.length ? `；警告：${warnings.join("；")}` : "";
+    toast(`已加载 ${events.length.toLocaleString("en-US")} 条配套事件；实验标识一致${warningText}`, false, warnings.length > 0);
   } catch (error) {
     if (error.name !== "AbortError") toast(`事件 CSV 加载失败：${error.message}`, true);
   } finally {
@@ -2331,6 +3230,27 @@ async function downloadLatestMeasurementsSafeCsv() {
   }
 }
 
+function downloadLatestSharePackage() {
+  const state = app.state || {};
+  if (state.experiment_dir) {
+    toast("请先停止采集并结束实验，再导出脱敏分享包。", true);
+    return;
+  }
+  if (!state.last_experiment_dir) {
+    toast("当前没有可导出的已完成实验。", true);
+    return;
+  }
+  // Let the browser stream the ZIP download; do not buffer a potentially large
+  // experiment archive in the page's JavaScript heap. Error JSON opens clearly
+  // in the new tab while the measurement page remains available.
+  const link = document.createElement("a");
+  link.href = "/api/latest-share-bundle.zip";
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.click();
+  toast("正在生成脱敏分享包；实验原始文件保持不变。失败原因会在新标签页显示。");
+}
+
 async function copyExperimentPath() {
   const directory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
   if (!directory) { toast("实验目录将在开始采集后创建", true); return; }
@@ -2365,7 +3285,32 @@ async function refreshExperimentFiles() {
     : "当前还没有实验文件；开始或完成一次实验后可在这里查看。";
 }
 
+function handleApplicationShortcut(event) {
+  if (!event || event.defaultPrevented || event.repeat || event.isComposing) return;
+  if (event.getModifierState?.("AltGraph")) return;
+  const target = event.target;
+  const tagName = String(target?.tagName || "").toUpperCase();
+  if (target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(tagName)) return;
+  if (!event.ctrlKey || !event.altKey || event.shiftKey || event.metaKey) return;
+
+  const key = String(event.key || "").toLowerCase();
+  let actionId = null;
+  if (key === "r") actionId = "start";
+  else if (key === "p") actionId = el("resume").classList.contains("hidden") ? "pause" : "resume";
+  else if (key === "s") actionId = "stop";
+  else if (key === "," || key === "comma") actionId = "openSettings";
+  else if (key === "enter") actionId = "markEvent";
+  if (!actionId) return;
+  const button = el(actionId);
+  if (!button || button.disabled || typeof button.click !== "function") return;
+  event.preventDefault?.();
+  button.click();
+}
+
 function bindControls() {
+  document.addEventListener("keydown", handleApplicationShortcut);
+  el("acknowledgeUncertainCommand").addEventListener("click", acknowledgeUncertainCommands);
+  el("duplicateOverwrite").addEventListener("click", () => finishDuplicateNameAction("overwrite"));
   el("duplicateCreateCopy").addEventListener("click", () => finishDuplicateNameAction("create-copy"));
   el("duplicateRename").addEventListener("click", () => finishDuplicateNameAction("rename"));
   el("duplicateCancel").addEventListener("click", () => finishDuplicateNameAction("cancel"));
@@ -2430,6 +3375,7 @@ function bindControls() {
     setBaselineInputFromSI(app.baseline);
     updateBaseline(validPoints().at(-1)?.y, spec.unit);
     app.yView = null;
+    app.yOrigin = null;
     drawChart();
     renderSettingsComparison(app.state);
   });
@@ -2438,12 +3384,45 @@ function bindControls() {
   el("zero").addEventListener("click", async () => {
     const active = app.state?.active_settings || {};
     const mode = app.modes.get(active.mode || app.selectedMode);
-    const range = active.autorange ? "自动量程（当前实际量程由仪器动态决定）" : active.range_si !== null && active.range_si !== undefined && Number.isFinite(Number(active.range_si)) ? rangeLabel(active.range_si, mode?.unit) : "量程未回读";
+    const range = active.autorange
+      ? Number.isFinite(Number(active.range_readback_si))
+        ? app.state?.simulation
+          ? `自动量程；MOCK模拟档位 ${rangeLabel(Number(active.range_readback_si), mode?.unit)}（模拟快照）`
+          : `自动量程；当前实际量程回读 ${rangeLabel(Number(active.range_readback_si), mode?.unit)}（当前快照，可能随输入变化）`
+        : "自动量程（当前量程回读不可用）"
+      : active.range_si !== null && active.range_si !== undefined && Number.isFinite(Number(active.range_si))
+        ? rangeLabel(active.range_si, mode?.unit) : "量程未回读";
     const timing = active.nplc !== null && active.nplc !== undefined ? `${active.nplc} NPLC` : active.ac_bandwidth_hz ? `${active.ac_bandwidth_hz} Hz 交流带宽` : "无适用积分/带宽设置";
-    const filter = active.analog_filter ? "模拟滤波：开" : "模拟滤波：关";
+    const filter = !mode
+      ? "模拟滤波：未回读"
+      : mode.analog_filter
+        ? active.analog_filter ? "模拟滤波：开" : "模拟滤波：关"
+        : "模拟滤波：不适用";
     const autozero = active.autozero ? "自动零点：开" : "自动零点：关";
     if (!window.confirm(`ZERO:AUTO ONCE 将启动一次仪器内部零点测量，不会将被测读数置零，也不是校准调整。\n\n当前回读：${mode?.label || "模式未回读"} · ${range} · ${timing} · ${filter} · ${autozero}\n\n请核对输入和触发条件；软件发出命令后检查错误队列并回读配置。本软件没有零点值查询项，配置回读不能证明已取得 ZERO 测量结果。继续？`)) return;
-    await command("zero", { zero_confirmed: true });
+    app.zeroPending = true;
+    if (app.state) updateStateDisplay(app.state);
+    let result;
+    try {
+      result = await command("zero", { zero_confirmed: true });
+    } catch (error) {
+      result = { success: false, uncertain: true, message: `ZERO结果未确认：${error.message}` };
+    } finally {
+      app.zeroPending = false;
+    }
+    const resultMessage = String(result?.message || result?.error || "未收到 ZERO 命令反馈");
+    const feedback = result?.zero_result || (result?.uncertain
+      ? `ZERO结果未确认：${resultMessage}`
+      : result?.blocked || result?.cancelled
+        ? `ZERO未发送：${resultMessage}`
+        : result?.success ? resultMessage : `ZERO操作失败：${resultMessage}`);
+    if (app.state) {
+      app.state = { ...app.state, zero_result: feedback };
+      updateStateDisplay(app.state);
+    } else {
+      el("zeroResult").textContent = feedback;
+      el("zeroResult").classList.toggle("hidden", !feedback);
+    }
   });
   el("start").addEventListener("click", startContinuous);
   el("single").addEventListener("click", startSingle);
@@ -2464,8 +3443,10 @@ function bindControls() {
   el("downloadCsv").addEventListener("click", downloadLatestCsv);
   el("downloadEventsSafe").addEventListener("click", downloadLatestEventsSafeCsv);
   el("downloadMeasurementsSafe").addEventListener("click", downloadLatestMeasurementsSafeCsv);
+  el("downloadSharePackage").addEventListener("click", downloadLatestSharePackage);
   el("savePlot").addEventListener("click", savePlot);
   el("historyFile").addEventListener("change", (event) => loadHistory(event.target.files[0]));
+  el("cancelHistoryImport").addEventListener("click", () => cancelHistoryImport());
   el("historyDirectory").addEventListener("change", async (event) => {
     try { await loadHistoryDirectory(event.target.files); }
     finally { event.target.value = ""; }
@@ -2482,7 +3463,7 @@ function bindControls() {
   el("openExperimentDir").addEventListener("click", () => command("open_experiment_directory"));
   el("copyExperimentPath").addEventListener("click", copyExperimentPath);
   el("restoreLive").addEventListener("click", () => {
-    app.imported = null; app.xView = null; app.yView = null;
+    app.imported = null; app.importedStats = null; app.xView = null; app.yView = null; app.yOrigin = null;
     app.importedEvents = null; app.importedExperimentId = null; app.importedFileName = ""; app.selectedEventIndex = null;
     el("autoFollow").checked = true;
     el("restoreLive").classList.add("hidden");
@@ -2556,7 +3537,9 @@ function clearPreferences() {
 }
 
 async function initialize() {
+  window.addEventListener("storage", handleCommandRecoveryStorage);
   bindControls();
+  void restoreUnresolvedCommands();
   try {
     const response = await fetch("/api/meta", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);

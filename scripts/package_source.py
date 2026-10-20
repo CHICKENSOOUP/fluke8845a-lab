@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.archive_paths import ensure_path_within, ensure_regular_file_within
+from scripts.atomic_archive import atomic_archive_path
 from scripts.build_provenance import (
     BUILD_PROVENANCE_NAME,
     SOURCE_ARCHIVE_SUFFIX,
@@ -56,6 +57,8 @@ REQUIRED_ARCHIVE_PATHS = (
     "run_windows.bat",
     "run_web.bat",
     "scripts/launch_windows.py",
+    "scripts/atomic_archive.py",
+    "scripts/run_web_tests.py",
     "src/fluke8845a/gui.py",
     "src/fluke8845a/history_import.py",
     "src/fluke8845a/webapp.py",
@@ -65,12 +68,14 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/qt-licensing-and-third-party-notices.md",
     "docs/licenses/LGPL-3.0.txt",
     "docs/licenses/windows-portable-review-2026-10-15.md",
+    "docs/licenses/windows-portable-review-2026-10-20.md",
     "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
     "docs/licenses/windows-source-offer.md",
     "docs/licenses/third-party/README.md",
     "docs/licenses/third-party/Apache-2.0.txt",
     "docs/licenses/third-party/pyserial-3.5-LICENSE.txt",
     "docs/hardware-validation.md",
+    "docs/release-notes-v1.1.0.md",
     "docs/release-notes-v1.0.7.md",
     "docs/release-notes-v1.0.6.md",
     "docs/release-notes-v1.0.5.md",
@@ -99,6 +104,17 @@ EXCLUDED_PATH_PARTS = {
     "output",
     "Fluke8845A_Agent_Reference_Pack",
 }
+NUMERIC_INSTRUMENT_SERIAL_PATTERNS = (
+    re.compile(r"FLUKE\s*,\s*8845A\s*,\s*\d{6,}\s*,", re.IGNORECASE),
+    re.compile(
+        r"(?:[\"']?serial_number[\"']?\s*[:=]\s*[\"'](?:SN-)?|SN-)\d{6,}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"[\"']\d{6,}[\"']\s*:\s*\{\s*[\"'](?:outguard_sw|inguard_sw)[\"']\s*:",
+        re.IGNORECASE,
+    ),
+)
 
 
 def validate_packaged_web_resources(html: str, javascript: str) -> None:
@@ -123,10 +139,24 @@ def validate_packaged_web_resources(html: str, javascript: str) -> None:
         raise ValueError("页面脚本未将采样间隔显示在对应位置，请从当前 Web 源码重新构建")
 
 
+def validate_synthetic_test_serials(files: list[Path], root: Path) -> None:
+    """Prevent numeric-looking hardware serials from shipping in test fixtures."""
+    for path in files:
+        relative = path.relative_to(root)
+        if not relative.parts or relative.parts[0] != "tests":
+            continue
+        content = path.read_text(encoding="utf-8", errors="replace")
+        if any(pattern.search(content) for pattern in NUMERIC_INSTRUMENT_SERIAL_PATTERNS):
+            raise ValueError(
+                "Source package test fixture contains a numeric instrument serial; "
+                f"use a synthetic instrument serial marker: {relative.as_posix()}"
+            )
+
+
 def validate_web_archive_resources(archive: ZipFile, member_prefix: str, source_web_dir: Path) -> None:
-    """Require release ZIP assets to match current HTML, JavaScript, and CSS sources."""
+    """Require release ZIP assets to match all current static Web sources."""
     source_web_dir = Path(source_web_dir)
-    assets = ("index.html", "app.js", "app.css")
+    assets = ("index.html", "app.js", "app.css", "history_worker.js")
     for asset in assets:
         member = f"{member_prefix.rstrip('/')}/{asset}"
         try:
@@ -167,7 +197,9 @@ def files_for_archive(root: Path = ROOT) -> list[Path]:
             if path.suffix in {".pyc", ".pyo", ".pdf", ".zip"}:
                 continue
             files.add(ensure_regular_file_within(path, root))
-    return sorted(files, key=lambda path: path.relative_to(root).as_posix().casefold())
+    ordered_files = sorted(files, key=lambda path: path.relative_to(root).as_posix().casefold())
+    validate_synthetic_test_serials(ordered_files, root)
+    return ordered_files
 
 
 def create_archive(destination: Path, *, provenance_path: Path) -> int:
@@ -186,39 +218,40 @@ def create_archive(destination: Path, *, provenance_path: Path) -> int:
         source_members,
         expected_candidate_build_name=candidate_name,
     )
-    with ZipFile(destination, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
-        for path in files:
-            archive.write(path, path.relative_to(ROOT).as_posix())
-        archive.writestr(BUILD_PROVENANCE_NAME, provenance_bytes)
+    with atomic_archive_path(destination) as candidate_archive:
+        with ZipFile(candidate_archive, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
+            for path in files:
+                archive.write(path, path.relative_to(ROOT).as_posix())
+            archive.writestr(BUILD_PROVENANCE_NAME, provenance_bytes)
 
-    with ZipFile(destination) as archive:
-        damaged = archive.testzip()
-        if damaged:
-            raise RuntimeError(f"Source archive CRC validation failed at {damaged}")
-        names = set(archive.namelist())
-        missing = [name for name in REQUIRED_ARCHIVE_PATHS if name not in names]
-        if BUILD_PROVENANCE_NAME not in names:
-            missing.append(BUILD_PROVENANCE_NAME)
-        if missing:
-            raise RuntimeError(f"Source archive is missing required files: {', '.join(missing)}")
-        packaged_provenance = json.loads(archive.read(BUILD_PROVENANCE_NAME).decode("utf-8"))
-        validate_web_archive_resources(archive, "src/fluke8845a/web", ROOT / "src" / "fluke8845a" / "web")
-        packaged_sources = {
-            name: archive.read(name)
-            for name in names
-            if name != BUILD_PROVENANCE_NAME
-        }
-        validate_source_archive_provenance(
-            packaged_provenance,
-            packaged_sources,
-            expected_candidate_build_name=candidate_name,
-        )
-        unsafe = [
-            name for name in names
-            if any(part in EXCLUDED_PATH_PARTS for part in Path(name).parts)
-        ]
-        if unsafe:
-            raise RuntimeError(f"Source archive contains excluded paths: {', '.join(sorted(unsafe))}")
+        with ZipFile(candidate_archive) as archive:
+            damaged = archive.testzip()
+            if damaged:
+                raise RuntimeError(f"Source archive CRC validation failed at {damaged}")
+            names = set(archive.namelist())
+            missing = [name for name in REQUIRED_ARCHIVE_PATHS if name not in names]
+            if BUILD_PROVENANCE_NAME not in names:
+                missing.append(BUILD_PROVENANCE_NAME)
+            if missing:
+                raise RuntimeError(f"Source archive is missing required files: {', '.join(missing)}")
+            packaged_provenance = json.loads(archive.read(BUILD_PROVENANCE_NAME).decode("utf-8"))
+            validate_web_archive_resources(archive, "src/fluke8845a/web", ROOT / "src" / "fluke8845a" / "web")
+            packaged_sources = {
+                name: archive.read(name)
+                for name in names
+                if name != BUILD_PROVENANCE_NAME
+            }
+            validate_source_archive_provenance(
+                packaged_provenance,
+                packaged_sources,
+                expected_candidate_build_name=candidate_name,
+            )
+            unsafe = [
+                name for name in names
+                if any(part in EXCLUDED_PATH_PARTS for part in Path(name).parts)
+            ]
+            if unsafe:
+                raise RuntimeError(f"Source archive contains excluded paths: {', '.join(sorted(unsafe))}")
     return len(files) + 1
 
 

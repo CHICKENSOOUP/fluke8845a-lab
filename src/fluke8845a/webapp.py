@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import mimetypes
+import re
 import signal
 import sys
 import tempfile
@@ -18,8 +20,9 @@ from urllib.parse import parse_qs, quote, urlsplit
 from PySide6.QtCore import QCoreApplication, QStandardPaths
 
 from . import __version__
+from .filter_policy import DIGITAL_FILTER_DISABLED_REASON
 from .modes import DESCRIPTORS
-from .scpi import DIGITAL_FILTER_DISABLED_REASON
+from .share_export import export_share_package
 from .storage import (
     complete_csv_prefix_size,
     write_excel_safe_events_csv,
@@ -61,7 +64,19 @@ class LocalWebHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args) -> None:
         # Keep the terminal useful during experiments without logging query/body contents.
-        print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {self.client_address[0]} {format % args}", file=sys.stderr)
+        stream = getattr(sys, "stderr", None)
+        if stream is None:
+            return
+        try:
+            print(
+                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                f"{self.client_address[0]} {format % args}",
+                file=stream,
+            )
+        except (OSError, ValueError):
+            # Frozen GUI executables can have missing or closed console streams.
+            # Request logging must not prevent an HTTP response from being sent.
+            return
 
     def _expected_host(self) -> str:
         port = self.server.server_port
@@ -69,42 +84,55 @@ class LocalWebHandler(BaseHTTPRequestHandler):
 
     def _check_local_request(self, *, require_origin: bool = False) -> bool:
         if self.client_address[0] != "127.0.0.1":
-            self._send_json(403, {"error": "仅允许本机浏览器访问"})
+            self._send_json(403, {"error": "仅允许本机浏览器访问"}, close=True)
             return False
         if self.headers.get("Host", "") != self._expected_host():
-            self._send_json(403, {"error": "无效的本地 Host 请求"})
+            self._send_json(403, {"error": "无效的本地 Host 请求"}, close=True)
             return False
         if require_origin:
             expected = f"http://{self._expected_host()}"
             if self.headers.get("Origin", "") != expected:
-                self._send_json(403, {"error": "命令请求必须来自本地界面"})
+                self._send_json(403, {"error": "命令请求必须来自本地界面"}, close=True)
                 return False
             fetch_site = self.headers.get("Sec-Fetch-Site")
             if fetch_site and fetch_site != "same-origin":
-                self._send_json(403, {"error": "已拒绝跨站命令"})
+                self._send_json(403, {"error": "已拒绝跨站命令"}, close=True)
                 return False
         return True
 
-    def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+    def _send_bytes(self, status: int, body: bytes, content_type: str, *, close: bool = False) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.send_header("Connection", "close")
+            self.close_connection = True
         for key, value in _SECURITY_HEADERS.items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, status: int, value: dict) -> None:
+    def _send_json(self, status: int, value: dict, *, close: bool = False) -> None:
         body = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        self._send_bytes(status, body, "application/json; charset=utf-8")
+        self._send_bytes(status, body, "application/json; charset=utf-8", close=close)
 
     def _not_found(self) -> None:
         self._send_json(404, {"error": "未找到该页面"})
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        parsed = urlsplit(self.path)
         if not self._check_local_request():
             return
-        parsed = urlsplit(self.path)
+        if parsed.path == "/api/command-status":
+            expected_origin = f"http://{self._expected_host()}"
+            origin = self.headers.get("Origin", "")
+            fetch_site = self.headers.get("Sec-Fetch-Site", "")
+            if (origin and origin != expected_origin) or (fetch_site and fetch_site != "same-origin"):
+                self._send_json(403, {"error": "命令状态查询必须来自本地界面"})
+                return
+            if not origin and fetch_site != "same-origin":
+                self._send_json(403, {"error": "命令状态查询缺少同源浏览器标记"})
+                return
         if parsed.path == "/api/health":
             self._send_json(200, {"status": "ok", "version": __version__, "bind": "127.0.0.1"})
             return
@@ -125,6 +153,7 @@ class LocalWebHandler(BaseHTTPRequestHandler):
                     "digital_filter": spec.digital_filter,
                     "input_impedance_auto": spec.input_impedance_auto,
                     "safety": spec.safety,
+                    "safety_limits": spec.safety_limits,
                 })
             documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
             if not documents:
@@ -157,6 +186,47 @@ class LocalWebHandler(BaseHTTPRequestHandler):
                 since_sample=since_sample, since_log=since_log, generation=generation,
             ))
             return
+        if parsed.path == "/api/command-status":
+            operation_id = parse_qs(parsed.query).get("id", [""])[0]
+            if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+                self._send_json(400, {"error": "命令状态编号无效"})
+                return
+            status = self.server.runtime.broker.operation_status(operation_id)
+            if status is None:
+                self._send_json(404, {"error": "该命令状态已过期或不存在；请先核对仪器状态"})
+                return
+            self._send_json(200, status)
+            return
+        if parsed.path == "/api/chart/overview":
+            query = parse_qs(parsed.query)
+            status, payload = self.server.runtime.chart_history.overview(query.get("width", [1200])[0])
+            self._send_json(status, payload)
+            return
+        if parsed.path == "/api/chart/range/cancel":
+            query = parse_qs(parsed.query)
+            status, payload = self.server.runtime.chart_history.cancel_range(query.get("request_id", [""])[0])
+            self._send_json(status, payload)
+            return
+        if parsed.path == "/api/chart/range":
+            query = parse_qs(parsed.query)
+            request_id = query.get("request_id", [""])[0]
+            if all(key in query for key in ("job_id", "start", "end", "width")):
+                try:
+                    start_s = float(query["start"][0])
+                    end_s = float(query["end"][0])
+                    width = int(query["width"][0])
+                    if not math.isfinite(start_s) or not math.isfinite(end_s):
+                        raise ValueError
+                except (TypeError, ValueError, OverflowError):
+                    self._send_json(400, {"error": "图表范围参数必须是有限数值和整数宽度"})
+                    return
+                status, payload = self.server.runtime.chart_history.start_range(
+                    query["job_id"][0], request_id, start_s, end_s, width,
+                )
+            else:
+                status, payload = self.server.runtime.chart_history.range_status(request_id)
+            self._send_json(status, payload)
+            return
         if parsed.path == "/api/latest.csv":
             self._send_latest_csv()
             return
@@ -165,6 +235,9 @@ class LocalWebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/latest-measurements-safe.csv":
             self._send_latest_measurements_safe_csv()
+            return
+        if parsed.path == "/api/latest-share-bundle.zip":
+            self._send_latest_share_bundle()
             return
         if parsed.path.startswith("/api/"):
             self._not_found()
@@ -296,6 +369,45 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError) as exc:
             self._send_json(400, {"error": f"无法生成测量安全副本：{exc}"})
 
+    def _send_latest_share_bundle(self) -> None:
+        state = self.server.runtime.store.snapshot()
+        if state.get("experiment_dir"):
+            self._send_json(409, {"error": "请停止采集并结束实验后，再导出脱敏分享包。原始实验文件不会更改。"})
+            return
+        directory = state.get("last_experiment_dir", "")
+        if not directory:
+            self._send_json(404, {"error": "当前没有可导出的已完成实验。"})
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="fluke8845a-share-") as temporary_directory:
+                archive_path = Path(temporary_directory) / "Fluke8845A_脱敏分享包.zip"
+                export_share_package(directory, archive_path)
+                size = archive_path.stat().st_size
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header(
+                    "Content-Disposition",
+                    "attachment; filename=Fluke8845A_share_bundle.zip; "
+                    f"filename*=UTF-8''{quote('Fluke8845A_脱敏分享包.zip', safe='')}",
+                )
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                try:
+                    with archive_path.open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            self.wfile.write(chunk)
+                except OSError:
+                    # Once headers are sent, dropping the connection is safer than inventing data.
+                    self.close_connection = True
+        except Exception:
+            # Helper errors can contain source paths. Keep them out of the HTTP response.
+            self._send_json(
+                400,
+                {"error": "无法生成脱敏分享包。请确认已完成实验包含有效的 config.json 和 measurements.csv；events.csv 可选。"},
+            )
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if not self._check_local_request(require_origin=True):
             return
@@ -323,7 +435,8 @@ class LocalWebHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "命令参数必须是对象"})
             return
         result = self.server.runtime.broker.request(request["action"], payload)
-        self._send_json(200 if result.get("success") else 400, result)
+        response_status = 202 if result.get("pending") else (200 if result.get("success") else 400)
+        self._send_json(response_status, result)
 
     def do_HEAD(self) -> None:  # noqa: N802
         self._send_json(405, {"error": "不支持 HEAD 请求"})

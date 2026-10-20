@@ -32,6 +32,7 @@ class ModeDescriptor:
     rms: bool = False
     wiring_group: str = "voltage"
     safety: str = ""
+    safety_limits: str = ""
 
     @property
     def sense_prefix(self) -> str:
@@ -59,36 +60,76 @@ DESCRIPTORS: Final[dict[Mode, ModeDescriptor]] = {
         (0.1, 1, 10, 100, 750), ac_bandwidths_hz=AC_BANDWIDTHS_HZ,
         rms=True, wiring_group="voltage",
         safety="交流电压读数为仪器真 RMS 值。接电压 HI/LO 端子并联测量；8845A 上限 750 V RMS。",
+        safety_limits=(
+            "AC 输入上限：750 V RMS、1000 V peak 或 8×10^7 V·Hz，以先达到的限制为准（任一量程）。"
+            "交流输入频率范围（按带宽档）：慢档 3 Hz–300 kHz、中档 20 Hz–300 kHz、快档 200 Hz–300 kHz。"
+            "来源：06_Extended_Specifications.pdf，PDF p.4 / printed p.3。"
+        ),
     ),
     Mode.DCI: ModeDescriptor(
         Mode.DCI, "直流电流 DCI", "CURR:DC", "current", "A",
         (100e-6, 1e-3, 10e-3, 100e-3, 400e-3, 1, 3, 10), NPLC_VALUES,
         analog_filter=True, digital_filter=True, wiring_group="current",
         safety="电流测量必须串联：先关闭被测回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。",
+        safety_limits=(
+            "8845A 量程：100 µA–10 A；400 mA 固定档要求 OutG SW ≥ 2.0。"
+            "mA/400 mA 输入：400 mA 连续；550 mA 最多通电 2 分钟、随后断开 1 分钟。"
+            "该输入使用 440 mA/1000 V 保险丝；10 A 输入使用 11 A/1000 V 保险丝。"
+        ),
     ),
     Mode.ACI: ModeDescriptor(
         Mode.ACI, "交流电流 ACI · 真 RMS", "CURR:AC", "current", "A",
         (10e-3, 100e-3, 400e-3, 1, 3, 10), ac_bandwidths_hz=AC_BANDWIDTHS_HZ,
         rms=True, wiring_group="current",
         safety="交流电流读数为仪器真 RMS 值。必须串联测量：关闭回路电源并核实保险丝和预期电流；严禁将电流输入并联到电压源。",
+        safety_limits=(
+            "8845A 量程：10 mA–10 A；400 mA 固定档要求软件版本 ≥ 1.0.700.18（官方资料未说明对应哪个软件字段），"
+            "且 400 mA 时峰值因数不得超过 3:1。"
+            "mA/400 mA 输入：400 mA 连续；550 mA 最多通电 2 分钟、随后断开 1 分钟。"
+            "该输入使用 440 mA/1000 V 保险丝；10 A 输入使用 11 A/1000 V 保险丝。"
+            "交流输入频率范围（按带宽档）：慢档 3 Hz–10 kHz、中档 20 Hz–10 kHz、快档 200 Hz–10 kHz。"
+            "来源：06_Extended_Specifications.pdf，PDF p.8 / printed p.7。"
+        ),
     ),
     Mode.RES2: ModeDescriptor(
         Mode.RES2, "两线电阻 2W", "RES", "resistance", "Ohm",
         (100, 1e3, 10e3, 100e3, 1e6, 10e6, 100e6), NPLC_VALUES,
         analog_filter=True, digital_filter=True, wiring_group="resistance-2w",
         safety="电阻测量前必须使被测电路断电并确认无外加电压；两线法使用相应 HI/LO 端子。引线电阻会进入读数，可在适当条件下执行仪器 ZERO。",
+        safety_limits="8845A 两线电阻量程：100 Ω–100 MΩ。",
     ),
     Mode.RES4: ModeDescriptor(
         Mode.RES4, "四线电阻 4W", "FRES", "resistance", "Ohm",
         (100, 1e3, 10e3, 100e3, 1e6, 10e6, 100e6), NPLC_VALUES,
         analog_filter=True, digital_filter=True, wiring_group="resistance-4w",
         safety="电阻测量前必须使被测电路断电并确认无外加电压；四线法将 FORCE 端接电流线、SENSE 端接被测电阻两端。",
+        safety_limits="8845A 四线电阻量程：100 Ω–100 MΩ。",
     ),
 }
 
 
 def descriptor(mode: Mode | str) -> ModeDescriptor:
     return DESCRIPTORS[Mode(mode)]
+
+
+def mode_transition_requires_wiring_confirmation(
+    previous_mode: Mode | str | None, target_mode: Mode | str,
+) -> bool:
+    """Return whether changing measurement mode can require changed wiring.
+
+    Unknown starting modes require confirmation. Transitions involving current
+    measurement, or between different terminal/wiring groups, require an
+    operator check before the application configures the meter.
+    """
+    target = descriptor(target_mode)
+    if previous_mode is None:
+        return True
+    previous = descriptor(previous_mode)
+    return (
+        previous.wiring_group != target.wiring_group
+        or previous.wiring_group == "current"
+        or target.wiring_group == "current"
+    )
 
 
 def mode_from_scpi_function(response: str) -> Mode | None:

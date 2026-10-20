@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
@@ -223,17 +224,33 @@ def collect_runtime_license_materials(
     manifest = {
         "format_version": 1,
         "python_runtime_version": python_version,
-        "review_status": "partial; see docs/licenses/windows-portable-review-2026-10-15.md",
+        "review_status": "partial; see docs/licenses/windows-portable-review-2026-10-20.md",
         "components": components,
         "license_files": sorted(records, key=lambda row: row["path"]),
         "native_binary_scope": "All .dll, .pyd, and .exe files present in the frozen application directory at collection time; family labels are inventory hints, not license conclusions.",
         "native_binaries": native_binaries,
         "known_open_items": [
             "Qt/PySide module and third-party notices require final exact-bundle review.",
-            "Microsoft Visual C++ redistribution source and applicable license terms require confirmation.",
+            "Qt/PySide corresponding source, including applicable wheel patches and provenance, requires confirmation.",
+            "Qt/PySide library replacement and relaunch have not been verified against this exact package.",
+            "Microsoft Visual C++ runtime source and applicable redistribution terms require confirmation.",
         ],
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    qt_inventory_path = output_root / "windows-qt-runtime-inventory.csv"
+    with qt_inventory_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("path", "family", "bytes", "sha256"))
+        writer.writeheader()
+        writer.writerows(
+            {
+                "path": record["path"],
+                "family": record["family"],
+                "bytes": record["bytes"],
+                "sha256": record["sha256"],
+            }
+            for record in native_binaries
+            if record["family"] == "Qt/PySide/Shiboken"
+        )
     return manifest_path
 
 

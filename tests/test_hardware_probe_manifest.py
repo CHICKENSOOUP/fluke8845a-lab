@@ -42,7 +42,7 @@ def prepare_probe(root: Path, *, simulation: bool = False) -> Path:
         "sample_count": 2,
         "invalid_count": 0,
         "collection_duration_s": 8.0,
-        "displayed_actual_rate": "5 Hz",
+        "displayed_actual_interval": "200 ms",
         "csv_reconstructed_actual_rate_hz": 5.0,
         "communication_log": ["> SYST:LOC"],
     }

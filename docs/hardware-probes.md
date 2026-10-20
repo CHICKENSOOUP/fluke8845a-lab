@@ -20,6 +20,8 @@ python -m fluke8845a.app --probe-real-gui-dci --port COM3 --baudrate 115200 --du
 
 DCI 要求仪表已在 DCI，确认 5 mA 直流源串联，红线接 mA/400 mA、黑线接 LO。探测使用 10 mA 固定量程、1 NPLC。电流测量前仍须按实际电路断电、检查保险丝和接线；软件无法识别表笔实际插孔。
 
+DCI/ACI 探测会先只读保存原量程。若原配置为自动量程或固定量程与本次探测量程不同，程序会在写入探测配置前退出，并在报告中保留 `pre_configuration_settings`。检查该设置后，如确实要在探测结束时恢复到报告中的原量程，再次运行时增加 `--confirm-restore-current-settings`；此选项同时确认恢复前面板记录的原自动量程/固定量程状态。若原量程已与探测量程相同，不需要此额外选项。
+
 ```powershell
 python -m fluke8845a.app --probe-real-gui-aci --port COM3 --baudrate 115200 --duration 8 --report build/aci-probe.json --confirm-front-aci-current-series --aci-current-arms 0.005 --aci-frequency-hz 60 --aci-range-a 0.01 --ac-bandwidth-hz 20
 ```

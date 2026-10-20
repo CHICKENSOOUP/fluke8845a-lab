@@ -16,13 +16,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from PySide6.QtCore import QObject, QTimer, Qt, Slot
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QObject, QPoint, QPointF, QTimer, Qt, Slot
+from PySide6.QtGui import QIcon, QWheelEvent
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from . import __version__
-from .gui import MainWindow, WiringConfirmationDialog
-from .modes import Mode, descriptor, mode_from_scpi_function
+from .gui import MainWindow, WiringConfirmationDialog, _format_sampling_interval
+from .modes import (
+    Mode, descriptor, mode_from_scpi_function,
+    mode_transition_requires_wiring_confirmation,
+)
 from .scpi import FlowControl, ModeSettings, Serial8845A, SerialSettings
 from .worker import ACTUAL_RATE_WINDOW_POINTS
 
@@ -30,6 +33,7 @@ MIN_HARDWARE_PROBE_DURATION_S = 8.0
 MAX_HARDWARE_PROBE_DURATION_S = 50.0
 HARDWARE_PROBE_WALL_LIMIT_S = 55.0
 HARDWARE_PROBE_CLEANUP_RESERVE_S = 15.0
+HARDWARE_PROBE_GUI_DRAIN_RESERVE_S = 0.25
 
 
 class _MockE2EReceiver(QObject):
@@ -52,6 +56,29 @@ def _application_icon_path() -> Path | None:
         Path(__file__).resolve().parents[2] / icon_name,
     )
     return next((path for path in candidates if path.is_file()), None)
+
+
+def _has_same_wiring_confirmation_target(
+    previous: ModeSettings, confirmed: ModeSettings,
+) -> bool:
+    """Whether one operator confirmation covers both mode and range settings."""
+    return (
+        previous.mode == confirmed.mode
+        and previous.autorange == confirmed.autorange
+        and previous.range_si == confirmed.range_si
+    )
+
+
+def _probe_restore_requires_confirmation(
+    previous: ModeSettings | None, probe: ModeSettings,
+) -> bool:
+    """Whether restoring the pre-probe mode/range needs fresh operator approval."""
+    if previous is None:
+        return True
+    return (
+        mode_transition_requires_wiring_confirmation(previous.mode, probe.mode)
+        and not _has_same_wiring_confirmation_target(previous, probe)
+    )
 
 
 def _reconstruct_gui_rate_from_rows(rows: list[dict], visible_sample_count: int) -> tuple[float, int]:
@@ -229,6 +256,7 @@ def run_real_gui_speed_probe(
     baudrate: int = 9600,
     duration_s: float = 12.0,
     visible_window: bool = False,
+    restore_wiring_confirmed: bool = False,
     measurement_mode: Mode = Mode.RES2,
     voltage_source_confirmed: bool = False,
     dci_current_source_confirmed: bool = False,
@@ -243,6 +271,8 @@ def run_real_gui_speed_probe(
     wall_deadline = invocation_started + HARDWARE_PROBE_WALL_LIMIT_S
     if measurement_mode not in (Mode.RES2, Mode.DCV, Mode.DCI, Mode.ACI):
         raise ValueError("实时硬件GUI探测仅支持RES2、DCV、DCI或ACI")
+    if restore_wiring_confirmed and measurement_mode not in (Mode.DCI, Mode.ACI):
+        raise ValueError("探测前电流量程恢复确认只适用于DCI或ACI")
     aci_values_present = any(value is not None for value in (
         aci_source_current_arms, aci_source_frequency_hz, aci_range_a, ac_bandwidth_hz,
     ))
@@ -309,6 +339,7 @@ def run_real_gui_speed_probe(
         "visible_window_requested": visible_window,
         "started_local": datetime.now().astimezone().isoformat(timespec="microseconds"),
         "operator_wiring_confirmation": confirmation,
+        "restore_wiring_confirmation": bool(restore_wiring_confirmed),
     }
     try:
         if confirmation is None:
@@ -341,6 +372,9 @@ def run_real_gui_speed_probe(
     window = None
     app = None
     previous_settings: ModeSettings | None = None
+    probe_settings: ModeSettings | None = None
+    restore_confirmation: ModeSettings | None = None
+    probe_configuration_attempted = False
     restore_error: str | None = None
     old_qt_platform = os.environ.get("QT_QPA_PLATFORM")
     old_config_dir = os.environ.get("FLUKE8845A_CONFIG_DIR")
@@ -348,11 +382,11 @@ def run_real_gui_speed_probe(
     try:
         # Snapshot the live configuration before the GUI worker connects. This is
         # read-only, and lets both guarded probe loads restore the operator's setup.
-        probe_settings = SerialSettings(
+        serial_settings = SerialSettings(
             baudrate=baudrate, bytesize=8, parity="N", stopbits=1,
             flow_control=FlowControl.NONE, eol="CRLF", timeout_s=2.0,
         )
-        snapshot = Serial8845A(port, probe_settings, communication_log.append)
+        snapshot = Serial8845A(port, serial_settings, communication_log.append)
         try:
             info = snapshot.connect()
             state = snapshot.read_mode_state()
@@ -469,8 +503,33 @@ def run_real_gui_speed_probe(
                 window.bandwidth_combo.setCurrentIndex(window.bandwidth_combo.findData(ac_bandwidth_hz))
             window.analog_filter_check.setChecked(False)
             window.autozero_check.setChecked(True)
+            probe_settings = window._settings_for_mode(measurement_mode)
+            needs_restore_confirmation = _probe_restore_requires_confirmation(
+                previous_settings, probe_settings,
+            )
+            if needs_restore_confirmation and not restore_wiring_confirmed:
+                raise RuntimeError(
+                    "探测前的电流模式/量程与探测设置不同；为确保能恢复到探测前量程，"
+                    "请先查看报告中的 pre_configuration_settings，并在命令中添加 "
+                    "--confirm-restore-current-settings。当前尚未发送探测配置或开始采集。"
+                )
+            report["restore_wiring_confirmation"] = (
+                "explicitly_confirmed" if restore_wiring_confirmed
+                else "same_mode_and_range_as_probe"
+                if _has_same_wiring_confirmation_target(previous_settings, probe_settings)
+                else "not_required_for_this_mode"
+            )
+            if descriptor(measurement_mode).wiring_group == "current":
+                # The CLI confirmation explicitly covers probe_settings. Reuse it
+                # for restoration only when the exact mode, autorange state, and
+                # range match, or when the operator separately confirmed restore.
+                restore_confirmation = previous_settings
             prior_config_count = len(configuration_updates)
-            window._apply_settings()
+            probe_configuration_attempted = True
+            with patch.object(
+                WiringConfirmationDialog, "exec", return_value=QDialog.DialogCode.Accepted
+            ):
+                window._apply_settings()
             pump_until(
                 lambda: len(configuration_updates) > prior_config_count,
                 10.0,
@@ -519,7 +578,9 @@ def run_real_gui_speed_probe(
             speed_combo = window.bandwidth_combo if spec.ac_bandwidths_hz else window.nplc_combo
             capture_deadline = min(
                 run_started + duration_s,
-                wall_deadline - HARDWARE_PROBE_CLEANUP_RESERVE_S,
+                wall_deadline
+                - HARDWARE_PROBE_CLEANUP_RESERVE_S
+                - HARDWARE_PROBE_GUI_DRAIN_RESERVE_S,
             )
             while time.monotonic() < capture_deadline:
                 app.processEvents()
@@ -564,10 +625,25 @@ def run_real_gui_speed_probe(
                 raise RuntimeError("GUI硬件探测没有完成两次速度及两次间隔变更")
             if len(speed_results) < 2 or not all(item[0] for item in speed_results[-2:]):
                 raise RuntimeError(f"GUI实时调速未全部获仪表回读确认：{speed_results}")
-            displayed_actual_rate = window.actual_rate_label.text()
-            if not displayed_actual_rate.endswith(" Hz"):
-                raise RuntimeError(f"GUI未显示有效的实测采样频率：{displayed_actual_rate}")
-            report["displayed_actual_rate"] = displayed_actual_rate
+            displayed_actual_interval = window.actual_rate_label.text()
+            missing_rate_values = {"—", "等待第二个有效读数", "等待有效读数"}
+            if displayed_actual_interval in missing_rate_values:
+                # A fast worker can finish its last READ? and queue the
+                # coalesced GUI update immediately after the capture loop's
+                # final processEvents() call. Drain that bounded UI mailbox
+                # before treating a stale placeholder as a missing rate.
+                try:
+                    pump_until(
+                        lambda: window.actual_rate_label.text() not in missing_rate_values,
+                        HARDWARE_PROBE_GUI_DRAIN_RESERVE_S,
+                        "GUI显示有效的实测采样间隔",
+                    )
+                except TimeoutError:
+                    pass
+                displayed_actual_interval = window.actual_rate_label.text()
+            if displayed_actual_interval in missing_rate_values:
+                raise RuntimeError(f"GUI未显示有效的实测采样间隔：{displayed_actual_interval}")
+            report["displayed_actual_interval"] = displayed_actual_interval
             report["displayed_sample_count"] = int(window._global_stats.get("count", 0))
             window._stop()
             pump_until(lambda: bool(experiment_directories), 10.0, "实验停止并保存文件")
@@ -613,10 +689,13 @@ def run_real_gui_speed_probe(
                             time.sleep(0.01)
                     if window._acquiring:
                         restore_error = "停止连续采集超时，未安全写回探测前设置"
-                    elif window._connected and previous_settings is not None:
+                    elif (
+                        window._connected and previous_settings is not None
+                        and probe_configuration_attempted
+                    ):
                         previous_count = len(configuration_updates)
                         previous_error_count = len(errors)
-                        window._bridge.configure.emit(previous_settings)
+                        window._bridge.configure.emit(previous_settings, restore_confirmation)
                         restore_deadline = min(time.monotonic() + 10.0, wall_deadline)
                         while time.monotonic() < restore_deadline:
                             app.processEvents()
@@ -694,12 +773,14 @@ def run_real_gui_speed_probe(
             reconstructed_rate, rate_window_count = _reconstruct_gui_rate_from_rows(
                 rows, int(report["displayed_sample_count"])
             )
-            displayed_rate = float(str(report["displayed_actual_rate"]).removesuffix(" Hz"))
-            if not math.isclose(displayed_rate, reconstructed_rate, rel_tol=1e-3):
+            expected_interval = _format_sampling_interval(reconstructed_rate)
+            if report["displayed_actual_interval"] != expected_interval:
                 raise RuntimeError(
-                    f"GUI频率显示与CSV单调时钟读数时间不符：显示{displayed_rate:g} Hz，"
-                    f"CSV重建{reconstructed_rate:g} Hz"
+                    "GUI实际采样间隔显示与CSV单调时钟读数时间不符："
+                    f"显示{report['displayed_actual_interval']}，应为{expected_interval} "
+                    f"（CSV重建{reconstructed_rate:g} Hz）"
                 )
+            report["csv_reconstructed_actual_rate_hz"] = reconstructed_rate
             speed_key = "ac_bandwidth_hz" if descriptor(measurement_mode).ac_bandwidths_hz else "nplc"
             expected_speed_values = [speed_first, speed_second]
             if len(changes) != 2 or [change.get(speed_key) for change in changes] != expected_speed_values:
@@ -797,6 +878,10 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
             app = QApplication(sys.argv[:1])
             save_progress("creating_main_window")
             window = MainWindow()
+            report["window_title"] = window.windowTitle()
+            window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+            window.show()
+            app.processEvents()
             save_progress("main_window_ready")
             window.mock_mode_check.setChecked(True)
             window.output_root.setText(str(output_root))
@@ -865,6 +950,80 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 state["deadline"] = time.monotonic() + 15.0
                 window._start_continuous()
                 save_progress(f"acquiring_{mode.value}")
+
+            def probe_mock_wheel_zoom() -> None:
+                mode = modes[state["mode_index"]]
+                if mode is not Mode.DCV:
+                    raise RuntimeError("滚轮缩放验收必须在DCV Mock模式执行")
+                plot_values_before = tuple(float(value) for value in window._plot_y)
+                raw_readings_before = tuple(
+                    str(point.get("raw_reading", "")) for point in window._plot_metadata
+                )
+                if len(plot_values_before) < 3 or len(raw_readings_before) < 3:
+                    raise RuntimeError("绘图区没有足够的DCV Mock样点供滚轮缩放验收")
+                x_range, y_range = window.view_box.viewRange()
+                initial_span = float(y_range[1] - y_range[0])
+                if not math.isfinite(initial_span) or initial_span <= 0:
+                    raise RuntimeError(f"滚轮缩放前的纵轴跨度无效：{initial_span}")
+                viewport = window.plot_widget.viewport()
+                position = viewport.rect().center()
+                global_position = viewport.mapToGlobal(position)
+                # Exercise the complete Qt event path through the plotted
+                # precision boundary, not only a comfortable six-order zoom.
+                wheel_event_count = 1400
+                wheel_events_accepted = 0
+                for _ in range(wheel_event_count):
+                    wheel_event = QWheelEvent(
+                        QPointF(position),
+                        QPointF(global_position),
+                        QPoint(0, 0),
+                        QPoint(0, 120),
+                        Qt.MouseButton.NoButton,
+                        Qt.KeyboardModifier.NoModifier,
+                        Qt.ScrollPhase.ScrollUpdate,
+                        False,
+                    )
+                    wheel_event.setAccepted(False)
+                    QApplication.sendEvent(viewport, wheel_event)
+                    if wheel_event.isAccepted():
+                        wheel_events_accepted += 1
+                if wheel_events_accepted != wheel_event_count:
+                    raise RuntimeError(
+                        "Qt绘图区没有接受全部向上滚轮事件："
+                        f"{wheel_events_accepted}/{wheel_event_count}"
+                    )
+                actual_range = window.view_box.viewRange()[1]
+                final_span = float(actual_range[1] - actual_range[0])
+                if not math.isfinite(final_span) or not 0 < final_span <= min(initial_span * 1e-6, 1e-323):
+                    raise RuntimeError(
+                        "DCV Mock滚轮缩放没有到达接近浮点精度下限的纵轴跨度："
+                        f"{initial_span:g} -> {final_span:g}"
+                    )
+                precision_limit_reached = "浮点精度下限" in window.statusBar().currentMessage()
+                if not precision_limit_reached:
+                    raise RuntimeError("DCV Mock滚轮缩放未显示浮点精度下限提示")
+                follow_disabled = not window.follow_check.isChecked()
+                plot_values_preserved = tuple(float(value) for value in window._plot_y) == plot_values_before
+                raw_readings_preserved = tuple(
+                    str(point.get("raw_reading", "")) for point in window._plot_metadata
+                ) == raw_readings_before
+                if not follow_disabled:
+                    raise RuntimeError("滚轮缩放后自动跟随仍处于开启状态")
+                if not plot_values_preserved or not raw_readings_preserved:
+                    raise RuntimeError("滚轮缩放改变了原始绘图读数")
+                report["wheel_zoom_validation"] = {
+                    "mode": mode.value,
+                    "simulation": True,
+                    "wheel_event_count": wheel_event_count,
+                    "wheel_events_accepted": wheel_events_accepted,
+                    "initial_span_si": initial_span,
+                    "final_span_si": final_span,
+                    "precision_limit_reached": precision_limit_reached,
+                    "follow_disabled": follow_disabled,
+                    "plot_values_preserved": plot_values_preserved,
+                    "raw_readings_preserved": raw_readings_preserved,
+                }
+                save_progress("validated_mock_wheel_zoom")
 
             def on_experiment_finished(directory: str) -> None:
                 if state["finished"]:
@@ -939,6 +1098,12 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     except Exception as exc:
                         finish(str(exc))
                 elif state["phase"] == "acquiring" and int(window._global_stats.get("count", 0)) >= 3:
+                    if state["mode_index"] == 0:
+                        try:
+                            probe_mock_wheel_zoom()
+                        except Exception as exc:
+                            finish(f"DCV滚轮缩放验收失败：{exc}")
+                            return
                     state["phase"] = "awaiting_finish"
                     state["deadline"] = time.monotonic() + 10.0
                     save_progress(f"stopping_{modes[state['mode_index']].value}")
@@ -1024,6 +1189,10 @@ def main(argv: list[str] | None = None) -> int:
         help="--probe-real/--probe-real-gui串口波特率（默认9600）",
     )
     parser.add_argument("--report", type=Path, help="--probe-real/--probe-real-gui的JSON诊断报告路径")
+    parser.add_argument(
+        "--confirm-restore-current-settings", action="store_true",
+        help="DCI/ACI探测前的量程与探测设置不同时，确认恢复报告读取到的原自动/固定量程",
+    )
     wiring = parser.add_mutually_exclusive_group()
     wiring.add_argument("--confirm-front-2w-30mohm", action="store_true",
                         help="确认前面板2W端子当前接着标称30 MOhm电阻")
@@ -1051,6 +1220,7 @@ def main(argv: list[str] | None = None) -> int:
             args.smoke or args.port or args.report or args.confirm_front_2w_30mohm
             or args.confirm_front_2w_short or args.confirm_front_voltage_source
             or args.confirm_front_dci_5ma_series or args.confirm_front_aci_current_series
+            or args.confirm_restore_current_settings
             or args.aci_current_arms is not None or args.aci_frequency_hz is not None
             or args.aci_range_a is not None or args.ac_bandwidth_hz is not None
             or args.baudrate != 9600
@@ -1062,6 +1232,7 @@ def main(argv: list[str] | None = None) -> int:
             args.smoke or args.port or args.confirm_front_2w_30mohm
             or args.confirm_front_2w_short or args.confirm_front_voltage_source
             or args.confirm_front_dci_5ma_series or args.confirm_front_aci_current_series
+            or args.confirm_restore_current_settings
             or args.aci_current_arms is not None or args.aci_frequency_hz is not None
             or args.aci_range_a is not None or args.ac_bandwidth_hz is not None
             or args.baudrate != 9600
@@ -1076,6 +1247,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             args.confirm_front_voltage_source or args.confirm_front_dci_5ma_series
             or args.confirm_front_aci_current_series or args.aci_current_arms is not None
+            or args.confirm_restore_current_settings
             or args.aci_frequency_hz is not None or args.aci_range_a is not None
             or args.ac_bandwidth_hz is not None
         ):
@@ -1146,6 +1318,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--confirm-front-dci-5ma-series is only valid with --probe-real-gui-dci")
         if gui_probe_mode != Mode.ACI and args.confirm_front_aci_current_series:
             parser.error("--confirm-front-aci-current-series is only valid with --probe-real-gui-aci")
+        if args.confirm_restore_current_settings and gui_probe_mode not in (Mode.DCI, Mode.ACI):
+            parser.error("--confirm-restore-current-settings is only valid with --probe-real-gui-dci/aci")
         if gui_probe_mode != Mode.RES2 and (args.confirm_front_2w_30mohm or args.confirm_front_2w_short):
             parser.error("2W wiring confirmations are only valid with RES2 GUI probes")
         probe_kwargs = {
@@ -1155,6 +1329,8 @@ def main(argv: list[str] | None = None) -> int:
             "duration_s": args.duration,
             "visible_window": args.probe_real_gui_visible,
         }
+        if args.confirm_restore_current_settings:
+            probe_kwargs["restore_wiring_confirmed"] = True
         if gui_probe_mode != Mode.RES2:
             probe_kwargs["measurement_mode"] = gui_probe_mode
         if gui_probe_mode == Mode.DCV:
@@ -1174,6 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
         args.port or args.report or args.confirm_front_2w_30mohm
         or args.confirm_front_2w_short or args.confirm_front_voltage_source
         or args.confirm_front_dci_5ma_series or args.confirm_front_aci_current_series
+        or args.confirm_restore_current_settings
         or args.aci_current_arms is not None or args.aci_frequency_hz is not None
         or args.aci_range_a is not None or args.ac_bandwidth_hz is not None
         or args.baudrate != 9600

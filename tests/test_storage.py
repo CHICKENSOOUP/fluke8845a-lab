@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 import io
 import json
-from datetime import datetime, timezone
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,6 +66,102 @@ def test_experiment_writes_csv_incrementally_with_full_value_and_time(tmp_path):
     assert config["mode_settings"]["input_impedance_auto"] is True
 
 
+def test_large_mock_run_keeps_every_attempt_and_periodic_progress_metadata(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path,
+        "high volume mock",
+        {"simulation": True, "device": {"model": "MOCK"}},
+        ModeSettings(Mode.DCV),
+    )
+    start_utc = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    total_attempts = 5_000
+
+    for index in range(total_attempts):
+        start_ns = 1_000_000_000 + index * 10_000_000
+        sample_utc = start_utc + timedelta(milliseconds=index * 10)
+        timestamp_utc = sample_utc.isoformat(timespec="microseconds")
+        timestamp_local = sample_utc.astimezone().isoformat(timespec="microseconds")
+        if index == 2_500:
+            recorder.append_reading(
+                None,
+                mode=Mode.DCV,
+                started_monotonic_ns=start_ns,
+                timestamp_utc=timestamp_utc,
+                timestamp_local=timestamp_local,
+                status="timeout",
+                error="simulated timeout",
+                raw_reading="NO RESPONSE",
+            )
+        else:
+            value = 1.000000123456789 + index * 1e-9
+            recorder.append_reading(
+                Reading(
+                    f"{value:+.17E}", value, 10.0, start_ns, start_ns + 100_000,
+                    timestamp_utc, timestamp_local,
+                ),
+                mode=Mode.DCV,
+            )
+
+        if (index + 1) % 1_000 == 0:
+            with (recorder.directory / "measurements.csv").open(
+                newline="", encoding="utf-8-sig"
+            ) as stream:
+                visible_rows = list(csv.DictReader(stream))
+            config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+            assert len(visible_rows) == index + 1
+            assert config["sample_count"] == index + 1
+
+    recorder.finish("stopped")
+
+    with (recorder.directory / "measurements.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+
+    assert len(rows) == total_attempts
+    assert [int(row["sample_index"]) for row in rows] == list(range(1, total_attempts + 1))
+    assert rows[2_500]["status"] == "timeout"
+    assert rows[2_500]["value_si"] == ""
+    assert rows[2_500]["raw_reading"] == "NO RESPONSE"
+    assert rows[2_501]["value_si"] == repr(1.000000123456789 + 2_501 * 1e-9)
+    assert rows[2_501]["raw_reading"] == f"{1.000000123456789 + 2_501 * 1e-9:+.17E}"
+    assert config["sample_count"] == total_attempts
+    assert config["completion_status"] == "stopped"
+
+
+def test_csv_interval_uses_valid_read_response_end_times(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "response-end interval", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    start_utc = "2026-10-16T01:00:00.000000+00:00"
+    start_local = "2026-10-16T09:00:00.000000+08:00"
+    first = Reading(
+        "+1E+00", 1.0, 10, 1_000_000_000, 1_100_000_000,
+        start_utc, start_local,
+        read_response_end_utc="2026-10-16T01:00:00.100000+00:00",
+        read_response_end_local="2026-10-16T09:00:00.100000+08:00",
+    )
+    second = Reading(
+        "+2E+00", 2.0, 10, 1_200_000_000, 1_600_000_000,
+        "2026-10-16T01:00:00.200000+00:00",
+        "2026-10-16T09:00:00.200000+08:00",
+        read_response_end_utc="2026-10-16T01:00:00.600000+00:00",
+        read_response_end_local="2026-10-16T09:00:00.600000+08:00",
+    )
+
+    first_row = recorder.append_reading(first, mode=Mode.DCV)
+    second_row = recorder.append_reading(second, mode=Mode.DCV)
+
+    assert first_row["actual_interval_s"] == ""
+    assert second_row["actual_interval_s"] == "0.5"
+    assert second_row["read_duration_s"] == "0.4"
+    assert second_row["host_read_request_start_monotonic_ns"] == "1200000000"
+    assert second_row["host_read_response_end_monotonic_ns"] == "1600000000"
+    assert second_row["host_read_response_end_utc"] == "2026-10-16T01:00:00.600000+00:00"
+    recorder.finish("test")
+
+
 def test_speed_change_preserves_all_measurement_mode_settings(tmp_path):
     settings = ModeSettings(
         Mode.DCV, nplc=10, digital_filter=True, input_impedance_auto=True,
@@ -110,6 +209,34 @@ def test_experiment_periodically_syncs_csv_rows_and_syncs_events_and_finish(
     assert len(sync_calls) >= 2
 
 
+def test_csv_fsync_uses_the_five_second_monotonic_interval_without_sleep(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "fsync throttle", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    assert storage_module.CSV_FSYNC_INTERVAL_NS == 5_000_000_000
+    baseline_ns = recorder._last_csv_fsync_ns
+    now_ns = [baseline_ns + storage_module.CSV_FSYNC_INTERVAL_NS - 1]
+    real_fsync = storage_module.os.fsync
+    synced_fds = []
+
+    def capture_fsync(fd):
+        synced_fds.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(storage_module.time, "monotonic_ns", lambda: now_ns[0])
+    monkeypatch.setattr(storage_module.os, "fsync", capture_fsync)
+
+    try:
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+        assert synced_fds == []
+
+        now_ns[0] = baseline_ns + storage_module.CSV_FSYNC_INTERVAL_NS
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+        assert len(synced_fds) == 2  # measurements.csv and events.csv
+    finally:
+        recorder.finish("stopped")
+
+
 def test_failed_attempt_stays_blank_and_event_is_saved(tmp_path):
     recorder = ExperimentRecorder.create(tmp_path, "fault test", {"simulation": False}, ModeSettings(Mode.ACI, nplc=None, ac_bandwidth_hz=20))
     failed = recorder.append_reading(None, mode=Mode.ACI, status="timeout", error="response timeout", raw_reading="partial")
@@ -151,6 +278,46 @@ def test_excel_safe_event_export_preserves_quoted_newlines_and_rejects_wrong_sch
         excel_safe_events_csv_bytes(b"name,value\na,b\n")
     with pytest.raises(ValueError, match="列数不一致"):
         excel_safe_events_csv_bytes(b"event,elapsed_s\nordinary,0.5,unexpected\n")
+
+
+def test_excel_safe_event_export_sanitizes_every_column_and_preserves_valid_numbers():
+    fields = (
+        "experiment_id", "event_index", "timestamp_local", "timestamp_utc",
+        "elapsed_s", "sample_index", "mode", "value_si", "unit_si", "event",
+    )
+    rows = [
+        {
+            "experiment_id": "=1+1", "event_index": "=2+2",
+            "timestamp_local": "+COMMAND", "timestamp_utc": "-COMMAND",
+            "elapsed_s": "=3+3", "sample_index": "@SUM(1,2)",
+            "mode": "=CMD", "value_si": "=4+4", "unit_si": "@CMD",
+            "event": " \t=HYPERLINK(\"https://example.invalid\")",
+        },
+        {
+            "experiment_id": "run-1", "event_index": "2",
+            "timestamp_local": "2026-10-19T10:00:00", "timestamp_utc": "2026-10-19T02:00:00Z",
+            "elapsed_s": "0.5", "sample_index": "3", "mode": "RES2",
+            "value_si": "-1.2345678901234567", "unit_si": "Ohm", "event": "接通负载",
+        },
+    ]
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields, lineterminator="\r\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    source = buffer.getvalue().encode("utf-8-sig")
+
+    exported = excel_safe_events_csv_bytes(source)
+    result = list(csv.DictReader(io.StringIO(exported.decode("utf-8-sig"), newline="")))
+
+    assert result[0] == {
+        "experiment_id": "'=1+1", "event_index": "'=2+2",
+        "timestamp_local": "'+COMMAND", "timestamp_utc": "'-COMMAND",
+        "elapsed_s": "'=3+3", "sample_index": "'@SUM(1,2)",
+        "mode": "'=CMD", "value_si": "'=4+4", "unit_si": "'@CMD",
+        "event": "' \t=HYPERLINK(\"https://example.invalid\")",
+    }
+    assert result[1] == rows[1]
+    assert source == buffer.getvalue().encode("utf-8-sig")
 
 
 def test_safe_csv_exports_reject_unrecognized_formula_like_headers(tmp_path):
@@ -249,10 +416,32 @@ def test_measurement_safe_copy_escapes_untrusted_text_and_preserves_raw_file(tmp
     assert rows[0]["value_si"] == "-1.2345678901234567"
     assert rows[0]["voltage_v"] == "-1.2345678901234567"
     assert rows[0]["elapsed_s"] == "0.25"
-    assert rows[1]["raw_reading"] == "'+2.50000000E+00"
+    assert rows[1]["raw_reading"] == "+2.50000000E+00"
     assert rows[1]["value_si"] == "2.5"
     assert rows[1]["error"] == ""
     assert not list(tmp_path.glob(".measurements-safe-*.tmp"))
+
+
+def test_measurement_safe_copy_sanitizes_formula_cells_in_numeric_columns(tmp_path):
+    source = tmp_path / "measurements.csv"
+    destination = tmp_path / "measurements_excel_safe.csv"
+    original = (
+        "experiment_id,sample_index,mode,value_si,unit_si,raw_reading,error,elapsed_s\r\n"
+        "run-1,=1+1,DCV,=2+2,V,-1.2345678901234567E+00,@COMMAND,=3+3\r\n"
+    ).encode("utf-8-sig")
+    source.write_bytes(original)
+
+    storage_module.write_excel_safe_measurements_csv(source, destination)
+
+    assert source.read_bytes() == original
+    with destination.open("r", encoding="utf-8-sig", newline="") as stream:
+        row = next(csv.DictReader(stream))
+    assert row == {
+        "experiment_id": "run-1", "sample_index": "'=1+1", "mode": "DCV",
+        "value_si": "'=2+2", "unit_si": "V",
+        "raw_reading": "-1.2345678901234567E+00", "error": "'@COMMAND",
+        "elapsed_s": "'=3+3",
+    }
 
 
 def test_measurement_safe_export_rejects_wrong_schema_and_malformed_rows(tmp_path):
@@ -352,6 +541,99 @@ def test_finish_closes_all_files_even_if_metadata_write_fails(tmp_path, monkeypa
     recorder.finish("stopped")  # a second close remains safe and does not repeat failed I/O
 
 
+def test_failed_final_csv_sync_keeps_run_recoverable(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "final sync failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    recorder.append_reading(make_reading(), mode=Mode.DCV)
+
+    def fail_final_sync(*, force=False):
+        raise OSError("injected final CSV fsync failure")
+
+    monkeypatch.setattr(recorder, "_sync_csv_streams", fail_final_sync)
+    with pytest.raises(OSError, match="injected final CSV fsync failure"):
+        recorder.finish("stopped")
+
+    config_path = recorder.directory / "config.json"
+    after_failed_finish = json.loads(config_path.read_text(encoding="utf-8"))
+    assert after_failed_finish["completion_status"] == "running"
+
+    with storage_module.ExperimentNameLock(tmp_path, "final sync failure").acquire() as lock:
+        recovery = storage_module.mark_stale_experiment_interrupted(
+            tmp_path,
+            "final sync failure",
+            expected_directory=recorder.directory,
+            lock=lock,
+        )
+
+    recovered = json.loads(config_path.read_text(encoding="utf-8"))
+    assert recovery is not None
+    assert recovered["completion_status"] == "interrupted"
+    assert recovered["recovery"]["measurements_csv"]["complete_prefix_bytes"] > 0
+
+
+def test_failed_final_log_sync_keeps_run_recoverable(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "final log sync failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    recorder.append_reading(make_reading(), mode=Mode.DCV)
+
+    def fail_final_log_sync():
+        raise OSError("injected final run.log fsync failure")
+
+    monkeypatch.setattr(recorder, "_sync_log_stream", fail_final_log_sync, raising=False)
+    with pytest.raises(OSError, match="injected final run.log fsync failure"):
+        recorder.finish("stopped")
+
+    config_path = recorder.directory / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["completion_status"] == "running"
+
+
+def test_failed_stream_close_keeps_run_recoverable(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "final close failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    recorder.append_reading(make_reading(), mode=Mode.DCV)
+    log_stream = recorder._log_stream
+
+    class FailingCloseStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        @property
+        def closed(self):
+            return self.stream.closed
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def close(self):
+            raise OSError("injected run.log close failure")
+
+    recorder._log_stream = FailingCloseStream(log_stream)
+    try:
+        with pytest.raises(OSError, match="injected run.log close failure"):
+            recorder.finish("stopped")
+    finally:
+        if not log_stream.closed:
+            log_stream.close()
+
+    config_path = recorder.directory / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["completion_status"] == "running"
+
+    with storage_module.ExperimentNameLock(tmp_path, "final close failure").acquire() as lock:
+        recovery = storage_module.mark_stale_experiment_interrupted(
+            tmp_path,
+            "final close failure",
+            expected_directory=recorder.directory,
+            lock=lock,
+        )
+    assert recovery is not None
+    assert json.loads(config_path.read_text(encoding="utf-8"))["completion_status"] == "interrupted"
+
+
 @pytest.mark.parametrize("name", ["bad/name", "bad\\name", "bad:name", "bad\x00name"])
 def test_validate_experiment_name_rejects_windows_path_and_control_characters(name):
     with pytest.raises(ValueError, match="实验名称"):
@@ -389,6 +671,50 @@ def test_require_minimum_free_space_accepts_exact_startup_reserve():
 def test_require_minimum_free_space_rejects_one_byte_below_startup_reserve():
     with pytest.raises(OSError, match="可用空间不足"):
         storage_module.require_minimum_free_space(storage_module.MINIMUM_FREE_SPACE_BYTES - 1)
+
+
+def test_estimate_recording_capacity_uses_target_interval_and_keeps_startup_reserve():
+    free_bytes = storage_module.MINIMUM_FREE_SPACE_BYTES + 8 * storage_module.ESTIMATED_SAMPLE_BYTES
+
+    seconds = storage_module.estimate_recording_capacity_seconds(free_bytes, 0.25)
+
+    assert seconds == 2.0
+
+
+@pytest.mark.parametrize("target_interval_s", [None, 0])
+def test_estimate_recording_capacity_is_unknown_for_fastest_mode(target_interval_s):
+    assert storage_module.estimate_recording_capacity_seconds(
+        4 * 1024**3, target_interval_s
+    ) is None
+
+
+def test_reserve_experiment_directory_retries_after_atomic_name_collision(tmp_path, monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 15, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(storage_module, "datetime", FrozenDateTime)
+    base = tmp_path / "20261015_120000_000000_shared"
+    original_mkdir = Path.mkdir
+    collision_injected = False
+
+    def mkdir_with_competing_creator(path, *args, **kwargs):
+        nonlocal collision_injected
+        if path == base and not collision_injected:
+            collision_injected = True
+            original_mkdir(path, *args, **kwargs)
+            raise FileExistsError(path)
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_with_competing_creator)
+
+    reserved = storage_module.reserve_experiment_directory(tmp_path, "shared")
+
+    assert collision_injected
+    assert base.is_dir()
+    assert reserved == tmp_path / "20261015_120000_000000_shared_1"
+    assert reserved.is_dir()
 
 
 def test_prepare_experiment_storage_probes_and_cleans_writable_directory(tmp_path, monkeypatch):
@@ -437,6 +763,95 @@ def test_recorder_stops_appending_when_free_space_drops_below_reserve(tmp_path, 
         assert recorder.metadata["sample_count"] == 0
     finally:
         recorder.finish("stopped")
+
+
+def test_partial_csv_write_does_not_increment_persisted_sample_count(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "partial csv write", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    original_stream = recorder._data_stream
+
+    class PartialFailureStream:
+        def write(self, text):
+            original_stream.write(text[: max(1, len(text) // 2)])
+            raise OSError("injected partial CSV write failure")
+
+        def __getattr__(self, name):
+            return getattr(original_stream, name)
+
+    failing_stream = PartialFailureStream()
+    recorder._data_stream = failing_stream
+    recorder._writer = csv.DictWriter(
+        failing_stream, fieldnames=storage_module.SAMPLE_FIELDS, extrasaction="ignore"
+    )
+    try:
+        with pytest.raises(OSError, match="injected partial CSV write failure"):
+            recorder.append_reading(make_reading(), mode=Mode.DCV)
+
+        assert recorder.sample_count == 0
+        assert recorder.metadata["sample_count"] == 0
+        recorder.finish("storage_error")
+
+        config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+        assert config["sample_count"] == 0
+        assert config["completion_status"] == "storage_error"
+        csv_path = recorder.directory / "measurements.csv"
+        complete_end = storage_module.complete_csv_prefix_size(csv_path)
+        raw = csv_path.read_bytes()
+        assert complete_end < len(raw)
+        complete_rows = list(
+            csv.DictReader(io.StringIO(raw[:complete_end].decode("utf-8-sig")))
+        )
+        assert complete_rows == []
+    finally:
+        for stream in (recorder._data_stream, recorder._event_stream, recorder._log_stream):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def test_csv_flush_failure_reconciles_count_if_final_flush_succeeds(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "csv flush retry", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    original_stream = recorder._data_stream
+
+    class FlushFailsOnceStream:
+        def __init__(self):
+            self.failed = False
+
+        def flush(self):
+            original_stream.flush()
+            if not self.failed:
+                self.failed = True
+                raise OSError("injected CSV flush failure after write")
+
+        def __getattr__(self, name):
+            return getattr(original_stream, name)
+
+    failing_stream = FlushFailsOnceStream()
+    recorder._data_stream = failing_stream
+    recorder._writer = csv.DictWriter(
+        failing_stream, fieldnames=storage_module.SAMPLE_FIELDS, extrasaction="ignore"
+    )
+
+    with pytest.raises(OSError, match="injected CSV flush failure after write"):
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+    assert recorder.sample_count == 0
+    with pytest.raises(OSError, match="前一条测量记录的CSV写入状态未确认"):
+        recorder.append_reading(make_reading(2.0, "+2E+00"), mode=Mode.DCV)
+    assert recorder.sample_count == 0
+
+    recorder.finish("storage_error")
+
+    with (recorder.directory / "measurements.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["sample_index"] == "1"
+    assert config["sample_count"] == 1
+    assert config["completion_status"] == "storage_error"
 
 
 def test_prepare_experiment_storage_reports_write_probe_failure(tmp_path, monkeypatch):
@@ -494,4 +909,342 @@ def test_same_experiment_name_detection_matches_windows_case_insensitive_folders
         assert storage_module.find_existing_experiment_directories(tmp_path, "test run") == [recorder.directory]
     finally:
         recorder.finish("stopped")
+
+
+def test_archive_latest_same_slug_run_requires_exact_name_metadata(tmp_path):
+    different_name = tmp_path / "20261017_120000_000001_dose_1"
+    exact_name = tmp_path / "20261016_120000_000001_dose_1"
+    different_name.mkdir()
+    exact_name.mkdir()
+    (different_name / "measurements.csv").write_bytes(b"keep dose_1\r\n")
+    (different_name / "config.json").write_text(
+        json.dumps({"experiment_name": "dose_1", "completion_status": "stopped"}),
+        encoding="utf-8",
+    )
+    (exact_name / "measurements.csv").write_bytes(b"archive dose 1\r\n")
+    (exact_name / "config.json").write_text(
+        json.dumps({"experiment_name": "dose 1", "completion_status": "stopped"}),
+        encoding="utf-8",
+    )
+
+    backup = storage_module.archive_latest_existing_experiment_directory(tmp_path, "dose 1")
+
+    assert different_name.is_dir()
+    assert (different_name / "measurements.csv").read_bytes() == b"keep dose_1\r\n"
+    assert not exact_name.exists()
+    assert (backup / "measurements.csv").read_bytes() == b"archive dose 1\r\n"
+
+
+def test_archive_refuses_run_without_matching_metadata_or_finished_status(tmp_path):
+    active = tmp_path / "20261017_120000_000001_dose_1"
+    active.mkdir()
+    (active / "measurements.csv").write_bytes(b"active run\r\n")
+    (active / "config.json").write_text(
+        json.dumps({"experiment_name": "dose 1", "completion_status": "running"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError):
+        storage_module.archive_latest_existing_experiment_directory(tmp_path, "dose 1")
+
+    assert active.is_dir()
+    assert (active / "measurements.csv").read_bytes() == b"active run\r\n"
+    assert not (tmp_path / ".8845a-backups").exists()
+
+
+def test_stale_run_recovery_marks_interrupted_and_preserves_raw_files(tmp_path):
+    directory = tmp_path / "20261019_120000_000001_recover_me"
+    directory.mkdir()
+    measurement_bytes = (
+        b"sample_index,raw_reading,status\r\n"
+        b"1,1.000000,ok\r\n"
+        b"2,partial"
+    )
+    event_bytes = b"event_index,event\r\n1,started\r\n2,partial"
+    (directory / "measurements.csv").write_bytes(measurement_bytes)
+    (directory / "events.csv").write_bytes(event_bytes)
+    original_config = json.dumps(
+        {
+            "experiment_name": "recover me",
+            "completion_status": "running",
+            "experiment_name_lock_protocol": 1,
+            "sample_count": 0,
+            "event_count": 0,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    (directory / "config.json").write_bytes(original_config)
+
+    with storage_module.ExperimentNameLock(tmp_path, "recover me").acquire() as lock:
+        recovery = storage_module.mark_stale_experiment_interrupted(
+            tmp_path, "recover me", expected_directory=directory, lock=lock,
+        )
+        assert lock._fd is not None
+
+    metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    assert metadata["completion_status"] == "interrupted"
+    assert metadata["sample_count"] == 0
+    assert metadata["recovery"]["sample_count_checkpoint"] == 0
+    assert recovery["measurements_csv"]["complete_prefix_bytes"] == measurement_bytes.rfind(b"\n") + 1
+    assert recovery["measurements_csv"]["partial_tail_bytes"] == len(b"2,partial")
+    assert recovery["events_csv"]["complete_prefix_bytes"] == event_bytes.rfind(b"\n") + 1
+    assert recovery["events_csv"]["partial_tail_bytes"] == len(b"2,partial")
+    assert (directory / "measurements.csv").read_bytes() == measurement_bytes
+    assert (directory / "events.csv").read_bytes() == event_bytes
+    backup_config_name = metadata["recovery"]["original_config_backup"]
+    assert (directory / backup_config_name).read_bytes() == original_config
+
+    archived = storage_module.archive_latest_existing_experiment_directory(
+        tmp_path, "recover me", expected_directory=directory,
+    )
+
+    assert not directory.exists()
+    assert (archived / "measurements.csv").read_bytes() == measurement_bytes
+    assert (archived / "events.csv").read_bytes() == event_bytes
+
+
+def test_abrupt_subprocess_exit_releases_lock_and_recovers_flushed_measurements(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    experiment_name = "abrupt process exit"
+    child_code = """
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from fluke8845a.modes import Mode
+from fluke8845a.scpi import ModeSettings, Reading
+from fluke8845a.storage import ExperimentNameLock, ExperimentRecorder
+
+root = Path(sys.argv[1])
+name = sys.argv[2]
+stamp = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+with ExperimentNameLock(root, name):
+    recorder = ExperimentRecorder.create(
+        root, name, {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    for index, value in enumerate((1.25, 1.5)):
+        start_ns = 1_000_000_000 + index * 100_000_000
+        recorder.append_reading(
+            Reading(
+                f"{value:+.8E}", value, 10.0, start_ns, start_ns + 10_000_000,
+                stamp, stamp,
+            ),
+            mode=Mode.DCV,
+        )
+    os._exit(23)
+"""
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(tmp_path),
+            experiment_name,
+            str(repository_root / "src"),
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=False,
+        timeout=10,
+        check=False,
+    )
+
+    assert child.returncode == 23, child.stderr.decode("utf-8", errors="replace")
+
+    with storage_module.ExperimentNameLock(tmp_path, experiment_name).acquire() as lock:
+        matches = storage_module.find_existing_experiment_directories(tmp_path, experiment_name)
+        assert len(matches) == 1
+        directory = matches[0]
+        measurements_path = directory / "measurements.csv"
+        raw_measurements = measurements_path.read_bytes()
+        original_config = (directory / "config.json").read_bytes()
+        recovery = storage_module.mark_stale_experiment_interrupted(
+            tmp_path,
+            experiment_name,
+            expected_directory=directory,
+            lock=lock,
+        )
+
+    assert recovery is not None
+    assert measurements_path.read_bytes() == raw_measurements
+    with measurements_path.open(newline="", encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["sample_index"] for row in rows] == ["1", "2"]
+    assert [row["value_si"] for row in rows] == ["1.25", "1.5"]
+    assert recovery["measurements_csv"]["complete_prefix_bytes"] == len(raw_measurements)
+    assert recovery["measurements_csv"]["partial_tail_bytes"] == 0
+
+    metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    assert metadata["completion_status"] == "interrupted"
+    assert metadata["recovery"]["sample_count_checkpoint"] == 0
+    backup = directory / metadata["recovery"]["original_config_backup"]
+    assert backup.read_bytes() == original_config
+
+
+def test_stale_run_recovery_requires_matching_acquired_lock(tmp_path):
+    directory = tmp_path / "20261019_120000_000001_recover_me"
+    directory.mkdir()
+    original_config = json.dumps(
+        {"experiment_name": "recover me", "completion_status": "running"},
+    )
+    (directory / "config.json").write_text(original_config, encoding="utf-8")
+    (directory / "measurements.csv").write_bytes(b"header\r\n")
+    lock = storage_module.ExperimentNameLock(tmp_path, "recover me")
+
+    with pytest.raises(OSError, match="锁"):
+        storage_module.mark_stale_experiment_interrupted(
+            tmp_path, "recover me", expected_directory=directory, lock=lock,
+        )
+
+    assert json.loads((directory / "config.json").read_text(encoding="utf-8"))["completion_status"] == "running"
+    assert not list(directory.glob("*recovery*"))
+
+
+def test_csv_prefix_can_include_closed_eof_quote_but_stops_at_unclosed_quote(tmp_path):
+    source = tmp_path / "quoted-eof.csv"
+    header = b"experiment_id,raw_reading\r\n"
+    complete_row = b'run-1,"quoted, reading"'
+    source.write_bytes(header + complete_row)
+
+    assert storage_module.complete_csv_prefix_size(source, chunk_size=1) == len(header)
+    assert storage_module.complete_csv_prefix_size(
+        source, chunk_size=1, allow_complete_eof_record=True,
+    ) == len(header + complete_row)
+
+    incomplete_row = b'run-1,"unterminated'
+    source.write_bytes(header + complete_row + b"\r\n" + incomplete_row)
+    assert storage_module.complete_csv_prefix_size(
+        source, chunk_size=1, allow_complete_eof_record=True,
+    ) == len(header + complete_row + b"\r\n")
+
+
+def test_stale_run_recovery_refuses_unmarked_legacy_writer_without_changes(tmp_path):
+    directory = tmp_path / "20261019_120000_000001_recover_me"
+    directory.mkdir()
+    original_config = json.dumps(
+        {"experiment_name": "recover me", "completion_status": "running"},
+    ).encode("utf-8")
+    original_csv = b"sample_index,raw_reading,status\r\n1,1.0,ok\r\n"
+    (directory / "config.json").write_bytes(original_config)
+    (directory / "measurements.csv").write_bytes(original_csv)
+
+    with storage_module.ExperimentNameLock(tmp_path, "recover me").acquire() as lock:
+        with pytest.raises(OSError, match="版本或锁协议"):
+            storage_module.mark_stale_experiment_interrupted(
+                tmp_path, "recover me", expected_directory=directory, lock=lock,
+            )
+
+    assert (directory / "config.json").read_bytes() == original_config
+    assert (directory / "measurements.csv").read_bytes() == original_csv
+    assert not list(directory.glob("*recovery*"))
+
+
+def test_archive_refuses_if_latest_directory_changes_after_confirmation(tmp_path):
+    confirmed = tmp_path / "20261016_120000_000001_repeat"
+    confirmed.mkdir()
+    (confirmed / "config.json").write_text(
+        json.dumps({"experiment_name": "repeat", "completion_status": "stopped"}),
+        encoding="utf-8",
+    )
+    latest = tmp_path / "20261017_120000_000001_repeat"
+    latest.mkdir()
+    (latest / "config.json").write_text(
+        json.dumps({"experiment_name": "repeat", "completion_status": "stopped"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError):
+        storage_module.archive_latest_existing_experiment_directory(
+            tmp_path, "repeat", expected_directory=confirmed,
+        )
+
+    assert confirmed.is_dir()
+    assert latest.is_dir()
+    assert not (tmp_path / ".8845a-backups").exists()
+
+
+def test_experiment_name_lock_blocks_same_name_and_releases_on_close(tmp_path):
+    first = storage_module.ExperimentNameLock(tmp_path, "Same Name").acquire()
+    try:
+        with pytest.raises(OSError, match="同名实验正在其他程序中运行"):
+            storage_module.ExperimentNameLock(tmp_path, "same name").acquire()
+
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        child_code = (
+            "import sys; from fluke8845a.storage import ExperimentNameLock; "
+            "lock = ExperimentNameLock(sys.argv[1], sys.argv[2]); "
+            "\ntry: lock.acquire()\nexcept OSError: print('blocked')\n"
+            "else: lock.release(); print('acquired')"
+        )
+        child = subprocess.run(
+            [sys.executable, "-c", child_code, str(tmp_path), "same name"],
+            capture_output=True, text=True, env=environment, timeout=5, check=False,
+        )
+        assert child.returncode == 0, child.stderr
+        assert child.stdout.strip() == "blocked"
+    finally:
+        first.release()
+
+    with storage_module.ExperimentNameLock(tmp_path, "same name").acquire():
+        pass
+
+
+def test_experiment_name_lock_refuses_reparse_point_directory(tmp_path, monkeypatch):
+    lock_directory = tmp_path / ".8845a-locks"
+    real_check = storage_module._is_symlink_or_junction
+    monkeypatch.setattr(
+        storage_module,
+        "_is_symlink_or_junction",
+        lambda path: Path(path) == lock_directory or real_check(Path(path)),
+    )
+
+    with pytest.raises(OSError):
+        storage_module.ExperimentNameLock(tmp_path, "junction check").acquire()
+
+
+def test_archive_refuses_reparse_point_backup_directory(tmp_path, monkeypatch):
+    existing = tmp_path / "20261017_120000_000001_repeat"
+    existing.mkdir()
+    (existing / "config.json").write_text(
+        json.dumps({"experiment_name": "repeat", "completion_status": "stopped"}),
+        encoding="utf-8",
+    )
+    backup_root = tmp_path / ".8845a-backups"
+    real_check = storage_module._is_symlink_or_junction
+    monkeypatch.setattr(
+        storage_module,
+        "_is_symlink_or_junction",
+        lambda path: Path(path) == backup_root or real_check(Path(path)),
+    )
+
+    with pytest.raises(OSError):
+        storage_module.archive_latest_existing_experiment_directory(tmp_path, "repeat")
+
+    assert existing.is_dir()
+    assert not backup_root.exists()
+
+
+def test_archive_refuses_reparse_point_config_metadata(tmp_path, monkeypatch):
+    existing = tmp_path / "20261017_120000_000001_repeat"
+    existing.mkdir()
+    config_path = existing / "config.json"
+    config_path.write_text(
+        json.dumps({"experiment_name": "repeat", "completion_status": "stopped"}),
+        encoding="utf-8",
+    )
+    real_check = storage_module._is_symlink_or_junction
+    monkeypatch.setattr(
+        storage_module,
+        "_is_symlink_or_junction",
+        lambda path: Path(path) == config_path or real_check(Path(path)),
+    )
+
+    with pytest.raises(OSError):
+        storage_module.archive_latest_existing_experiment_directory(tmp_path, "repeat")
+
+    assert existing.is_dir()
+    assert not (tmp_path / ".8845a-backups").exists()
 

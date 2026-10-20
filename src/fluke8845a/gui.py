@@ -10,15 +10,18 @@ import math
 import os
 import sys
 import tempfile
+import time
 from collections import deque
+from collections.abc import Iterable
 from datetime import datetime
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from PySide6.QtCore import (
     QObject, QRunnable, QSignalBlocker, QStandardPaths, Qt, QThread, QThreadPool, QTimer,
     Signal, Slot, QPointF, QRectF, QUrl,
 )
-from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QColor, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QKeySequence, QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QBoxLayout, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -26,26 +29,37 @@ from PySide6.QtWidgets import (
     QTabWidget, QToolButton, QStackedLayout, QGridLayout,
 )
 
+import numpy as np
 import pyqtgraph as pg
 
+from . import __version__
 from .analysis import RunningStats, engineering_value, relative_change_percent, summarize
-from .history_import import load_history_csv
-from .modes import DESCRIPTORS, Mode, descriptor, mode_from_scpi_function, range_label
+from .build_identity import desktop_build_label
+from .filter_policy import digital_filter_enable_error
+from .history_import import load_history_csv, load_history_csv_range
+from .modes import (
+    DESCRIPTORS, Mode, descriptor, mode_from_scpi_function,
+    mode_transition_requires_wiring_confirmation, range_label,
+)
 from .mock import MockScenario
+from .plot_history import downsample_plot_data
 from .scpi import (
-    DIGITAL_FILTER_DISABLED_REASON, FlowControl, InstrumentIdentityError, ModeSettings, SerialSettings,
-    compare_firmware, current_autorange_block_reason, digital_filter_blocked_nplc_values,
-    digital_filter_slow_read_block_reason,
+    FlowControl, InstrumentIdentityError, ModeSettings, SerialSettings,
+    current_autorange_block_reason,
     parse_idn, select_range_firmware,
     unsupported_current_ranges,
 )
+from .versioning import compare_firmware
+from .share_export import export_share_package
 from .storage import (
     complete_csv_prefix_size, find_existing_experiment_directories,
-    format_available_space, get_available_space_bytes, require_minimum_free_space,
-    prepare_experiment_storage, validate_experiment_name,
+    estimate_recording_capacity_seconds, format_available_space,
+    format_estimated_recording_capacity, get_available_space_bytes,
+    require_minimum_free_space, prepare_experiment_storage,
+    validate_experiment_name,
     write_excel_safe_events_csv, write_excel_safe_measurements_csv,
 )
-from .worker import MeasurementWorker
+from .worker import MAX_PENDING_GUI_ROWS, MeasurementWorker
 
 log = logging.getLogger(__name__)
 _REGISTERED_UI_FONT_IDS: list[int] = []
@@ -77,6 +91,35 @@ def _window_dimensions_for_available_screen(
     return initial_size, minimum_size
 
 
+def _available_geometry_for_widget(widget: QWidget):
+    """Return the logical work area for a widget's screen, with a primary-screen fallback."""
+    screen = widget.screen()
+    if screen is None:
+        screen = QApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else None
+
+
+def _fit_dialog_to_available_geometry(dialog: QDialog, available=None) -> None:
+    """Clamp and center a secondary dialog within the current screen work area."""
+    if available is None:
+        available = _available_geometry_for_widget(dialog)
+    if available is None:
+        return
+    # Leave a small allowance for native frame decorations, which are included
+    # in frameGeometry() but not in QWidget.resize() on Windows.
+    max_width = max(1, available.width() - 32)
+    max_height = max(1, available.height() - 80)
+    dialog.setMinimumSize(min(320, max_width), min(220, max_height))
+    dialog.setMaximumSize(max_width, max_height)
+    width = min(max(dialog.width(), dialog.minimumWidth()), max_width)
+    height = min(max(dialog.height(), dialog.minimumHeight()), max_height)
+    dialog.resize(width, height)
+    dialog.move(
+        available.x() + max(0, (available.width() - width) // 2),
+        available.y() + max(0, (available.height() - height) // 2),
+    )
+
+
 def _finite_number(value) -> float | None:
     """Convert a saved numeric value without letting extreme integers crash startup."""
     try:
@@ -84,6 +127,108 @@ def _finite_number(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _parse_region_sample_index(value) -> int | None:
+    """Accept only positive integer sample IDs from CSV or worker payloads."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        token = value.strip()
+        if token and token.isascii() and token.isdecimal():
+            try:
+                parsed = int(token)
+            except ValueError:
+                return None
+            return parsed if parsed > 0 else None
+    return None
+
+
+def _region_sample_rows_are_contiguous(rows: Iterable[dict], last_sample_index: int) -> bool:
+    """Return whether incremental GUI rows cover every attempt after a CSV snapshot."""
+    expected = last_sample_index + 1
+    for row in rows:
+        try:
+            sample_index = _parse_region_sample_index(row.get("sample_index"))
+        except AttributeError:
+            sample_index = None
+        if sample_index is None:
+            return False
+        if sample_index < expected:
+            continue
+        if sample_index != expected:
+            return False
+        expected += 1
+    return True
+
+
+def _region_successful_row_values(row: dict, sample_index: int) -> tuple[float, float]:
+    """Parse a successful raw row or fail instead of silently understating statistics."""
+    parsed = {}
+    for field in ("elapsed_s", "value_si"):
+        try:
+            value = float(row[field])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"成功样本 #{sample_index} 的 {field} 无效") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"成功样本 #{sample_index} 的 {field} 不是有限数值")
+        parsed[field] = value
+    return parsed["elapsed_s"], parsed["value_si"]
+
+
+def _plot_y_margin(min_y: float, max_y: float) -> float:
+    """Keep a useful panning area around flat data without limiting manual spans to a few ULPs."""
+    y_span = max(max_y - min_y, abs(min_y) * 1e-12, abs(max_y) * 1e-12, 1e-12)
+    magnitude_margin = max(abs(min_y), abs(max_y)) * 1e-6
+    return max(y_span * 0.08, magnitude_margin, 1e-15)
+
+
+def _plot_y_view_limits(min_y: float, max_y: float) -> tuple[float, float]:
+    """Allow vertical zoom-out to the finite coordinate boundary, not a data-relative cap."""
+    finite_bound = sys.float_info.max / 4
+    center = min(finite_bound, max(-finite_bound, min_y / 2 + max_y / 2))
+    return max(-finite_bound, center - finite_bound), min(finite_bound, center + finite_bound)
+
+
+def _engineering_axis_scale(span: float, unit_si: str) -> tuple[float, str]:
+    """Choose an engineering unit from the visible span, not the raw baseline."""
+    base_unit = "Ω" if unit_si == "Ohm" else unit_si
+    if not math.isfinite(span) or span <= 0 or unit_si not in {"V", "A", "Ohm"}:
+        return 1.0, base_unit
+    maximum_exponent = 9 if unit_si == "Ohm" else 3
+    exponent = math.floor(math.log10(span) / 3) * 3
+    exponent = min(maximum_exponent, max(-12, exponent))
+    prefix = {
+        -12: "p", -9: "n", -6: "µ", -3: "m", 0: "", 3: "k", 6: "M", 9: "G",
+    }[exponent]
+    return 10.0 ** exponent, f"{prefix}{base_unit}"
+
+
+def _format_axis_tick(value: Decimal, step: float) -> str:
+    if not value.is_finite():
+        return str(value)
+    magnitude = abs(value)
+    try:
+        float_value = float(value)
+    except (OverflowError, ValueError):
+        float_value = math.inf
+    if not math.isfinite(float_value) or magnitude >= Decimal("1e12") or (magnitude and magnitude < Decimal("1e-6")):
+        return format(value, ".6g")
+    places = 0
+    if math.isfinite(step) and 0 < step < 1:
+        places = max(0, min(18, int(math.ceil(-math.log10(step)))))
+    quantum = Decimal(1).scaleb(-places)
+    with localcontext() as context:
+        context.prec = max(32, len(value.as_tuple().digits) + places + 8)
+        try:
+            label = format(value.quantize(quantum), "f")
+        except ArithmeticError:
+            return format(value, ".6g")
+    if "." in label:
+        label = label.rstrip("0").rstrip(".")
+    return label or "0"
 
 
 def _copy_complete_csv_prefix(source: Path, destination: Path, *, chunk_size: int = 1024 * 1024) -> int:
@@ -146,21 +291,206 @@ class _MeasurementViewBox(pg.ViewBox):
     """Wheel zoom: Y by default, Shift=X, Ctrl=both, Alt=Y around zero."""
 
     userZoomed = Signal(bool, bool)
+    rebaseRequested = Signal(float, object)
+    yZoomLimitReached = Signal(float)
 
-    def wheelEvent(self, event) -> None:
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.zero_y = 0.0
+        self.y_anchor_tolerance = 0.0
+        self.pan_y_data_bounds: tuple[float, float] | None = None
+        self.y_anchor_provider = None
+        self._last_zoom_rebase_changed = False
+        self._last_zoom_rebase_delta = 0.0
+
+    def set_pan_y_data_bounds(self, bounds: tuple[float, float] | None) -> None:
+        if bounds is None:
+            self.pan_y_data_bounds = None
+            return
+        lower, upper = (float(value) for value in bounds)
+        if math.isfinite(lower) and math.isfinite(upper) and lower <= upper:
+            self.pan_y_data_bounds = (lower, upper)
+        else:
+            self.pan_y_data_bounds = None
+
+    def translateBy(self, t=None, x=None, y=None) -> None:
+        bounds = self.pan_y_data_bounds
+        if bounds is not None:
+            tuple_translation = t is not None
+            if tuple_translation:
+                x, y = t[0], t[1]
+            if y is not None and math.isfinite(float(y)):
+                view_low, view_high = self.targetRange()[1]
+                span = float(view_high - view_low)
+                center = float(view_low / 2 + view_high / 2)
+                if math.isfinite(span) and span > 0 and math.isfinite(center):
+                    # Keep part of the data envelope visible during panning,
+                    # while allowing the zoom range itself to remain unbounded.
+                    center_margin = span * 0.3
+                    desired_center = center + float(y)
+                    min_center = bounds[0] - center_margin
+                    max_center = bounds[1] + center_margin
+                    if all(math.isfinite(value) for value in (desired_center, min_center, max_center)):
+                        adjusted_center = min(max(desired_center, min_center), max_center)
+                        y = adjusted_center - center
+                        if tuple_translation:
+                            t = (x, y)
+                            x = y = None
+        super().translateBy(t=t, x=x, y=y)
+
+    def _scale_y_by(self, factor: float, center_y: float) -> None:
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        y_min, y_max = self.viewRange()[1]
+        current_span = y_max - y_min
+        if not math.isfinite(current_span) or current_span <= 0:
+            return
+
+        reference = max(abs(center_y), abs(y_min), abs(y_max))
+        # Coordinates are offset from the first plotted reading, so a fixed
+        # absolute floor is meaningful even when the actual reading is large.
+        minimum_span = math.ulp(reference)
+        requested_span = current_span * factor
+        y_limits = self._effectiveLimits()[1]
+        lower, upper = y_limits
+        maximum_span = None
+        if lower is not None and upper is not None:
+            candidate_span = upper - lower
+            if math.isfinite(candidate_span) and candidate_span > 0:
+                maximum_span = candidate_span
+        if not math.isfinite(requested_span):
+            if maximum_span is None:
+                return
+            requested_span = maximum_span
+        elif maximum_span is not None:
+            requested_span = min(requested_span, maximum_span)
+        span = max(minimum_span, requested_span)
+        relative = (center_y - y_min) / current_span
+        if not math.isfinite(relative):
+            return
+        relative = min(1.0, max(0.0, relative))
+        if requested_span <= minimum_span * 4:
+            half_span = minimum_span / 2
+            low, high = center_y - half_span, center_y + half_span
+            if high <= low:
+                low = math.nextafter(center_y, -math.inf)
+                high = math.nextafter(center_y, math.inf)
+        else:
+            low = center_y - span * relative
+            high = center_y + span * (1 - relative)
+            if high <= low:
+                low = math.nextafter(center_y, -math.inf)
+                high = math.nextafter(center_y, math.inf)
+
+        if lower is not None and upper is not None and high - low > upper - lower:
+            low, high = lower, upper
+        elif lower is not None and low < lower:
+            shift = lower - low
+            low += shift
+            high += shift
+        if upper is not None and high > upper:
+            shift = high - upper
+            low -= shift
+            high -= shift
+
+        self.state["targetRange"][1] = [low, high]
+        self.updateViewRange(forceY=True)
+
+    def wheelEvent(self, event, axis=None) -> None:
         delta = event.delta()
         if not delta:
             event.ignore()
             return
         modifiers = event.modifiers()
-        factor = math.exp(-float(delta) / 120.0 * 0.18)
-        center = self.mapSceneToView(event.scenePos())
         zoom_x, zoom_y = _wheel_zoom_axes(modifiers)
+        if zoom_y:
+            # Resolve a pending live auto-range and take manual control before
+            # mapping the cursor anchor or applying this wheel step. Disabling
+            # auto-range after scaling can execute that pending update and erase
+            # the very zoom this event just requested.
+            self.enableAutoRange(y=False)
+        zoom_sensitivity = 0.18 if modifiers & Qt.KeyboardModifier.AltModifier else 0.9
+        factor = math.exp(-float(delta) / 120.0 * zoom_sensitivity)
+        scene_position = event.scenePos()
+        center = self.mapSceneToView(scene_position)
+        scene_bounds = self.sceneBoundingRect()
+        x_min, x_max = self.viewRange()[0]
+        y_min, y_max = self.viewRange()[1]
+        # Wheel events from axis tick labels are forwarded to the ViewBox.
+        # Their scene position can be just outside the plot rectangle, and
+        # mapping that coordinate back to data can produce a tiny negative
+        # offset that shifts the whole curve out of view during Y zoom.
+        if scene_position.x() < scene_bounds.left() or scene_position.x() > scene_bounds.right():
+            center.setX(x_min + (x_max - x_min) / 2)
+        if scene_position.y() < scene_bounds.top() or scene_position.y() > scene_bounds.bottom():
+            center.setY(y_min + (y_max - y_min) / 2)
+        has_curve_anchor = False
+        absolute_curve_anchor = None
+        if zoom_y and not (modifiers & Qt.KeyboardModifier.AltModifier):
+            # Anchor vertical zoom to a recorded sample near the pointer's
+            # time. A linearly interpolated value is only a display estimate;
+            # rebasing to it can leave a sub-ULP residual around a large
+            # absolute reading and make further zoom impossible.
+            provider = self.y_anchor_provider
+            anchor = provider(float(center.x())) if callable(provider) else None
+            if isinstance(anchor, (tuple, list)) and len(anchor) == 2:
+                anchor, absolute_curve_anchor = anchor
+            if anchor is not None and math.isfinite(float(anchor)):
+                center.setY(float(anchor))
+                has_curve_anchor = True
+            else:
+                absolute_curve_anchor = None
+                center.setY(y_min / 2 + y_max / 2)
+        # Use one stable wheel mapping across the plot and its axis items:
+        # plain/Alt zoom Y, Shift zooms time, and Ctrl zooms both. PyQtGraph
+        # forwards axis-item events with an axis index, which otherwise makes
+        # a plain wheel over the time ticks appear to stop vertical zooming.
+        if zoom_x and not math.isfinite(center.x()):
+            center.setX(x_min + (x_max - x_min) / 2)
+        if zoom_y and not math.isfinite(center.y()):
+            center.setY(y_min + (y_max - y_min) / 2)
         x_factor = factor if zoom_x else 1.0
         y_factor = factor if zoom_y else 1.0
+        if zoom_y and factor < 1.0:
+            y_anchor = self.zero_y if modifiers & Qt.KeyboardModifier.AltModifier else center.y()
+            y_min, y_max = self.viewRange()[1]
+            reference = max(abs(y_anchor), abs(y_min), abs(y_max))
+            floor = math.ulp(reference)
+            if (y_max - y_min) * factor < floor * 16:
+                self._last_zoom_rebase_changed = False
+                self._last_zoom_rebase_delta = 0.0
+                absolute_anchor = 0.0 if modifiers & Qt.KeyboardModifier.AltModifier else absolute_curve_anchor
+                self.rebaseRequested.emit(float(y_anchor), absolute_anchor)
+                if self._last_zoom_rebase_changed:
+                    # Rebasing changes only the Y data origin. Preserve the
+                    # selected vertical anchor using the actual origin delta;
+                    # remapping the mouse position here would replace a sample
+                    # anchor with the cursor's screen Y for Ctrl+wheel.
+                    center.setY(center.y() - self._last_zoom_rebase_delta)
         if modifiers & Qt.KeyboardModifier.AltModifier:
+            center.setY(self.zero_y)
+        elif not has_curve_anchor and abs(center.y()) <= self.y_anchor_tolerance:
+            # Qt's scene-to-view transform can accumulate sub-ULP drift at a
+            # fixed mouse position. Snap only fallback coordinates too small
+            # to distinguish from the plotted origin; a curve-provided sample
+            # is raw data and must retain even a one-ULP offset.
             center.setY(0.0)
-        self.scaleBy((x_factor, y_factor), center=center)
+        if zoom_x:
+            self.scaleBy(x=x_factor, center=center)
+        if zoom_y:
+            previous_y_range = self.viewRange()[1]
+            previous_span = previous_y_range[1] - previous_y_range[0]
+            self._scale_y_by(y_factor, center.y())
+            current_y_range = self.viewRange()[1]
+            current_span = current_y_range[1] - current_y_range[0]
+            reference = max(abs(center.y()), abs(current_y_range[0]), abs(current_y_range[1]))
+            precision_floor = math.ulp(reference)
+            if (
+                factor < 1.0
+                and current_span >= previous_span
+                and current_span <= precision_floor * 16
+            ):
+                self.yZoomLimitReached.emit(float(current_span))
         self.sigRangeChangedManually.emit([zoom_x, zoom_y])
         self.userZoomed.emit(zoom_x, zoom_y)
         event.accept()
@@ -170,7 +500,7 @@ class _MeasurementPlotWidget(pg.PlotWidget):
     """Plot widget with predictable keyboard focus and chart shortcuts."""
 
     def __init__(self, *, view_box: _MeasurementViewBox, parent=None) -> None:
-        super().__init__(parent=parent, viewBox=view_box)
+        super().__init__(parent=parent, viewBox=view_box, axisItems={"left": _OffsetValueAxis("left")})
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.key_handler = None
 
@@ -184,6 +514,64 @@ class _MeasurementPlotWidget(pg.PlotWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class _OffsetValueAxis(pg.AxisItem):
+    """Render offset plot coordinates as absolute readings or explicit offsets."""
+
+    def __init__(self, orientation: str, **kwargs) -> None:
+        self.value_offset = 0.0
+        self.display_factor = 1.0
+        self.display_unit = ""
+        super().__init__(orientation=orientation, **kwargs)
+        self.enableAutoSIPrefix(False)
+
+    def tickSpacing(self, minVal, maxVal, size):
+        levels = super().tickSpacing(minVal, maxVal, size)
+        if not levels or all(math.isfinite(spacing) and spacing > 0 for spacing, _offset in levels):
+            return levels
+        span = abs(float(maxVal) - float(minVal))
+        if not math.isfinite(span) or span <= 0:
+            return []
+        spacing = span / 2
+        if not math.isfinite(spacing) or spacing <= 0:
+            spacing = span
+        return [(spacing, 0.0)]
+
+    def tickStrings(self, values, scale, spacing):
+        offset = float(self.value_offset)
+        factor = float(self.display_factor)
+        if not math.isfinite(factor) or factor <= 0:
+            factor = 1.0
+        if not math.isfinite(offset):
+            return super().tickStrings(values, scale, spacing)
+
+        if offset == 0.0 and factor == 1.0:
+            return super().tickStrings(values, scale, spacing)
+
+        step = abs(float(spacing)) / factor
+        if not math.isfinite(step) or step <= 0:
+            step = 0.0
+        factor_decimal = Decimal(str(factor))
+        offset_decimal = Decimal(str(offset)) / factor_decimal
+        relative = offset != 0.0 and (
+            (math.isfinite(step) and step > 0 and abs(offset_decimal) > Decimal(str(step)) * Decimal("1e6"))
+            or abs(float(spacing)) < math.ulp(offset) * 16
+        )
+        result = []
+        for raw_value in values:
+            value = float(raw_value)
+            if not math.isfinite(value):
+                result.append(f"{value:.6g}")
+                continue
+            delta = Decimal(str(value)) / factor_decimal
+            absolute = (Decimal(str(offset)) + Decimal(str(value))) / factor_decimal
+            shown = delta if relative else absolute
+            label = _format_axis_tick(shown, step)
+            if relative and shown > 0:
+                label = f"+{label}"
+            result.append(label)
+        return result
 
 
 class _RegionStatisticsSignals(QObject):
@@ -235,19 +623,19 @@ class _RegionStatisticsTask(QRunnable):
                 for row in reader:
                     if self._cancelled:
                         raise InterruptedError("区间统计任务已取消")
-                    try:
-                        sample_index = int(row["sample_index"])
-                    except (TypeError, ValueError):
-                        continue
-                    last_sample_index = max(last_sample_index, sample_index)
+                    sample_index = _parse_region_sample_index(row.get("sample_index"))
+                    if sample_index is None:
+                        raise ValueError("测量CSV含无效样本序号，无法保证区间统计完整")
+                    expected_sample_index = last_sample_index + 1
+                    if sample_index != expected_sample_index:
+                        raise ValueError(
+                            f"测量CSV样本序号不连续：期望 {expected_sample_index}，实际 {sample_index}"
+                        )
+                    last_sample_index = sample_index
                     if row.get("status") != "ok" or row.get("mode") != self.mode.value:
                         continue
-                    try:
-                        elapsed = float(row["elapsed_s"])
-                        value = float(row["value_si"])
-                    except (TypeError, ValueError):
-                        continue
-                    if math.isfinite(elapsed) and math.isfinite(value) and self.left <= elapsed <= self.right:
+                    elapsed, value = _region_successful_row_values(row, sample_index)
+                    if self.left <= elapsed <= self.right:
                         stats.add(value)
             result = {"stats": stats, "last_sample_index": last_sample_index}
         except Exception as exc:
@@ -261,15 +649,34 @@ class _CsvSnapshotSignals(QObject):
 
 def _validate_snapshot_destinations(source: Path, destination: Path, sidecar: Path) -> None:
     source = Path(source)
+    raw_files = {
+        name: source.parent / name
+        for name in ("measurements.csv", "events.csv", "config.json", "run.log")
+    }
+    raw_files.setdefault(source.name, source)
     for target in (Path(destination), Path(sidecar)):
         try:
-            same_file = source.resolve() == target.resolve()
-            if not same_file and source.exists() and target.exists():
-                same_file = os.path.samefile(source, target)
-        except OSError as exc:
-            raise OSError(f"无法确认快照目标是否与原始 CSV 相同：{target}：{exc}") from exc
-        if same_file:
-            raise ValueError(f"快照文件或元数据不能覆盖原始 measurements.csv：{target}")
+            target_is_directory = target.is_dir()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise OSError(f"无法确认快照目标是否为目录：{target}：{exc}") from exc
+        if target_is_directory:
+            raise ValueError(f"快照目标不能是目录：{target}")
+        for raw_name, raw_path in raw_files.items():
+            try:
+                same_file = raw_path.resolve(strict=False) == target.resolve(strict=False)
+                if not same_file:
+                    try:
+                        same_file = os.path.samefile(raw_path, target)
+                    except FileNotFoundError:
+                        same_file = False
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise OSError(
+                    f"无法确认快照目标是否与原始实验文件相同：{target}：{exc}"
+                ) from exc
+            if same_file:
+                raise ValueError(
+                    f"快照文件或元数据不能覆盖当前实验的原始文件 {raw_name}：{target}"
+                )
 
 
 class _CsvSnapshotTask(QRunnable):
@@ -434,6 +841,24 @@ class _SafeMeasurementsExportTask(QRunnable):
         self.signals.completed.emit(str(self.destination), error)
 
 
+class _SharePackageExportTask(QRunnable):
+    """Create a redacted, fixed-content share package away from the GUI thread."""
+
+    def __init__(self, source_directory: Path, destination: Path) -> None:
+        super().__init__()
+        self.source_directory = source_directory
+        self.destination = destination
+        self.signals = _SafeEventsExportSignals()
+
+    def run(self) -> None:
+        error = None
+        try:
+            export_share_package(self.source_directory, self.destination)
+        except Exception as exc:
+            error = str(exc)
+        self.signals.completed.emit(str(self.destination), error)
+
+
 class _HistoryLoadSignals(QObject):
     completed = Signal(str, object, object)
 
@@ -461,6 +886,42 @@ class _HistoryLoadTask(QRunnable):
             self.signals.completed.emit(self.path, result, None)
         except Exception as exc:
             self.signals.completed.emit(self.path, None, str(exc))
+
+
+class _HistoryRangeLoadSignals(QObject):
+    completed = Signal(int, str, object, object)
+
+
+class _HistoryRangeLoadTask(QRunnable):
+    """Read a bounded history window off the GUI thread; keep raw CSV untouched."""
+
+    def __init__(
+        self, request_id: int, path: Path, left: float, right: float,
+        max_plot_points: int, range_index=None,
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.path = path
+        self.left = left
+        self.right = right
+        self.max_plot_points = max_plot_points
+        self.range_index = range_index
+        self.signals = _HistoryRangeLoadSignals()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            result = load_history_csv_range(
+                self.path, self.left, self.right, self.max_plot_points,
+                is_cancelled=lambda: self._cancelled,
+                range_index=self.range_index,
+            )
+            self.signals.completed.emit(self.request_id, str(self.path), result, None)
+        except Exception as exc:
+            self.signals.completed.emit(self.request_id, str(self.path), None, str(exc))
 
 
 def _ensure_windows_ui_font() -> None:
@@ -724,32 +1185,41 @@ class WiringConfirmationDialog(QDialog):
         self.setModal(True)
         self.resize(1040, 475)
         layout = QVBoxLayout(self)
-        message = QLabel(instructions)
-        message.setWordWrap(True)
-        layout.addWidget(message)
+        self.instructions_label = QLabel(instructions)
+        self.instructions_label.setWordWrap(True)
+        layout.addWidget(self.instructions_label)
         self.schematic = WiringSchematicWidget(
             mode, self, current_range_si=current_range_si, autorange=autorange,
         )
+        available = _available_geometry_for_widget(self)
+        if available is not None:
+            max_width = max(1, available.width() - 24)
+            max_height = max(1, available.height() - 72)
+            self.schematic.setMinimumSize(
+                min(860, max(1, max_width - 36)),
+                min(275, max(120, max_height - 270)),
+            )
         layout.addWidget(self.schematic, 1)
-        note = QLabel("示意图依据 Fluke 8845A《Users Manual》中文本第 4-4、4-9 至 4-11 页整理。SCPI可回读量程与FRONT/REAR，不能确认表笔接入哪个电流孔，也不能检测保险丝或外部回路。")
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #687386;")
-        layout.addWidget(note)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("我已断电并核对接线")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.note_label = QLabel("示意图依据 Fluke 8845A《Users Manual》中文本第 4-4、4-9 至 4-11 页整理。SCPI可回读量程与FRONT/REAR，不能确认表笔接入哪个电流孔，也不能检测保险丝或外部回路。")
+        self.note_label.setWordWrap(True)
+        self.note_label.setStyleSheet("color: #687386;")
+        layout.addWidget(self.note_label)
+        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("我已断电并核对接线")
+        self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+        _fit_dialog_to_available_geometry(self, available)
 
 
 class WorkerBridge(QObject):
-    connect_real = Signal(str, object, object, bool)
+    connect_real = Signal(str, object, object, bool, object)
     connect_mock = Signal(object, object)
     set_control_mode = Signal(str)
     set_firmware_versions = Signal(str, str)
-    configure = Signal(object)
-    start_experiment = Signal(object, str, str, object, bool)
+    configure = Signal(object, object)
+    start_experiment = Signal(object, str, str, object, bool, str, str, object)
     set_sampling_interval = Signal(object)
     set_measurement_speed = Signal(object)
     pause = Signal()
@@ -765,7 +1235,10 @@ class WorkerBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Fluke 8845A 科研测量与长期记录")
+        frozen = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+        build_label = desktop_build_label(Path(sys.executable), __version__, frozen=frozen)
+        self._base_window_title = f"Fluke 8845A 科研测量与长期记录 · {build_label}"
+        self.setWindowTitle(self._base_window_title)
         screen = QApplication.primaryScreen()
         if screen is not None:
             area = screen.availableGeometry()
@@ -798,11 +1271,12 @@ class MainWindow(QMainWindow):
         self._control_mode = "disconnected"
         self._control_mode_switch_pending = False
         self._simulation = False
+        self._instrument_mode_readback: Mode | None = None
         self._connected_mock_scenario = ""
         self._instrument_mode_known = False
         self._active_settings_by_mode: dict[str, dict] = {}
         self._firmware = ""
-        self._idn_firmware = ""
+        self._idn_version_candidate = ""
         self._device_serial = ""
         self._terminals = ""
         self._loading_mode_controls = False
@@ -811,6 +1285,8 @@ class MainWindow(QMainWindow):
         self._paused = False
         self._speed_update_pending = False
         self._diagnostic_pending = False
+        self._configure_pending = False
+        self._zero_pending = False
         self._start_pending = False
         self._connection_pending = False
         self._connection_stage_status: dict[str, tuple[str, str]] = {}
@@ -827,24 +1303,41 @@ class MainWindow(QMainWindow):
         self._latest_invalid_log_text = ""
         self._last_acquisition_issue = ""
         self._baseline: float | None = None
-        self._plot_x: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
-        self._plot_y: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
-        self._plot_metadata: deque[dict] = deque(maxlen=MAX_PLOT_POINTS)
-        self._plot_break_before: deque[bool] = deque(maxlen=MAX_PLOT_POINTS)
+        self._plot_x: deque[float] = deque()
+        self._plot_y: deque[float] = deque()
+        self._plot_y_anchor_x = np.asarray([], dtype=float)
+        self._plot_y_anchor_values = np.asarray([], dtype=float)
+        self._plot_y_origin: float | None = None
+        self._plot_x_nondecreasing = True
+        self._plot_x_uniformly_spaced = True
+        self._last_plot_zoom_limit_notice_s = 0.0
+        self._plot_metadata: deque[dict] = deque()
+        self._plot_break_before: deque[bool] = deque()
         self._plot_break_pending = False
         self._live_plot_snapshot: dict | None = None
         self._history_mode = False
+        self._history_overview_data: dict | None = None
+        self._history_detail_range: tuple[float, float] | None = None
+        self._history_detail_is_downsampled = False
+        self._history_range_sequence = 0
+        self._history_range_pending = False
+        self._history_range_task: _HistoryRangeLoadTask | None = None
+        self._active_history_range_tasks: dict[int, _HistoryRangeLoadTask] = {}
         self._history_load_pending = False
         self._history_load_task: _HistoryLoadTask | None = None
         self._log_entries: deque[tuple[str, str]] = deque(maxlen=6000)
         self._experiment_csv_path: Path | None = None
         self._snapshot_pending = False
         self._snapshot_task: _CsvSnapshotTask | None = None
+        self._safe_events_export_task: _SafeEventsExportTask | None = None
         self._safe_measurements_export_task: _SafeMeasurementsExportTask | None = None
+        self._share_export_task: _SharePackageExportTask | None = None
         self._region_stats_request_id = 0
         self._region_stats_tasks: dict[int, _RegionStatisticsTask] = {}
         self._region_stats_scanning = False
         self._region_stats_pending_rows: list[dict] = []
+        self._region_stats_pending_overflow = False
+        self._region_stats_mode: Mode | None = None
         self._region_stats_values: RunningStats | None = None
         self._region_stats_last_sample_index = 0
         self._region_stats_bounds: tuple[float, float] | None = None
@@ -858,6 +1351,8 @@ class MainWindow(QMainWindow):
         self._selected_plot_metadata: dict | None = None
         self._shutdown_started = False
         self._shutdown_finished = False
+        self._shutdown_file_errors: list[str] = []
+        self._shutdown_file_errors_reported = False
 
         self._worker_thread = QThread(self)
         self._worker_thread.finished.connect(self._on_worker_thread_finished)
@@ -878,12 +1373,16 @@ class MainWindow(QMainWindow):
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_elapsed_label)
         self._clock_timer.start(250)
+        self._history_range_timer = QTimer(self)
+        self._history_range_timer.setSingleShot(True)
+        self._history_range_timer.setInterval(180)
+        self._history_range_timer.timeout.connect(self._load_history_detail_for_view)
         self.statusBar().showMessage("未连接。请确认仪器处于RS-232 / COMPUTER模式。")
         if self._config_fallback:
             self.statusBar().showMessage("用户配置目录不可写；参数暂存于临时目录。检查权限后重启可恢复持久化。", 15000)
 
     def _wire_worker(self) -> None:
-        self._bridge.connect_real.connect(self._worker.connect_real)
+        self._bridge.connect_real.connect(self._worker.connect_real_with_profiles)
         self._bridge.connect_mock.connect(self._worker.connect_mock)
         self._bridge.set_control_mode.connect(self._worker.set_control_mode)
         self._bridge.set_firmware_versions.connect(self._worker.set_firmware_versions)
@@ -1055,7 +1554,7 @@ class MainWindow(QMainWindow):
         self.experiment_file_list.setObjectName("experimentFileList")
         self.experiment_file_list.setAccessibleName("当前实验文件和导出结果")
         files_layout.addWidget(self.experiment_file_list, 1)
-        files_actions = QHBoxLayout()
+        files_actions = QGridLayout()
         self.refresh_files_button = QPushButton("刷新列表")
         self.refresh_files_button.clicked.connect(self._refresh_file_workspace)
         self.files_open_directory_button = QPushButton("打开目录")
@@ -1073,17 +1572,24 @@ class MainWindow(QMainWindow):
             "仅处理原始响应和错误文本；原始 measurements.csv 保持不变。请停止采集后导出。"
         )
         self.files_safe_measurements_button.clicked.connect(self._export_safe_measurements_csv)
+        self.files_share_package_button = QPushButton("\u5bfc\u51fa\u8131\u654f\u5206\u4eab\u5305")
+        self.files_share_package_button.setToolTip(
+            "生成脱敏分享包（独立 ZIP 副本）：保留 8845A 型号、实验配置和有效数值；数值列中的非数值文本会脱敏。隐藏序列号、COM 口及本机路径；"
+            "只包含 config.json、measurements.csv 和可选 events.csv，不含 run.log。CSV 中公式样式文本会加文本前缀，原始实验文件不修改。"
+        )
+        self.files_share_package_button.clicked.connect(self._export_share_package)
         self.files_close_button = QPushButton("关闭")
         self.files_close_button.clicked.connect(self.files_dialog.hide)
-        for button in (
+        for index, button in enumerate((
             self.refresh_files_button, self.files_open_directory_button,
             self.files_copy_path_button, self.files_load_history_button,
             self.files_snapshot_button, self.files_safe_events_button,
             self.files_safe_measurements_button,
+            self.files_share_package_button,
             self.files_close_button,
-        ):
+        )):
             button.setProperty("class", "secondaryButton")
-            files_actions.addWidget(button)
+            files_actions.addWidget(button, index // 4, index % 4)
         files_layout.addLayout(files_actions)
         self._refresh_file_workspace()
 
@@ -1129,6 +1635,7 @@ class MainWindow(QMainWindow):
         if section == "files":
             self.configuration_dialog.hide()
             self._refresh_file_workspace()
+            _fit_dialog_to_available_geometry(self.files_dialog)
             self.files_dialog.show()
             self.files_dialog.raise_()
             self.files_dialog.activateWindow()
@@ -1159,8 +1666,10 @@ class MainWindow(QMainWindow):
             if screen is None:
                 return
             available = screen.availableGeometry()
-        max_width = max(1, available.width() - 24)
-        max_height = max(1, available.height() - 72)
+        # Reserve space for native title-bar and frame pixels so the outer
+        # frame, not only the client area, remains inside the work area.
+        max_width = max(1, available.width() - 32)
+        max_height = max(1, available.height() - 80)
         min_width = min(760, max_width)
         min_height = min(520, max_height)
         dialog = self.configuration_dialog
@@ -1251,6 +1760,7 @@ class MainWindow(QMainWindow):
 
         self.connect_button = QPushButton("连接真实仪器")
         self.connect_button.setObjectName("primaryButton")
+        self.connect_button.setProperty("connectionTarget", "instrument")
         self.disconnect_button = QPushButton("断开")
         self.disconnect_button.setObjectName("secondaryButton")
         self.disconnect_button.setEnabled(False)
@@ -1266,8 +1776,8 @@ class MainWindow(QMainWindow):
         self.idn_label.setWordWrap(True)
         self.idn_label.setObjectName("secondaryText")
         self.idn_label.setToolTip(
-            "8845A/8846A模式的*IDN?第四字段常为日期/时间修订标记，不一定是软件版本。"
-            "SYST:VERS?返回SCPI命令版本，不是仪器固件。请在仪表面板查看软件版本。"
+            "*IDN?第四字段可由用户自定义；即使其中有可解析的点分数字，也不能证明它是 OutG SW。"
+            "SYST:VERS?返回SCPI命令版本，不是仪器固件。400 mA门槛只依据人工核对的面板 OutG SW。"
         )
         form.addRow("识别结果", self.idn_label)
         self.connection_stages_label = QLabel("设备 待开始 · 串口 待开始 · 8845A 待开始 · 配置 待开始 · 就绪 待开始")
@@ -1286,7 +1796,7 @@ class MainWindow(QMainWindow):
         self.outguard_sw_edit.setPlaceholderText("面板核对，例如 2.10.882.24")
         self.outguard_sw_edit.setToolTip(
             "从仪器前面板 INSTR SETUP → SYSTEM → VERSIONS + SN 读取，并按仪器序列号保存在本机。"
-            "只有*IDN?没有可解析的软件版本时，才用此 OutG SW 判断400 mA门槛；未知或无法解析不会限制量程。"
+            "*IDN?修订字段可能是用户自定义内容，不用它判断固件。400 mA门槛只依据此处人工核对的 OutG SW；未知或无法解析不会限制量程。"
             "这是人工核对记录，不是通过SCPI读取。"
         )
         self.inguard_sw_edit = QLineEdit()
@@ -1294,7 +1804,7 @@ class MainWindow(QMainWindow):
         self.inguard_sw_edit.setPlaceholderText("可选记录，例如 ad300210")
         self.inguard_sw_edit.setToolTip(
             "可选记录同一前面板版本页显示的 InG SW，并随实验配置保存。"
-            "400 mA固件门槛只依据*IDN?或已核对的 OutG SW，不依据 InG SW。"
+            "InG SW不参与400 mA门槛判断；该门槛只依据人工核对的 OutG SW。"
         )
         self.outguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
         self.inguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
@@ -1317,8 +1827,9 @@ class MainWindow(QMainWindow):
         self.control_mode_combo.addItem("Local · 面板操作", "local")
         control_mode_help = (
             "Computer：软件可发送SCPI命令、设置仪表并采集；仪表的RS-232接口协议仍须单独设为COMPUTER。\n"
-            "Local：把控制权交给仪表面板；软件停用测量、参数设置、诊断和ZERO，串口连接保留，"
-            "也无法回读面板改动的设置。只能在停止采集后切换；切回Computer时会重新读取仪表配置。"
+            "Local：软件发送 SYST:LOC 请求后停用测量、参数设置、诊断和ZERO，串口连接保留；"
+            "仪表不提供 Local 状态的 SCPI 回读，请核对面板。只能在停止采集后切换；"
+            "切回Computer时会重新读取仪表配置。"
         )
         self.control_mode_combo.setToolTip(control_mode_help)
         self.control_mode_label = QLabel("控制方式")
@@ -1556,7 +2067,7 @@ class MainWindow(QMainWindow):
         self.zero_result_label.setObjectName("zeroResultLabel")
         self.zero_result_label.setWordWrap(True)
         self.zero_result_label.hide()
-        mode_form.addRow("ZERO结果", self.zero_result_label)
+        mode_form.addRow("ZERO执行反馈", self.zero_result_label)
         self.safety_text = QLabel()
         self.safety_text.setObjectName("safetyBox")
         self.safety_text.setWordWrap(True)
@@ -1572,7 +2083,7 @@ class MainWindow(QMainWindow):
         self.experiment_name = QLineEdit(f"实验_{datetime.now().strftime('%Y%m%d_%H%M')}")
         self.experiment_name.textChanged.connect(self._validate_experiment_name_field)
         exp_form.addRow("实验名称", self.experiment_name)
-        self.experiment_name_validation = QLabel("名称有效；重复实验会使用独立时间戳目录，不会覆盖旧数据。")
+        self.experiment_name_validation = QLabel("名称有效；如有同名实验，可选择先备份再覆盖、另存目录或改名。")
         self.experiment_name_validation.setObjectName("fieldHint")
         self.experiment_name_validation.setWordWrap(True)
         exp_form.addRow("", self.experiment_name_validation)
@@ -1582,8 +2093,10 @@ class MainWindow(QMainWindow):
         exp_form.addRow("采集预检", self.preflight_status)
         self.experiment_name.textChanged.connect(lambda _text: self._reset_preflight_status())
         default_root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)) / "Fluke8845A_Experiments"
-        self.output_root = QLineEdit(str(default_root))
+        saved_root = self._profiles.get("output_root", "")
+        self.output_root = QLineEdit(saved_root or str(default_root))
         self.output_root.textChanged.connect(lambda _text: self._reset_preflight_status())
+        self.output_root.editingFinished.connect(self._save_profiles)
         browse = QPushButton("选择")
         browse.setObjectName("secondaryButton")
         browse.clicked.connect(self._choose_output_root)
@@ -1791,6 +2304,7 @@ class MainWindow(QMainWindow):
         status_tile.setObjectName("metricCell")
         status_tile.setMinimumWidth(132)
         status_layout = QVBoxLayout(status_tile)
+        self._status_metric_layout = status_layout
         status_layout.setContentsMargins(10, 7, 10, 7)
         status_layout.setSpacing(3)
         status_layout.addWidget(self._status_caption)
@@ -1803,12 +2317,16 @@ class MainWindow(QMainWindow):
         self.latest_invalid_label.setObjectName("latestInvalidLabel")
         self.latest_invalid_label.setWordWrap(True)
         self.latest_invalid_label.setToolTip("采集中的无效读数及其原因会显示在这里")
-        status_layout.addWidget(self.latest_invalid_label)
+        self.latest_invalid_row = QHBoxLayout()
+        self.latest_invalid_row.setContentsMargins(0, 0, 0, 0)
+        self.latest_invalid_row.setSpacing(4)
+        self.latest_invalid_row.addWidget(self.latest_invalid_label, 1)
         self.latest_invalid_log_button = QPushButton("查看异常日志")
         self.latest_invalid_log_button.setObjectName("secondaryButton")
         self.latest_invalid_log_button.setEnabled(False)
         self.latest_invalid_log_button.clicked.connect(self._jump_to_latest_invalid_log)
-        status_layout.addWidget(self.latest_invalid_log_button)
+        self.latest_invalid_row.addWidget(self.latest_invalid_log_button, 0)
+        status_layout.addLayout(self.latest_invalid_row)
         self.recovery_hint_label = QLabel("")
         self.recovery_hint_label.setObjectName("recoveryHintLabel")
         self.recovery_hint_label.setWordWrap(True)
@@ -1820,6 +2338,7 @@ class MainWindow(QMainWindow):
         rate_tile.setObjectName("metricCell")
         rate_tile.setMinimumWidth(104)
         rate_layout = QVBoxLayout(rate_tile)
+        self._rate_metric_layout = rate_layout
         rate_layout.setContentsMargins(10, 7, 10, 7)
         rate_layout.setSpacing(3)
         rate_layout.addWidget(self._rate_caption)
@@ -1827,8 +2346,10 @@ class MainWindow(QMainWindow):
         elapsed_tile = QFrame()
         elapsed_tile.setObjectName("elapsedMetric")
         elapsed_tile.setObjectName("metricCell")
+        self._elapsed_tile = elapsed_tile
         elapsed_tile.setMinimumWidth(112)
         elapsed_layout = QVBoxLayout(elapsed_tile)
+        self._elapsed_metric_layout = elapsed_layout
         elapsed_layout.setContentsMargins(10, 7, 10, 7)
         elapsed_layout.setSpacing(3)
         elapsed_layout.addWidget(self._elapsed_caption)
@@ -1845,9 +2366,11 @@ class MainWindow(QMainWindow):
         self._metrics_layout = reading_layout
         self._reading_layout_mode = None
         self._short_chart_layout = None
+        self._short_viewport_layout = None
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
+        self._action_bar = action_bar
         action_layout = QHBoxLayout(action_bar)
         self._action_layout = action_layout
         action_layout.setContentsMargins(10, 7, 10, 7)
@@ -1918,6 +2441,38 @@ class MainWindow(QMainWindow):
         self.screenshot_button.setObjectName("secondaryButton")
         self.screenshot_button.clicked.connect(self._save_screenshot)
         plot_toolbar_layout.addWidget(self.screenshot_button, 0, 8)
+        self.y_axis_span_control = QWidget(plot_toolbar)
+        self.y_axis_span_control.setObjectName("yAxisSpanControl")
+        y_axis_span_layout = QHBoxLayout(self.y_axis_span_control)
+        y_axis_span_layout.setContentsMargins(0, 0, 0, 0)
+        y_axis_span_layout.setSpacing(5)
+        y_axis_span_label = QLabel("纵轴跨度")
+        y_axis_span_label.setObjectName("secondaryText")
+        y_axis_span_label.setToolTip(
+            "范围按右侧单位输入；例如单位为 Ω 时，1e-6 表示 1 µΩ。"
+            "最小跨度受计算机浮点精度限制，放大不会提升仪表分辨率；"
+            "只改变图表显示，不修改原始读数。"
+        )
+        self.y_axis_span_edit = QLineEdit()
+        self.y_axis_span_edit.setObjectName("yAxisSpanEdit")
+        self.y_axis_span_edit.setFixedWidth(112)
+        self.y_axis_span_edit.setPlaceholderText("例如 1e-6")
+        self.y_axis_span_edit.setToolTip(
+            "范围按右侧单位输入；例如单位为 Ω 时，1e-6 表示 1 µΩ。"
+            "最小跨度受计算机浮点精度限制，放大不会提升仪表分辨率；"
+            "只改变图表显示，不修改原始读数。"
+        )
+        self.y_axis_span_unit_label = QLabel("V")
+        self.y_axis_span_unit_label.setObjectName("secondaryText")
+        self.apply_y_axis_span_button = QPushButton("应用")
+        self.apply_y_axis_span_button.setObjectName("secondaryButton")
+        self.apply_y_axis_span_button.setToolTip("按输入跨度缩放纵轴，并保持当前纵轴中心")
+        y_axis_span_layout.addWidget(y_axis_span_label)
+        y_axis_span_layout.addWidget(self.y_axis_span_edit)
+        y_axis_span_layout.addWidget(self.y_axis_span_unit_label)
+        y_axis_span_layout.addWidget(self.apply_y_axis_span_button)
+        self.apply_y_axis_span_button.clicked.connect(self._apply_plot_y_span)
+        self.y_axis_span_edit.returnPressed.connect(self._apply_plot_y_span)
         self._plot_toolbar_widgets = (
             self.follow_check,
             self.view_mode_label,
@@ -1932,7 +2487,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(plot_toolbar)
 
         self.chart_gesture_help = QLabel(
-            "滚轮缩放读数轴（纵轴）；Shift+滚轮缩放时间轴；Ctrl+滚轮同时缩放两轴；"
+            "图表内滚轮向上缩小读数轴（纵轴）跨度，向下放大；"
+            "Shift+滚轮缩放时间轴；Ctrl+滚轮同时缩放两轴；"
             "Alt+滚轮以零点为锚缩放读数轴。拖动曲线可平移，点击曲线可锁定读数点；"
             "聚焦图表后按方向键选点，Enter将锁定点设为基准；Shift+方向键平移，"
             "PageUp/PageDown缩放，Ctrl缩放时间轴，Alt缩放读数轴。手动缩放任一坐标轴或平移时间轴会停止自动跟随；"
@@ -1955,6 +2511,14 @@ class MainWindow(QMainWindow):
         self.view_box = _MeasurementViewBox()
         self.plot_widget = _MeasurementPlotWidget(view_box=self.view_box)
         self.plot_widget.setObjectName("trendPlot")
+        wheel_tooltip = (
+            "图表内滚轮向上缩小纵轴跨度，优先以鼠标横坐标附近的实测点为锚；无有效曲线时以视区中心为锚，向下放大；"
+            "Shift+滚轮缩放时间轴；Ctrl+滚轮同时缩放两轴；Alt+滚轮以零点为锚缩放纵轴。"
+            "纵轴单位随当前显示跨度采用工程前缀；相对刻度会标明参考读数。"
+            "缩放只改变图表显示，不修改原始读数。"
+        )
+        self.plot_widget.setToolTip(wheel_tooltip)
+        self.plot_widget.viewport().setToolTip(wheel_tooltip)
         self.plot_widget.key_handler = self._handle_plot_key
         self.plot_widget.setMinimumHeight(230)
         self.plot_widget.setBackground("#fbf9f1")
@@ -1964,14 +2528,20 @@ class MainWindow(QMainWindow):
         legend = self.plot_widget.addLegend(offset=(12, 8))
         legend.setLabelTextColor("#526064")
         self.curve = self.plot_widget.plot([], [], pen=pg.mkPen("#138b92", width=2.2), name="原始读数")
+        self.view_box.y_anchor_provider = self._plot_y_zoom_anchor_at_x
         plot_item = self.plot_widget.getPlotItem()
+        self.y_axis = plot_item.getAxis("left")
         for axis_name in ("left", "bottom"):
             axis = plot_item.getAxis(axis_name)
             axis.setTextPen(pg.mkPen("#526064"))
             axis.setPen(pg.mkPen("#96a09a"))
             axis.setTickFont(QFont("Microsoft YaHei UI", 10))
         plot_item.vb.sigRangeChanged.connect(self._position_event_labels)
+        plot_item.vb.sigRangeChanged.connect(self._sync_plot_y_axis)
+        plot_item.vb.sigRangeChanged.connect(self._sync_plot_y_span_control)
         self.view_box.userZoomed.connect(self._on_plot_wheel_zoom)
+        self.view_box.yZoomLimitReached.connect(self._on_plot_y_zoom_limit_reached)
+        self.view_box.rebaseRequested.connect(self._rebase_plot_for_zoom)
         self.view_box.sigRangeChangedManually.connect(self._on_plot_range_changed_manually)
         plot_item.setMenuEnabled(False)
         plot_item.vb.setMouseEnabled(x=True, y=True)
@@ -2156,6 +2726,14 @@ class MainWindow(QMainWindow):
         self.export_events_safe_button = QPushButton("导出表格软件安全副本…")
         self.export_events_safe_button.setToolTip("仅处理自由文本事件列；原始 events.csv 保持不变。请停止采集后导出。")
         self.export_events_safe_button.clicked.connect(self._export_safe_events_csv)
+        self.event_csv_safety_warning = QLabel(
+            "安全提醒：原始 events.csv 保留事件原文。以 =、+、-、@ 开头的事件，"
+            "在 Excel 等表格软件中可能被解释为公式。打开或分享前请导出表格软件安全副本；原始文件不会修改。"
+        )
+        self.event_csv_safety_warning.setObjectName("warningBanner")
+        self.event_csv_safety_warning.setWordWrap(True)
+        self.event_csv_safety_warning.setAccessibleName("事件 CSV 公式风险提示")
+        event_layout.addWidget(self.event_csv_safety_warning)
         event_layout.addWidget(self.export_events_safe_button)
         event_layout.addStretch(1)
         self.analysis_tabs.addTab(event_tab, "实验事件")
@@ -2177,11 +2755,21 @@ class MainWindow(QMainWindow):
         workspace_height = self.measurement_workspace.height()
         mode = "stacked" if workspace_width < 620 else "compact" if workspace_width < 820 else "wide"
         short_chart = workspace_height < 620
-        if mode == self._reading_layout_mode and short_chart == self._short_chart_layout:
+        # At 150% scaling a 1366×768 display leaves roughly 370 logical
+        # pixels for this workspace after Windows and app chrome. Enter the
+        # compact vertical layout before labels and toolbar controls are
+        # compressed below their readable minimums.
+        short_viewport = 0 < workspace_height < 420
+        if (
+            mode == self._reading_layout_mode
+            and short_chart == self._short_chart_layout
+            and short_viewport == self._short_viewport_layout
+        ):
             self._update_plot_toolbar_layout()
             return
         self._reading_layout_mode = mode
         self._short_chart_layout = short_chart
+        self._short_viewport_layout = short_viewport
         narrow = mode != "wide"
         self._reading_layout.setSpacing(12 if narrow else 20)
         self._metrics_layout.setSpacing(4 if narrow else 6)
@@ -2189,27 +2777,100 @@ class MainWindow(QMainWindow):
         self._rate_caption.setText("实测采样间隔")
         self._elapsed_caption.setText("历时" if narrow else "实验历时")
         self._reading_card.setProperty("compact", narrow)
+        self._reading_card.setProperty("short", short_viewport)
         stacked = mode == "stacked"
         self._reading_card.setProperty("stacked", stacked)
-        self._reading_kicker.setVisible(not stacked)
+        # Qt stylesheets do not always refresh descendant selectors when only
+        # an ancestor's dynamic property changes. Mark the responsive labels
+        # directly so their font sizes and size hints update at short heights.
+        for widget in (
+            self._reading_kicker,
+            self.reading_mode_label,
+            self.latest_value_label,
+            self.valid_sample_count_label,
+            self._status_caption,
+            self.status_dot,
+            self.experiment_status,
+            self.latest_invalid_label,
+            self._rate_caption,
+            self.actual_rate_label,
+            self._elapsed_caption,
+            self.elapsed_label,
+            self.recovery_hint_label,
+        ):
+            widget.setProperty("short", short_viewport)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.updateGeometry()
+        self._reading_kicker.setVisible(not stacked and not short_viewport)
         self._reading_layout.setSpacing(6 if stacked else 12 if narrow else 20)
-        if stacked:
+        if short_viewport:
+            self._reading_layout.setContentsMargins(5, 2, 5, 2)
+            for metric_layout in (
+                self._status_metric_layout,
+                self._rate_metric_layout,
+                self._elapsed_metric_layout,
+            ):
+                metric_layout.setContentsMargins(5, 3, 5, 3)
+                metric_layout.setSpacing(1)
+            self._status_tile.setMinimumWidth(108)
+            self._rate_tile.setMinimumWidth(86)
+            self._elapsed_tile.setMinimumWidth(88)
+            self.latest_invalid_label.setWordWrap(False)
+            self.latest_invalid_label.setMaximumHeight(19)
+            self.latest_invalid_label.setVisible(bool(self._latest_invalid_log_text))
+            self.latest_invalid_log_button.setText("日志")
+            self.latest_invalid_log_button.setFixedSize(36, 20)
+            self.latest_invalid_log_button.setVisible(bool(self._latest_invalid_log_text))
+            self.recovery_hint_label.setWordWrap(False)
+            self.recovery_hint_label.setMaximumHeight(19)
+        elif stacked:
             self._reading_layout.setContentsMargins(12, 6, 12, 6)
         else:
             self._reading_layout.setContentsMargins(18, 14, 18, 14)
-        self._reading_text_layout.setSpacing(1 if stacked else 3)
-        self._chart_panel_layout.setSpacing(5 if stacked or short_chart else 9)
+        if not short_viewport:
+            for metric_layout in (
+                self._status_metric_layout,
+                self._rate_metric_layout,
+                self._elapsed_metric_layout,
+            ):
+                metric_layout.setContentsMargins(10, 7, 10, 7)
+                metric_layout.setSpacing(3)
+            self._status_tile.setMinimumWidth(132)
+            self._rate_tile.setMinimumWidth(104)
+            self._elapsed_tile.setMinimumWidth(112)
+            self.latest_invalid_label.setWordWrap(True)
+            self.latest_invalid_label.setMaximumHeight(16777215)
+            self.latest_invalid_label.show()
+            self.latest_invalid_log_button.setText("查看异常日志")
+            self.latest_invalid_log_button.setMinimumSize(0, 0)
+            self.latest_invalid_log_button.setMaximumSize(16777215, 16777215)
+            self.latest_invalid_log_button.setVisible(bool(self._latest_invalid_log_text))
+            self.recovery_hint_label.setWordWrap(True)
+            self.recovery_hint_label.setMaximumHeight(16777215)
+        if short_viewport and self.recovery_hint_label.toolTip():
+            self.recovery_hint_label.setText("采集已停止 · 悬停查看")
+        elif not short_viewport and self.recovery_hint_label.toolTip():
+            self.recovery_hint_label.setText(self.recovery_hint_label.toolTip())
+        if self._latest_invalid_log_text:
+            self._update_latest_invalid_summary()
+        self._reading_text_layout.setSpacing(1 if stacked or short_viewport else 3)
+        self._chart_panel_layout.setSpacing(3 if short_viewport else 5 if stacked or short_chart else 9)
         if stacked or short_chart:
             self._action_layout.setContentsMargins(10, 4, 10, 4)
         else:
             self._action_layout.setContentsMargins(10, 7, 10, 7)
         compact_chart = stacked or short_chart
         self._action_layout.setSpacing(4 if compact_chart else 8)
-        self.plot_widget.setMinimumHeight(170 if compact_chart else 230)
-        self._plot_frame.setMinimumHeight(172 if compact_chart else 232)
+        self._action_bar.setProperty("short", short_viewport)
+        self._action_bar.style().unpolish(self._action_bar)
+        self._action_bar.style().polish(self._action_bar)
+        self.plot_widget.setMinimumHeight(108 if short_viewport else 170 if compact_chart else 230)
+        self._plot_frame.setMinimumHeight(110 if short_viewport else 172 if compact_chart else 232)
         self._reading_card.style().unpolish(self._reading_card)
         self._reading_card.style().polish(self._reading_card)
         self._reading_card.updateGeometry()
+        self._reading_card.setMaximumHeight(98 if short_viewport else 16777215)
         self.measurement_workspace.updateGeometry()
         self._reading_layout.setDirection(
             QBoxLayout.Direction.TopToBottom if mode == "stacked" else QBoxLayout.Direction.LeftToRight
@@ -2219,11 +2880,45 @@ class MainWindow(QMainWindow):
         )
         self._update_plot_toolbar_layout()
 
+    def _update_latest_invalid_summary(self) -> None:
+        """Keep the compact status card's error cause readable beside its log link."""
+        if not self._latest_invalid_log_text:
+            return
+        detail = self.latest_invalid_label.toolTip()
+        if not self._short_viewport_layout:
+            self.latest_invalid_label.setText(detail)
+            self.latest_invalid_log_button.setText("查看异常日志")
+            return
+
+        # In the short layout keep a concise, visible cause; the full status and
+        # device error remain available from the tooltip and the log viewer.
+        status = ""
+        if "：" in detail and " · " in detail:
+            status = detail.split("：", 1)[1].split(" · ", 1)[0].strip()
+        status_labels = {
+            "timeout": "串口超时",
+            "scpi_timeout": "SCPI超时",
+            "parse_error": "解析失败",
+            "invalid": "无效响应",
+        }
+        cause = status_labels.get(status, status or "数据无效")
+        sample = ""
+        if "#" in detail:
+            sample = detail.split("#", 1)[1].split("：", 1)[0]
+        summary = f"{cause} · #{sample}" if sample else cause
+        available_width = max(1, self.latest_invalid_label.contentsRect().width())
+        summary = QFontMetrics(self.latest_invalid_label.font()).elidedText(
+            summary, Qt.TextElideMode.ElideRight, available_width,
+        )
+        self.latest_invalid_label.setText(summary)
+        self.latest_invalid_log_button.setText("日志")
+
     def _update_plot_toolbar_layout(self) -> None:
         if not hasattr(self, "_plot_toolbar_layout"):
             return
         width = self.plot_toolbar.width()
-        mode = "wide" if width >= 1080 else "compact" if width >= 820 else "narrow"
+        short_viewport = bool(getattr(self, "_short_viewport_layout", False))
+        mode = "short" if short_viewport else "wide" if width >= 1080 else "compact" if width >= 820 else "narrow"
         if mode == self._plot_toolbar_mode:
             return
         self._plot_toolbar_mode = mode
@@ -2232,19 +2927,32 @@ class MainWindow(QMainWindow):
             toolbar_layout.takeAt(0)
         for column in range(9):
             toolbar_layout.setColumnStretch(column, 0)
-        toolbar_layout.setHorizontalSpacing(4 if mode == "narrow" else 8)
-        toolbar_layout.setVerticalSpacing(3 if mode == "narrow" else 5)
-        self.plot_toolbar.setProperty("narrow", mode == "narrow")
+        toolbar_layout.setHorizontalSpacing(3 if mode in {"narrow", "short"} else 8)
+        toolbar_layout.setVerticalSpacing(2 if mode == "short" else 3 if mode == "narrow" else 5)
+        self.plot_toolbar.setProperty("narrow", mode in {"narrow", "short"})
+        self.plot_toolbar.setProperty("short", mode == "short")
         self.plot_toolbar.style().unpolish(self.plot_toolbar)
         self.plot_toolbar.style().polish(self.plot_toolbar)
         widgets = self._plot_toolbar_widgets
+        for widget in self.plot_toolbar.findChildren(QWidget):
+            widget.setProperty("short", mode == "short")
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.updateGeometry()
         follow, view_mode, hint, gestures, source, autoscale, live, history, screenshot = widgets
-        hint.setWordWrap(mode != "wide")
+        hint.setVisible(mode != "short")
+        hint.setWordWrap(mode not in {"wide", "short"})
         if mode == "wide":
             for column, widget in enumerate(widgets):
                 toolbar_layout.addWidget(widget, 0, column)
             toolbar_layout.setColumnStretch(2, 1)
             toolbar_layout.setColumnStretch(4, 1)
+            toolbar_layout.addWidget(self.y_axis_span_control, 1, 0, 1, 9)
+        elif mode == "short":
+            for column, widget in enumerate((follow, view_mode, source, autoscale, live, history, screenshot, gestures)):
+                toolbar_layout.addWidget(widget, 0, column)
+            toolbar_layout.addWidget(self.y_axis_span_control, 1, 0, 1, 8)
+            toolbar_layout.setColumnStretch(1, 1)
         else:
             toolbar_layout.addWidget(follow, 0, 0)
             toolbar_layout.addWidget(view_mode, 0, 1)
@@ -2253,16 +2961,32 @@ class MainWindow(QMainWindow):
                 toolbar_layout.addWidget(widget, 0, column)
             toolbar_layout.addWidget(hint, 1, 0, 1, 6)
             toolbar_layout.addWidget(gestures, 1, 6)
+            toolbar_layout.addWidget(self.y_axis_span_control, 2, 0, 1, 7)
             toolbar_layout.setColumnStretch(1, 1)
         self.plot_toolbar.updateGeometry()
 
     def _on_plot_wheel_zoom(self, zoom_x: bool, zoom_y: bool) -> None:
         if zoom_x or zoom_y:
             self.follow_check.setChecked(False)
+        if zoom_x:
+            self._schedule_history_detail_reload()
+
+    def _on_plot_y_zoom_limit_reached(self, span: float) -> None:
+        now = time.monotonic()
+        if now - self._last_plot_zoom_limit_notice_s < 2.0:
+            return
+        self._last_plot_zoom_limit_notice_s = now
+        unit = self.y_axis_span_unit_label.text() if hasattr(self, "y_axis_span_unit_label") else ""
+        self.statusBar().showMessage(
+            f"纵轴已达到当前浮点精度下限，实际跨度 {span:.8g} {unit}；继续向上滚动不会继续缩小。"
+            "自动缩放可恢复数据范围，原始读数不变。",
+            6000,
+        )
 
     def _on_plot_range_changed_manually(self, axes) -> None:
         if axes and axes[0]:
             self.follow_check.setChecked(False)
+            self._schedule_history_detail_reload()
 
     def _on_follow_toggled(self, enabled: bool) -> None:
         if hasattr(self, "view_mode_label"):
@@ -2289,30 +3013,35 @@ class MainWindow(QMainWindow):
     def _pan_plot(self, dx_fraction: float, dy_fraction: float) -> None:
         x_range, y_range = self.view_box.viewRange()
         x_span = max(1e-12, x_range[1] - x_range[0])
-        y_span = max(1e-12, y_range[1] - y_range[0])
-        new_x = (x_range[0] + dx_fraction * x_span, x_range[1] + dx_fraction * x_span)
-        new_y = (y_range[0] + dy_fraction * y_span, y_range[1] + dy_fraction * y_span)
-        self.view_box.setRange(
-            xRange=new_x if dx_fraction else None,
-            yRange=new_y if dy_fraction else None,
-            padding=0,
+        y_span = y_range[1] - y_range[0]
+        self.view_box.translateBy(
+            x=dx_fraction * x_span if dx_fraction else None,
+            y=dy_fraction * y_span if dy_fraction else None,
         )
         if dx_fraction:
             self.follow_check.setChecked(False)
+            self._schedule_history_detail_reload()
 
     def _zoom_plot(self, factor: float, *, zoom_x: bool, zoom_y: bool) -> None:
+        if zoom_y:
+            self.view_box.enableAutoRange(y=False)
         x_range, y_range = self.view_box.viewRange()
-
-        def scaled_range(bounds: list[float]) -> tuple[float, float]:
-            center = (bounds[0] + bounds[1]) / 2
-            half_span = max(1e-15, (bounds[1] - bounds[0]) * factor / 2)
-            return center - half_span, center + half_span
-
-        self.view_box.setRange(
-            xRange=scaled_range(x_range) if zoom_x else None,
-            yRange=scaled_range(y_range) if zoom_y else None,
-            padding=0,
+        center = QPointF(
+            (x_range[0] + x_range[1]) / 2,
+            (y_range[0] + y_range[1]) / 2,
         )
+        if zoom_x:
+            self.view_box.scaleBy(x=factor, center=center)
+        if zoom_y:
+            reference = max(abs(center.y()), abs(y_range[0]), abs(y_range[1]))
+            floor = math.ulp(reference)
+            if factor < 1.0 and (y_range[1] - y_range[0]) * factor < floor * 16:
+                old_origin = self._plot_y_origin or 0.0
+                target_origin = old_origin + center.y()
+                if math.isfinite(target_origin):
+                    self._rebase_plot_y_origin(target_origin)
+                    center.setY(0.0)
+            self.view_box._scale_y_by(factor, center.y())
         self._on_plot_wheel_zoom(zoom_x, zoom_y)
 
     def _handle_plot_key(self, event) -> bool:
@@ -2455,22 +3184,25 @@ class MainWindow(QMainWindow):
             QScrollArea { background: transparent; border: 0; }
             QTabWidget#setupTabs::pane, QTabWidget#analysisTabs::pane { background: transparent; border: 0; }
             QTabWidget#setupTabs QTabBar::tab, QTabWidget#analysisTabs QTabBar::tab {
-                background: transparent; color: #697579; border: 0; border-bottom: 2px solid transparent; padding: 8px 14px; margin-right: 5px;
+                background: transparent; color: #596762; border: 0; border-bottom: 2px solid transparent; padding: 8px 14px; margin-right: 5px;
             }
             QTabWidget#setupTabs QTabBar::tab:selected, QTabWidget#analysisTabs QTabBar::tab:selected {
                 color: #176d72; font-weight: 700; border-bottom-color: #29aab0;
             }
             QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #273136; }
-            QLabel#subtitle, QLabel#secondaryText { color: #677277; }
+            QLabel#subtitle, QLabel#secondaryText { color: #596762; }
             QWidget#measurementWorkspace QLabel#secondaryText { color: #b7c2bc; }
             QLabel#latestInvalidLabel { color: #f4c579; font-size: 12px; }
+            QLabel#latestInvalidLabel[short="true"] { font-size: 11px; }
             QLabel#recoveryHintLabel { color: #f4c579; font-size: 12px; }
+            QLabel#recoveryHintLabel[short="true"] { font-size: 11px; }
+            QLabel#warningBanner { color: #634411; background: #fff2cc; border: 1px solid #d6ad54; border-radius: 6px; padding: 8px 10px; font-weight: 650; }
             QGroupBox#sidebarCard { background: #faf9f4; border: 1px solid #cbd0c9; border-radius: 8px; margin-top: 12px; padding: 11px 8px 9px; font-weight: 650; }
             QGroupBox#sidebarCard::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #394448; background: #faf9f4; }
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {
                 background: #fffefa; color: #273136; border: 1px solid #bfc7c4; border-radius: 5px; padding: 5px 8px; selection-background-color: #17858b; min-height: 25px;
             }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #17858b; }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus { border: 2px solid #075e63; }
             QPushButton:focus, QToolButton:focus, QCheckBox:focus { border: 2px solid #075e63; }
             QTabWidget QTabBar::tab:focus { border: 2px solid #075e63; border-radius: 4px; }
             QGraphicsView#trendPlot:focus { border: 2px solid #17858b; border-radius: 4px; }
@@ -2483,6 +3215,9 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { color: #99a09e; background: #e7e8e1; border-color: #d1d4cd; }
             QPushButton#primaryButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; }
             QPushButton#primaryButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#primaryButton[connectionTarget="mock"] { background: #8a5d13; border-color: #8a5d13; color: #fff8e6; }
+            QPushButton#primaryButton[connectionTarget="mock"]:hover { background: #704b10; border-color: #704b10; }
+            QPushButton#primaryButton[connectionTarget="mock"]:disabled { background: #5c4a2e; border-color: #6a5a3f; color: #c1b79d; }
             QPushButton#dangerButton { color: #982f2b; border-color: #d6aaa3; background: #fff8f4; }
             QPushButton#secondaryButton { color: #344247; }
             QToolButton[class="secondaryButton"] { background: #faf9f4; color: #344247; border: 1px solid #bfc7c4; border-radius: 5px; padding: 6px 12px; min-height: 25px; }
@@ -2505,6 +3240,16 @@ class MainWindow(QMainWindow):
             QLabel#readingValue { color: #73e2e2; font-family: "Cascadia Mono", Consolas, monospace; font-size: 42px; font-weight: 650; }
             QFrame#readingCard[compact="true"] QLabel#readingValue { font-size: 32px; }
             QFrame#readingCard[stacked="true"] QLabel#readingValue { font-size: 27px; }
+            QFrame#readingCard[short="true"] QLabel#eyebrow { font-size: 11px; }
+            QFrame#readingCard[short="true"] QLabel#readingMode { font-size: 11px; }
+            QFrame#readingCard[short="true"] QLabel#readingValue { font-size: 22px; }
+            QFrame#readingCard[short="true"] QLabel#metricValue,
+            QFrame#readingCard[short="true"] QLabel#statusValue { font-size: 11px; }
+            QLabel#eyebrow[short="true"] { font-size: 11px; }
+            QLabel#readingMode[short="true"] { font-size: 11px; }
+            QLabel#readingValue[short="true"] { font-size: 22px; }
+            QLabel#metricValue[short="true"],
+            QLabel#statusValue[short="true"] { font-size: 11px; }
             QFrame#metricCell { background: #303b3e; border: 1px solid #465458; border-radius: 6px; }
             QFrame#readingCard QFrame#metricCell QLabel#eyebrow { color: #a8b5ae; font-size: 12px; }
             QFrame#readingCard QLabel#metricValue, QFrame#readingCard QLabel#statusValue { color: #f0f0e7; font-size: 13px; font-weight: 700; }
@@ -2516,6 +3261,7 @@ class MainWindow(QMainWindow):
             QFrame#toolbarDivider { color: #596367; }
             QFrame#actionBar { background: #30383c; border: 1px solid #465156; border-radius: 7px; }
             QFrame#actionBar QPushButton { min-height: 30px; }
+            QFrame#actionBar[short="true"] QPushButton { padding: 1px 6px; min-height: 22px; }
             QLabel#targetIntervalLabel { color: #d6ded8; font-size: 12px; }
             QLabel#fastestIntervalLabel { color: #d6ded8; font-size: 12px; }
             QLabel#chartViewMode { color: #d6ded8; font-size: 12px; }
@@ -2523,6 +3269,16 @@ class MainWindow(QMainWindow):
             QCheckBox#chartFollowCheck { color: #d6ded8; font-size: 12px; }
             QLabel#chartSourceLabel { color: #d6ded8; font-size: 12px; }
             QFrame#plotToolbar[narrow="true"] QPushButton { padding: 3px 6px; min-height: 22px; }
+            QFrame#plotToolbar[short="true"] QPushButton { padding: 1px 5px; min-height: 20px; }
+            QFrame#plotToolbar[short="true"] QLabel#chartViewMode,
+            QFrame#plotToolbar[short="true"] QLabel#chartSourceLabel { font-size: 11px; }
+            QPushButton[short="true"] { padding: 1px 5px; min-height: 18px; }
+            QLineEdit[short="true"], QComboBox[short="true"],
+            QSpinBox[short="true"], QDoubleSpinBox[short="true"] {
+                padding: 1px 4px; min-height: 18px;
+            }
+            QLabel#chartViewMode[short="true"],
+            QLabel#chartSourceLabel[short="true"] { font-size: 11px; }
             QFrame#plotCard { background: #f1efe6; border: 1px solid #8d9690; border-radius: 8px; }
             QWidget#plotEmptyOverlay { background: transparent; }
             QLabel#plotEmptyTitle { color: #465457; font-size: 18px; font-weight: 700; }
@@ -2561,6 +3317,8 @@ class MainWindow(QMainWindow):
             elif not isinstance(profiles[key], dict):
                 log.warning("配置文件中的 %s 不是对象；使用默认设置", key)
                 profiles[key] = {}
+        saved_output_root = profiles.get("output_root", "")
+        profiles["output_root"] = saved_output_root if isinstance(saved_output_root, str) else ""
         firmware_profiles = profiles["instrument_firmware_by_serial"]
         profiles["instrument_firmware_by_serial"] = {
             str(serial): {
@@ -2638,6 +3396,10 @@ class MainWindow(QMainWindow):
             "serial": serial_settings,
             "serial_by_port": serial_by_port,
             "sampling_interval_s": self.interval_spin.value(),
+            "output_root": (
+                self.output_root.text() if hasattr(self, "output_root")
+                else self._profiles.get("output_root", "")
+            ),
             "instrument_firmware_by_serial": self._firmware_profiles,
             **{mode: data for mode, data in self._profiles.items() if mode in {m.value for m in Mode}},
         }
@@ -2824,7 +3586,9 @@ class MainWindow(QMainWindow):
         self.connection_badge.setProperty("state", "connecting")
         self.connection_badge.style().unpolish(self.connection_badge)
         self.connection_badge.style().polish(self.connection_badge)
-        self._bridge.connect_real.emit(port, serial_settings, settings, False)
+        self._bridge.connect_real.emit(
+            port, serial_settings, settings, False, self._firmware_profiles
+        )
 
     def _disconnect(self) -> None:
         if self._acquiring:
@@ -2845,6 +3609,9 @@ class MainWindow(QMainWindow):
                 current = self.port_combo.currentData() or self.port_combo.currentText().split(" ", 1)[0]
                 self._active_port = str(current)
         if not connected:
+            self._configure_pending = False
+            self._zero_pending = False
+            self._instrument_mode_readback = None
             self._connected_mock_scenario = ""
             self._control_mode = "disconnected"
             self._control_mode_switch_pending = False
@@ -2854,7 +3621,8 @@ class MainWindow(QMainWindow):
             badge_text = "MOCK 模拟模式"
         elif connected:
             port_text = f"{self._active_port} · " if self._active_port else ""
-            badge_text = f"已连接 · {port_text}8845A / LOCAL" if self._control_mode == "local" else f"已连接 · {port_text}8845A / COMPUTER · REMOTE"
+            suffix = "LOCAL 请求 · 待面板确认" if self._control_mode == "local" else "COMPUTER · REMOTE"
+            badge_text = f"已连接 · {port_text}8845A / {suffix}"
         else:
             badge_text = text if text and text != "未读取" else "未连接"
         self.connection_badge.setText(badge_text)
@@ -2883,7 +3651,7 @@ class MainWindow(QMainWindow):
             self._update_mock_scenario_status()
         else:
             self._firmware = ""
-            self._idn_firmware = ""
+            self._idn_version_candidate = ""
             self._device_serial = ""
             self._set_firmware_fields("", "")
             self._terminals = ""
@@ -2954,8 +3722,8 @@ class MainWindow(QMainWindow):
     def _control_mode_tooltip(self) -> str:
         if self._control_mode == "local":
             return (
-                "LOCAL：仪表面板获得控制权。软件不发送设置、诊断、ZERO或测量命令，串口连接保留；"
-                "无法回读面板改动的设置。切回Computer后软件会重新读取当前仪表配置，再显示为已回读设置。"
+                "LOCAL 请求：软件已发送 SYST:LOC，但仪表没有 SCPI 回读命令确认该状态；请核对仪表面板。"
+                "软件不发送设置、诊断、ZERO或测量命令，串口连接保留。切回Computer后软件会重新读取当前仪表配置。"
             )
         return (
             "COMPUTER：软件通过SCPI控制仪表，除LOCAL键外，面板按键不可用。"
@@ -2970,8 +3738,8 @@ class MainWindow(QMainWindow):
         elif self._simulation:
             text, detail, state = "MOCK设置", "当前为模拟仪器配置，不代表真实仪器回读。", "mock"
         elif self._control_mode == "local":
-            text = "Local · 无法回读"
-            detail = "Local模式下软件无法回读面板操作改动的设置；切回Computer后会重新读取当前配置。"
+            text = "Local请求 · 无法回读"
+            detail = "软件已发送 SYST:LOC；仪表不提供状态回读（没有对应的 SCPI 查询），请核对面板。切回Computer后会重新读取当前配置。"
             state = "local"
         elif not self._instrument_mode_known:
             text, detail, state = "模式未识别", "尚未读回仪器当前功能；请在Computer模式下应用设置并确认回读。", "pending"
@@ -2995,7 +3763,7 @@ class MainWindow(QMainWindow):
         self._control_mode = mode if mode in {"computer", "local", "disconnected"} else "disconnected"
         self._set_combo_data(self.control_mode_combo, self._control_mode)
         if self._connected and not self._simulation:
-            suffix = "LOCAL" if self._control_mode == "local" else "COMPUTER · REMOTE"
+            suffix = "LOCAL 请求 · 待面板确认" if self._control_mode == "local" else "COMPUTER · REMOTE"
             port_text = f"{self._active_port} · " if self._active_port else ""
             self.connection_badge.setText(f"已连接 · {port_text}8845A / {suffix}")
             self.connection_badge.setToolTip(self._control_mode_tooltip())
@@ -3029,19 +3797,21 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_configuration(self, details: dict) -> None:
+        configuration_was_pending = self._configure_pending
+        self._configure_pending = False
         self._simulation = bool(details.get("simulation", self._simulation))
         self._terminals = str(details.get("input_terminals") or "")
         idn = str(details.get("idn") or "")
         try:
             info = parse_idn(idn)
-            self._idn_firmware = info.firmware
+            self._idn_version_candidate = info.idn_version_candidate
             self._device_serial = info.serial_number
         except (csv.Error, IndexError, InstrumentIdentityError, StopIteration, ValueError):
-            self._idn_firmware = ""
+            self._idn_version_candidate = ""
             self._device_serial = ""
         if self._simulation:
             self._set_firmware_fields("", "")
-            self._firmware = self._idn_firmware
+            self._firmware = ""
             self.firmware_profile_status.setText("MOCK不使用人工固件记录")
         else:
             saved_versions = self._firmware_profiles.get(self._device_serial, {})
@@ -3053,18 +3823,20 @@ class MainWindow(QMainWindow):
             )
             self._update_firmware_profile_status(saved_versions)
             self._firmware = select_range_firmware(
-                self._idn_firmware, self.outguard_sw_edit.text().strip()
+                self.outguard_sw_edit.text().strip()
             )[0]
-            # The worker keeps manual front-panel evidence separate from *IDN?.
+            # Only manual front-panel OutG SW participates in the range gate.
             self._bridge.set_firmware_versions.emit(
                 self.outguard_sw_edit.text().strip(), self.inguard_sw_edit.text().strip()
             )
         function = str(details.get("function") or "")
         detected_mode = mode_from_scpi_function(function)
+        self._instrument_mode_readback = detected_mode
         self._instrument_mode_known = detected_mode is not None
+        mode_changed = detected_mode is not None and detected_mode != self._current_mode
         if detected_mode is None:
             self._active_settings_by_mode.clear()
-        if detected_mode is not None and detected_mode != self._current_mode:
+        if mode_changed:
             self._active_settings_by_mode.clear()
             self._current_mode = detected_mode
             self._baseline = self._profiles[detected_mode.value].get("baseline")
@@ -3074,7 +3846,14 @@ class MainWindow(QMainWindow):
         if self._connected:
             self._load_mode_controls(self._current_mode)
             self._update_controls()
+        if configuration_was_pending:
+            self._set_operation_status(
+                "配置已回读", state="success",
+                detail="仪器配置命令完成，已收到当前功能与设置回读。",
+            )
         self._update_instrument_readback_status()
+        if mode_changed and self._region.isVisible():
+            self._update_region_stats()
 
     def _set_firmware_fields(self, outguard_version: str, inguard_version: str) -> None:
         outguard_blocked = self.outguard_sw_edit.blockSignals(True)
@@ -3100,7 +3879,7 @@ class MainWindow(QMainWindow):
             else:
                 self._firmware_profiles.pop(self._device_serial, None)
             self._update_firmware_profile_status(self._firmware_profiles.get(self._device_serial, {}))
-        self._firmware = select_range_firmware(self._idn_firmware, outguard_version)[0]
+        self._firmware = select_range_firmware(outguard_version)[0]
         if self._connected and not self._simulation:
             self._bridge.set_firmware_versions.emit(outguard_version, inguard_version)
             self._save_profiles()
@@ -3136,7 +3915,7 @@ class MainWindow(QMainWindow):
             return
         self._firmware_profiles.pop(self._device_serial, None)
         self._set_firmware_fields("", "")
-        self._firmware = self._idn_firmware
+        self._firmware = ""
         self._update_firmware_profile_status({})
         if self._connected and not self._simulation:
             self._bridge.set_firmware_versions.emit("", "")
@@ -3149,6 +3928,7 @@ class MainWindow(QMainWindow):
         mode = str(payload.get("mode") or "")
         if mode in {item.value for item in Mode}:
             self._active_settings_by_mode[mode] = dict(payload)
+            self._instrument_mode_readback = Mode(mode)
             self._update_readout_context()
             self.statusBar().showMessage(f"{mode} 仪器配置回读完成。")
             self._set_operation_status("配置已回读", state="success", detail=f"{mode} 仪器配置回读完成。")
@@ -3167,41 +3947,43 @@ class MainWindow(QMainWindow):
             return
         old_spec, new_spec = descriptor(self._current_mode), descriptor(mode)
         requires_safety_check = (
-            old_spec.wiring_group != new_spec.wiring_group
-            or old_spec.wiring_group == "current"
-            or new_spec.wiring_group == "current"
+            not self._simulation
+            and mode_transition_requires_wiring_confirmation(self._current_mode, mode)
         )
+        target_settings = self._settings_for_mode(mode)
+        confirmed_settings = None
         if requires_safety_check:
             transition_steps = []
             if old_spec.wiring_group == "current" and new_spec.wiring_group != "current":
                 transition_steps.append("先关闭被测回路，并将测试线从独立的mA/400 mA或10 A电流插孔移回V/Ω插孔，再切换离开电流模式。")
             transition_steps.append(self._mode_safety_instructions(mode))
-            target_profile = self._profiles[mode.value]
-            target_autorange = bool(target_profile.get("autorange", True))
-            target_range = None if target_autorange else float(target_profile.get("range_si", new_spec.ranges_si[0]))
             dialog = WiringConfirmationDialog(
                 mode,
                 f"切换为“{new_spec.label}”前，请逐项确认：\n\n" + "\n\n".join(transition_steps) + "\n\n切换SCPI模式不会移动测试线，也不能检查外部回路。",
                 self,
-                current_range_si=target_range,
-                autorange=target_autorange,
+                current_range_si=(None if target_settings.autorange else target_settings.range_si),
+                autorange=target_settings.autorange,
             )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 self._set_combo_data(self.mode_combo, self._current_mode.value)
                 return
+            confirmed_settings = target_settings
         self._active_settings_by_mode.clear()
         self._current_mode = mode
         self._instrument_mode_known = not self._connected
         self._baseline = self._profiles[mode.value].get("baseline")
         self._load_mode_controls(mode)
         if self._connected:
-            self._bridge.configure.emit(self._settings_for_mode(mode))
+            self._bridge.configure.emit(target_settings, confirmed_settings)
         self._clear_plot()
 
     def _mode_safety_instructions(self, mode: Mode) -> str:
         spec = descriptor(mode)
+        safety = spec.safety
+        if spec.safety_limits:
+            safety = f"{safety}\n关键限值：{spec.safety_limits}"
         if spec.quantity != "current":
-            return spec.safety
+            return safety
         if mode == self._current_mode and hasattr(self, "range_combo"):
             autorange = self.autorange_check.isChecked()
             selected_range = self.range_combo.currentData()
@@ -3210,7 +3992,7 @@ class MainWindow(QMainWindow):
             autorange = bool(profile.get("autorange", True))
             selected_range = profile.get("range_si", spec.ranges_si[0])
         range_value = None if selected_range is None else float(selected_range)
-        return f"{spec.safety}\n{current_input_guidance(range_value, autorange)}"
+        return f"{safety}\n{current_input_guidance(range_value, autorange)}"
 
     def _refresh_safety_hint(self) -> None:
         if hasattr(self, "safety_text"):
@@ -3381,27 +4163,11 @@ class MainWindow(QMainWindow):
             blocked = self.digital_filter_check.blockSignals(True)
             self.digital_filter_check.setChecked(False)
             self.digital_filter_check.blockSignals(blocked)
-        slow_nplc = next((value for value in spec.nplc_values if value > 1), None)
-        block_reason = (
-            digital_filter_slow_read_block_reason(self._current_mode, slow_nplc, self._firmware)
-            if spec.digital_filter else None
-        )
-        if block_reason:
-            self.digital_filter_check.setToolTip(block_reason)
-        elif spec.digital_filter:
+        if spec.digital_filter:
             self.digital_filter_check.setToolTip(
                 "此滤波器会对多个读数求平均，平均数量随直流功能和量程变化；"
-                f"{DIGITAL_FILTER_DISABLED_REASON}。"
+                f"{digital_filter_enable_error(self._current_mode)}。"
             )
-        blocked_nplc_values = set(
-            digital_filter_blocked_nplc_values(self._current_mode, self._firmware)
-        )
-        enforce_firmware_guard = self._connected and not self._simulation
-        for index in range(self.nplc_combo.count()):
-            value = self.nplc_combo.itemData(index)
-            item = self.nplc_combo.model().item(index)
-            if item is not None and value is not None:
-                item.setEnabled(not enforce_firmware_guard or value not in blocked_nplc_values)
 
     def _persist_current_settings(self) -> None:
         mode = self._current_mode
@@ -3455,8 +4221,16 @@ class MainWindow(QMainWindow):
             if active_autorange:
                 active_parts.append("自动量程")
                 if self._last_actual_range_si is not None:
+                    range_text = range_label(self._last_actual_range_si, spec.unit_si)
                     active_parts.append(
-                        f"本次实际量程 {range_label(self._last_actual_range_si, spec.unit_si)}"
+                        f"MOCK模拟档位 {range_text}" if self._simulation
+                        else f"本次实际量程 {range_text}"
+                    )
+                elif active.get("range_readback_si") is not None:
+                    range_text = range_label(float(active["range_readback_si"]), spec.unit_si)
+                    active_parts.append(
+                        f"MOCK模拟档位 {range_text}" if self._simulation
+                        else f"当前量程回读 {range_text}（快照）"
                     )
             elif active_range is not None:
                 active_parts.append(range_label(float(active_range), spec.unit_si))
@@ -3476,8 +4250,11 @@ class MainWindow(QMainWindow):
                     pending.append(f"{int(selected_bandwidth)} Hz 带宽")
             if spec.analog_filter and active.get("analog_filter"):
                 active_parts.append("模拟滤波")
-            if spec.digital_filter and active.get("digital_filter"):
-                active_parts.append("数字滤波")
+            if spec.digital_filter:
+                if active.get("digital_filter_state") == "unsupported":
+                    active_parts.append("数字滤波不支持（OutG SW < 2.0）")
+                elif active.get("digital_filter"):
+                    active_parts.append("数字滤波")
             if spec.input_impedance_auto:
                 active_impedance = bool(active.get("input_impedance_auto", False))
                 active_parts.append("自动高输入阻抗" if active_impedance else "10 MΩ输入阻抗")
@@ -3608,6 +4385,8 @@ class MainWindow(QMainWindow):
         return conflicts
 
     def _apply_settings(self) -> None:
+        if self._configure_pending:
+            return
         try:
             self._persist_current_settings()
             settings = self._settings_for_mode(self._current_mode)
@@ -3619,24 +4398,41 @@ class MainWindow(QMainWindow):
                 return
             if not self._connected:
                 QMessageBox.information(self, "参数已保存", "本模式参数已保存到本机。连接8845A后按“应用仪器参数”写入仪器。")
-            elif not self._instrument_mode_known:
-                spec = descriptor(self._current_mode)
-                answer = QMessageBox.warning(
-                    self, "确认配置测量模式",
-                    f"程序无法识别仪器当前功能。此操作将把仪器配置为“{spec.label}”。\n\n{self._mode_safety_instructions(self._current_mode)}\n\n确认仪器接线状态适用于该功能？",
-                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
-                    QMessageBox.StandardButton.Cancel,
+            elif not self._simulation and mode_transition_requires_wiring_confirmation(
+                self._instrument_mode_readback, settings.mode,
+            ):
+                spec = descriptor(settings.mode)
+                dialog = WiringConfirmationDialog(
+                    settings.mode,
+                    f"应用“{spec.label}”设置前，请核对接线和量程：\n\n"
+                    f"{self._mode_safety_instructions(settings.mode)}\n\n"
+                    "SCPI不能检查表笔、保险丝或外部回路；确认接线适用于目标模式后再继续。",
+                    self,
+                    current_range_si=None if settings.autorange else settings.range_si,
+                    autorange=settings.autorange,
                 )
-                if answer == QMessageBox.StandardButton.Ok:
-                    self.statusBar().showMessage("正在发送仪器配置命令，等待仪器回读…")
-                    self._set_operation_status("正在应用配置", detail="进行中：发送仪器配置命令。预期结果：当前模式参数完成写入并收到配置回读。")
-                    self._bridge.configure.emit(settings)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                confirmed_settings = settings
+                self._queue_configuration(settings, confirmed_settings=confirmed_settings)
             else:
-                self.statusBar().showMessage("正在发送仪器配置命令，等待仪器回读…")
-                self._set_operation_status("正在应用配置", detail="进行中：发送仪器配置命令。预期结果：当前模式参数完成写入并收到配置回读。")
-                self._bridge.configure.emit(settings)
+                self._queue_configuration(settings)
         except Exception as exc:
             self._show_error(str(exc))
+
+    def _queue_configuration(
+        self, settings: ModeSettings, *, confirmed_settings: ModeSettings | None = None,
+    ) -> None:
+        if self._configure_pending:
+            return
+        self._configure_pending = True
+        self._update_controls()
+        self.statusBar().showMessage("正在发送仪器配置命令，等待仪器回读…")
+        self._set_operation_status(
+            "正在应用配置",
+            detail="进行中：发送仪器配置命令。预期结果：当前模式参数完成写入并收到配置回读。",
+        )
+        self._bridge.configure.emit(settings, confirmed_settings)
 
     def _initialize_parameters(self) -> None:
         if self._acquiring:
@@ -3694,19 +4490,35 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _request_zero(self) -> None:
+        if self._zero_pending:
+            return
         if self._acquiring:
-            self._show_error("请停止采集后再执行ZERO。模拟滤波条件下，ZERO应与当前量程、NPLC和触发设置一致。")
+            message = "请停止采集后再执行ZERO。模拟滤波条件下，ZERO应与当前量程、NPLC和触发设置一致。"
+            self._on_zero_result(f"ZERO未执行：{message}")
+            self._show_error(message)
+            return
+        if not self._zero_configuration_ready():
+            self._on_zero_result("ZERO未执行：请先读取或应用当前模式配置，并确认配置回读。")
             return
         active = self._active_settings_by_mode.get(self._current_mode.value)
         if active is None:
             applied = "当前模式尚无仪器配置回读；请先应用参数并确认读回。"
         else:
             spec = descriptor(self._current_mode)
-            range_text = (
-                "自动量程"
-                if active.get("autorange")
-                else f"固定量程 {range_label(active.get('range_si'), spec.unit_si)}"
-            )
+            if active.get("autorange"):
+                range_text = "自动量程"
+                range_readback = active.get("range_readback_si")
+                if range_readback is not None and math.isfinite(float(range_readback)):
+                    range_text += (
+                        f"；当前量程回读 {range_label(float(range_readback), spec.unit_si)}"
+                        "（当前快照，可能随输入变化）"
+                    )
+                else:
+                    range_text += "（当前量程回读不可用）"
+                if active.get("simulation"):
+                    range_text += "（MOCK模拟）"
+            else:
+                range_text = f"固定量程 {range_label(active.get('range_si'), spec.unit_si)}"
             timing = (
                 f"NPLC={active.get('nplc')}"
                 if active.get("nplc") is not None
@@ -3714,9 +4526,13 @@ class MainWindow(QMainWindow):
                 if active.get("ac_bandwidth_hz") is not None
                 else "无适用积分/带宽项"
             )
+            analog_filter = (
+                f"模拟滤波：{'开' if active.get('analog_filter') else '关'}"
+                if spec.analog_filter else "模拟滤波：不适用"
+            )
             applied = (
                 f"已回读配置：{spec.label} · {range_text} · {timing} · "
-                f"模拟滤波：{'开' if active.get('analog_filter') else '关'} · "
+                f"{analog_filter} · "
                 f"自动零点：{'开' if active.get('autozero') else '关'}。"
             )
         answer = QMessageBox.question(
@@ -3728,17 +4544,37 @@ class MainWindow(QMainWindow):
             "现在执行一次吗？",
         )
         if answer == QMessageBox.StandardButton.Yes:
+            self._zero_pending = True
+            self._update_controls()
             self.zero_result_label.setText("ZERO执行中；完成后显示仪器配置回读。")
             self.zero_result_label.show()
             self._set_operation_status("ZERO执行中", detail="进行中：仪表正在执行ZERO。预期结果：返回ZERO后的配置回读；不代表当前读数被清零或校准完成。")
             self._bridge.zero.emit()
 
+    def _zero_configuration_ready(self) -> bool:
+        return (
+            self._instrument_mode_known
+            and self._instrument_mode_readback == self._current_mode
+            and self._current_mode.value in self._active_settings_by_mode
+        )
+
     @Slot(str)
     def _on_zero_result(self, result: str) -> None:
+        self._zero_pending = False
         self.zero_result_label.setText(result)
         self.zero_result_label.show()
-        self._set_operation_status("ZERO结果已返回", state="success", detail=result)
+        readback_failed = any(
+            marker in result for marker in (
+                "配置回读失败", "ZERO失败", "ZERO执行失败", "命令或执行确认失败", "ZERO未执行",
+            )
+        )
+        self._set_operation_status(
+            "ZERO执行失败" if readback_failed else "ZERO配置回读已返回",
+            state="failure" if readback_failed else "success",
+            detail=result,
+        )
         self.statusBar().showMessage(result, 20000)
+        self._update_controls()
 
     def _scenario(self) -> MockScenario:
         selected = self.scenario_combo.currentText()
@@ -3758,6 +4594,9 @@ class MainWindow(QMainWindow):
         self._start(one_shot=True)
 
     def _start(self, one_shot: bool) -> None:
+        if self._history_load_pending:
+            self.statusBar().showMessage("历史 CSV 正在后台加载，完成后再开始采集。", 5000)
+            return
         if not self._validate_experiment_name_field():
             self.statusBar().showMessage(self.experiment_name_validation.text(), 8000)
             return
@@ -3773,6 +4612,7 @@ class MainWindow(QMainWindow):
         if not self._simulation and not self._instrument_mode_known:
             self._show_error("未识别到仪器当前测量功能。请先逐项核对接线，再点击“应用仪器参数”明确配置一种支持模式。")
             return
+        confirmed_settings = None
         if not self._simulation:
             spec = descriptor(self._current_mode)
             autorange = self.autorange_check.isChecked()
@@ -3789,6 +4629,7 @@ class MainWindow(QMainWindow):
             )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
+            confirmed_settings = self._settings_for_mode(self._current_mode)
         try:
             settings = self._settings_for_mode(self._current_mode)
             settings.validate()
@@ -3797,11 +4638,22 @@ class MainWindow(QMainWindow):
                 raise ValueError("请填写实验名称")
             validate_experiment_name(self.experiment_name.text())
             duplicate_name = self._prepare_start_preflight(settings, root, wiring_confirmed=not self._simulation)
+            duplicate_action = ""
+            expected_duplicate_path = ""
             if duplicate_name:
+                duplicates = find_existing_experiment_directories(root, self.experiment_name.text())
+                latest_name = duplicates[-1].name if duplicates else "（目录状态已变化）"
+                expected_duplicate_path = str(duplicates[-1].resolve()) if duplicates else ""
                 dialog = QMessageBox(self)
                 dialog.setWindowTitle("同名实验已存在")
-                dialog.setText("保存目录中已有相同名称的实验。已有数据不会被覆盖。")
-                dialog.setInformativeText("新建独立目录会保留旧数据；返回改名可编辑实验名称；取消会停止本次启动。")
+                dialog.setText(f"检测到 {len(duplicates)} 个同名实验目录。最近一次：{latest_name}")
+                dialog.setInformativeText(
+                    "选择“覆盖”时，最近一次实验目录会先移动到保存根目录下的 .8845a-backups，"
+                    "旧数据仍可恢复。若元数据仍显示运行中，程序会先取得同名跨进程锁；"
+                    "只有确认没有其他采集进程后才标记为“异常中断”并备份，活动实验会被拒绝覆盖。"
+                    "程序随后为本次实验创建新目录。也可以另存独立目录、改名或取消。"
+                )
+                overwrite = dialog.addButton("覆盖最近一次（先备份）", QMessageBox.ButtonRole.AcceptRole)
                 create_copy = dialog.addButton("新建独立目录", QMessageBox.ButtonRole.AcceptRole)
                 rename = dialog.addButton("返回改名", QMessageBox.ButtonRole.ActionRole)
                 cancel = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -3812,9 +4664,16 @@ class MainWindow(QMainWindow):
                     self.experiment_name.setFocus()
                     self.experiment_name.selectAll()
                     return
+                if dialog.clickedButton() is overwrite:
+                    duplicate_action = "overwrite"
+                    self.preflight_status.setText("将先备份最近一次同名实验，再创建本次实验目录。")
+                elif dialog.clickedButton() is create_copy:
+                    duplicate_action = "create-copy"
+                    self.preflight_status.setText("将创建新的独立目录；已有实验保留不变。")
                 if dialog.clickedButton() is not create_copy:
-                    self.preflight_status.setText("已取消启动；旧实验数据未修改。")
-                    return
+                    if dialog.clickedButton() is not overwrite:
+                        self.preflight_status.setText("已取消启动；旧实验数据未修改。")
+                        return
             interval = None if self.interval_spin.value() == 0 else self.interval_spin.value()
             if self.mock_mode_check.isChecked() and not self._simulation:
                 raise ValueError("MOCK模式未连接。请先点击“连接真实仪器”以通过MOCK后端连接；UI会明确显示模拟状态。")
@@ -3825,7 +4684,10 @@ class MainWindow(QMainWindow):
             self._user_stop_pending = False
             self.statusBar().showMessage("正在启动单次测量…" if one_shot else "正在启动连续采集…")
             self._update_controls()
-            self._bridge.start_experiment.emit(settings, self.experiment_name.text().strip(), str(root), interval, one_shot)
+            self._bridge.start_experiment.emit(
+                settings, self.experiment_name.text().strip(), str(root), interval, one_shot,
+                duplicate_action, expected_duplicate_path, confirmed_settings,
+            )
         except Exception as exc:
             self._start_pending = False
             self.preflight_status.setText(f"采集预检未通过：{exc}")
@@ -3837,9 +4699,17 @@ class MainWindow(QMainWindow):
         if active is None or active.get("mode") != settings.mode.value:
             raise ValueError("当前仪器配置没有可用的回读结果；请先应用仪器参数并确认回读")
         prepared_root = prepare_experiment_storage(root)
-        available_space = format_available_space(
-            require_minimum_free_space(get_available_space_bytes(prepared_root))
-        )
+        free_bytes = require_minimum_free_space(get_available_space_bytes(prepared_root))
+        available_space = format_available_space(free_bytes)
+        target_interval_s = self.interval_spin.value() or None
+        capacity_seconds = estimate_recording_capacity_seconds(free_bytes, target_interval_s)
+        if capacity_seconds is None:
+            capacity_forecast = format_estimated_recording_capacity(None)
+        else:
+            capacity_forecast = (
+                f"按 4 KiB/样本粗估，目标间隔 {target_interval_s:g} s 时可记录"
+                f"{format_estimated_recording_capacity(capacity_seconds)}；实际采样间隔、原始响应及错误文本长度会影响结果"
+            )
         duplicates = find_existing_experiment_directories(prepared_root, self.experiment_name.text())
         identity = self.idn_label.text().replace("设备身份：", "").strip() or "已连接仪器"
         wiring = "模拟器无需实体接线" if self._simulation else (
@@ -3849,15 +4719,17 @@ class MainWindow(QMainWindow):
             "采集预检通过：\n"
             f"✓ 仪器已连接：{identity}\n"
             f"✓ 当前功能已回读：{descriptor(settings.mode).label}；本次参数将在开始时再次应用并回读\n"
-            f"✓ 保存目录可写：{prepared_root}（当前可用 {available_space}；启动至少预留 10 MiB，"
-            "采集中每 5 秒复查；低于预留值时停止采集并尝试收尾文件，若收尾失败会提示记录可能不完整；"
-            "不预测长期实验总空间）\n"
+            f"✓ 保存目录可写：{prepared_root}（当前可用 {available_space}；启动至少预留 10 MiB；"
+            f"{capacity_forecast}；此估算不限制实验时长。采集中每 5 秒复查空间，低于预留值时停止采集并尝试收尾文件，"
+            "若收尾失败会提示记录可能不完整）\n"
             f"✓ {wiring}\n"
             "✓ 实验名称有效；不会覆盖旧数据。"
         )
         if duplicates:
             self.preflight_status.setText(
-                self.preflight_status.text() + f"\n发现 {len(duplicates)} 个同名实验目录；继续将创建新的时间戳目录。"
+                self.preflight_status.text()
+                + f"\n发现 {len(duplicates)} 个同名实验目录；最近一次为 {duplicates[-1].name}，"
+                "确认后可备份并覆盖，或另存独立目录。"
             )
         return bool(duplicates)
 
@@ -3891,6 +4763,9 @@ class MainWindow(QMainWindow):
 
     def _update_connect_label(self, mock: bool) -> None:
         self.connect_button.setText("启动MOCK模拟仪器" if mock else "连接真实仪器")
+        self.connect_button.setProperty("connectionTarget", "mock" if mock else "instrument")
+        self.connect_button.style().unpolish(self.connect_button)
+        self.connect_button.style().polish(self.connect_button)
         self.scenario_combo.setEnabled(bool(mock) and not self._connected)
         self.mock_scenario_status.setVisible(bool(mock) or self._simulation)
         self._update_mock_scenario_status()
@@ -3903,6 +4778,15 @@ class MainWindow(QMainWindow):
             status = f"待连接MOCK场景：{self.scenario_combo.currentText()}"
         else:
             status = "MOCK场景：未连接"
+        if self._connected:
+            scenario_tooltip = (
+                "当前设备已连接，模拟场景选择已锁定。切换场景请先断开连接，选好场景后重新连接模拟器。"
+            )
+        elif self.mock_mode_check.isChecked():
+            scenario_tooltip = "模拟场景需在连接前选择；修改场景后重新连接模拟器即可生效。"
+        else:
+            scenario_tooltip = "此选项仅适用于 Mock 模拟仪器；先启用模拟模式，再选择连接前要使用的场景。"
+        self.scenario_combo.setToolTip(scenario_tooltip)
         self.mock_scenario_status.setText(status)
         self.mock_scenario_header.setText(status)
         self.mock_scenario_header.setVisible(self._simulation or self.mock_mode_check.isChecked())
@@ -3929,7 +4813,7 @@ class MainWindow(QMainWindow):
 
     def _on_status(self, status: str) -> None:
         self._single_shot_running = "单次测量中" in status
-        if status.startswith(("连续超时", "SCPI响应超时", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
+        if status.startswith(("连续超时", "SCPI响应超时", "串口读取超时", "串口通信异常", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
             self._last_acquisition_issue = status
             self._show_recovery_guidance(status)
         if "连续采集中" in status:
@@ -3942,6 +4826,8 @@ class MainWindow(QMainWindow):
             display_status = "就绪"
         elif status.startswith("连续超时"):
             display_status = "连续超时"
+        elif status.startswith(("串口读取超时", "串口通信异常")):
+            display_status = "通信故障"
         elif status.startswith("SCPI"):
             display_status = "响应超时"
         else:
@@ -3961,7 +4847,7 @@ class MainWindow(QMainWindow):
             self._acquiring = False
             self._paused = False
             self._experiment_active = False
-        elif status.startswith(("SCPI响应超时", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
+        elif status.startswith(("SCPI响应超时", "串口读取超时", "串口通信异常", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
             self._acquiring = False
             self._paused = False
             self._experiment_active = False
@@ -3982,26 +4868,25 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _show_recovery_guidance(self, status: str) -> None:
-        if status.startswith("连续超时"):
+        if status.startswith(("串口读取超时", "SCPI响应超时", "串口通信异常")):
             guidance = (
-                "普通读超时后软件会在下一采样周期继续尝试；连续 3 次超时才停止。"
-                "已写入 CSV 的尝试会保留。检查串口线、COM/波特率和仪表 Computer 模式，"
-                "重新连接后开始新实验。"
+                "读取过程中出现串口超时或通信故障；当前实验已立即停止，失败尝试已记录并保存，串口连接已关闭。"
+                "软件不会自动重试或续接旧 CSV。检查线缆、COM/波特率、结束符和仪表 Computer 模式，"
+                "确认状态后重新连接并开始新实验/分段。"
             )
-        elif status.startswith("SCPI响应超时"):
+        elif status.startswith("连续超时"):
             guidance = (
-                "SCPI 响应超时会立即停止并关闭串口，不会重放同一条 READ?。"
-                "已保存的读数与超时记录保留；检查 COM、波特率、结束符和 Computer 模式，"
-                "重新连接后开始新实验。"
+                "多次读数超时后采集已停止，异常尝试已写入 CSV。真实仪器发生串口超时会立即停止并关闭连接；"
+                "检查连接后重新连接并开始新实验/分段。"
             )
         elif status.startswith("仪器已切回LOCAL"):
-            guidance = "仪器已交给前面板控制，当前实验记录已保留；切回 Computer 并重新连接后开始新实验。"
+            guidance = "仪器因 LOCAL 状态拒绝远程命令；当前实验记录已保留。切回 Computer 并重新连接后开始新实验。"
         elif status.startswith("RS-232当前不是Computer"):
             guidance = "串口终端模式下停止采集，已有 CSV 记录保留；在仪表切回 Computer 后重新连接并开始新实验。"
         elif status in {"普通读超时", "timeout"}:
             guidance = (
-                "这是一次普通读超时；软件会在下一采样周期继续尝试，连续 3 次超时才停止。"
-                "当前异常记录已写入 CSV。"
+                "无效读数已记录。真实仪器的串口超时或通信异常会立即停止采集并关闭连接，不自动重试或续接旧 CSV。"
+                "MOCK 超时行为按当前模拟场景设置。检查连接后重新连接并开始新实验/分段。"
             )
         elif "连接中断" in status:
             guidance = "连接中断后采集停止；已落盘的有效与异常尝试保留。检查线缆和串口设置，重新连接后开始新实验。"
@@ -4009,20 +4894,23 @@ class MainWindow(QMainWindow):
             guidance = "过量程后采集停止；检查输入端子、保险丝、回路及量程，确认安全后重新连接或配置并开始新实验。"
         else:
             return
-        self.recovery_hint_label.setText(guidance)
-        self.recovery_hint_label.setToolTip(status)
-        self.recovery_hint_label.show()
         attempts = int(self._global_stats.get("attempt_count", 0) or 0)
         if attempts:
             valid = int(self._global_stats.get("valid_count", self._global_stats.get("count", 0)) or 0)
             abnormal = int(self._global_stats.get("abnormal_count", max(0, attempts - valid)) or 0)
-            self.recovery_hint_label.setText(
-                f"{guidance} 当前 CSV 已保存 {attempts} 次尝试：有效 {valid}、异常 {abnormal}。"
-            )
+            guidance = f"{guidance} 当前 CSV 已保存 {attempts} 次尝试：有效 {valid}、异常 {abnormal}。"
+        self.recovery_hint_label.setToolTip(guidance)
+        self.recovery_hint_label.setText(
+            "采集已停止 · 悬停查看" if self._short_viewport_layout else guidance
+        )
+        self.recovery_hint_label.show()
 
     def _jump_to_latest_invalid_log(self) -> None:
         if not self._latest_invalid_log_text:
             return
+        error_index = self.log_filter_combo.findData("error")
+        if error_index >= 0 and self.log_filter_combo.currentIndex() != error_index:
+            self.log_filter_combo.setCurrentIndex(error_index)
         self.log_dock.show()
         self.log_dock.raise_()
         cursor = self.log_text.document().find(self._latest_invalid_log_text)
@@ -4034,11 +4922,16 @@ class MainWindow(QMainWindow):
     def _update_controls(self) -> None:
         idle = not self._acquiring and not self._start_pending
         self._update_experiment_directory_controls()
-        command_ready = idle and not self._diagnostic_pending and not self._connection_pending
+        command_ready = (
+            idle and not self._diagnostic_pending and not self._connection_pending
+            and not self._configure_pending and not self._zero_pending
+        )
         computer_control = not self._connected or self._simulation or self._control_mode == "computer"
         reason = (
             "正在连接仪器。" if self._connection_pending else
             "正在读取仪器诊断，完成后才能继续操作。" if self._diagnostic_pending else
+            "正在应用仪器参数，等待配置回读。" if self._configure_pending else
+            "ZERO正在执行，等待仪器结果。" if self._zero_pending else
             "采集中不能更改此参数。" if self._acquiring or self._start_pending else
             "Local 模式下不发送设置命令；切换到 Computer 后可操作。" if self._connected and not computer_control else
             "请先连接仪器或模拟器。" if not self._connected else ""
@@ -4053,8 +4946,15 @@ class MainWindow(QMainWindow):
         self.range_combo.setEnabled(command_ready and computer_control and not self.autorange_check.isChecked())
         # Measurement speed remains editable while acquiring; the Apply Speed
         # action serializes the instrument update in the worker thread.
-        self.nplc_combo.setEnabled(computer_control and bool(spec.nplc_values) and (idle or self._connected))
-        self.bandwidth_combo.setEnabled(computer_control and bool(spec.ac_bandwidths_hz) and (idle or self._connected))
+        settings_command_pending = self._configure_pending or self._zero_pending
+        self.nplc_combo.setEnabled(
+            computer_control and not settings_command_pending
+            and bool(spec.nplc_values) and (idle or self._connected)
+        )
+        self.bandwidth_combo.setEnabled(
+            computer_control and not settings_command_pending
+            and bool(spec.ac_bandwidths_hz) and (idle or self._connected)
+        )
         self.analog_filter_check.setEnabled(command_ready and computer_control and spec.analog_filter)
         self.input_impedance_auto_check.setEnabled(
             command_ready and computer_control and spec.input_impedance_auto
@@ -4069,9 +4969,17 @@ class MainWindow(QMainWindow):
             self._acquiring and self._connected and computer_control and not self._speed_update_pending
             and bool(spec.nplc_values or spec.ac_bandwidths_hz)
         )
-        self.zero_button.setEnabled(command_ready and self._connected and computer_control)
-        self.start_button.setEnabled(command_ready and self._connected and computer_control and self._experiment_name_valid)
-        self.single_button.setEnabled(command_ready and self._connected and computer_control and self._experiment_name_valid)
+        zero_ready = self._zero_configuration_ready()
+        self.zero_button.setEnabled(command_ready and self._connected and computer_control and zero_ready)
+        history_load_ready = not self._history_load_pending
+        self.start_button.setEnabled(
+            command_ready and self._connected and computer_control
+            and self._experiment_name_valid and history_load_ready
+        )
+        self.single_button.setEnabled(
+            command_ready and self._connected and computer_control
+            and self._experiment_name_valid and history_load_ready
+        )
         self.pause_button.setEnabled(self._acquiring and not self._single_shot_running)
         self.pause_button.setText("继续" if self._paused else "暂停")
         self.stop_button.setEnabled(self._acquiring)
@@ -4117,9 +5025,17 @@ class MainWindow(QMainWindow):
         if reason:
             autozero_tooltip = f"{reason}\n\n{autozero_tooltip}"
         self.autozero_check.setToolTip(autozero_tooltip)
+        self.apply_button.setToolTip(
+            "正在应用仪器参数，等待配置回读。"
+            if self._configure_pending else reason or "将当前模式参数写入仪器并等待回读。"
+        )
         name_reason = self.experiment_name_validation.text() if not self._experiment_name_valid else ""
-        self.start_button.setToolTip((reason or name_reason or "开始连续采集；原始结果逐点保存到当前实验 CSV。") + " 快捷键：Ctrl+R。")
-        self.single_button.setToolTip(reason or name_reason or "只读取一次并保存为独立实验数据。")
+        start_reason = (
+            "历史 CSV 正在后台加载，完成后再开始采集。"
+            if self._history_load_pending else reason or name_reason
+        )
+        self.start_button.setToolTip((start_reason or "开始连续采集；原始结果逐点保存到当前实验 CSV。") + " 快捷键：Ctrl+R。")
+        self.single_button.setToolTip(start_reason or "只读取一次并保存为独立实验数据。")
         pause_tooltip = (
             "继续当前已暂停的采集。快捷键：Ctrl+P。" if self._paused else
             "单次测量不支持暂停；可停止当前读数。" if self._single_shot_running else
@@ -4139,9 +5055,15 @@ class MainWindow(QMainWindow):
             ("请先开始一次实验，再记录事件。" if not self._experiment_active else "记录带有当前时间、样本号和读数的实验事件。")
             + " 快捷键：Ctrl+Enter。"
         )
-        zero_tooltip = self.zero_help
-        if reason:
-            zero_tooltip = f"{reason}\n\n{zero_tooltip}"
+        zero_reason = reason or (
+            "请先读取或应用当前模式配置，并确认仪器配置回读后再执行 ZERO。"
+            if self._connected and computer_control and not zero_ready else ""
+        )
+        zero_tooltip_parts = [
+            "ZERO正在执行，等待仪器结果返回。" if self._zero_pending else zero_reason,
+            self.zero_help,
+        ]
+        zero_tooltip = "\n\n".join(part for part in zero_tooltip_parts if part)
         self.zero_button.setToolTip(zero_tooltip)
         self.diagnose_button.setToolTip(reason or "读取仪器身份、配置与错误队列。")
         actions = getattr(self, "_shortcut_actions", {})
@@ -4174,6 +5096,7 @@ class MainWindow(QMainWindow):
             self._global_stats = full_stats
             valid_count = int(full_stats.get("valid_count", full_stats.get("count", 0)) or 0)
             self.valid_sample_count_label.setText(f"有效样本 {valid_count:,}")
+            invalid_log_entries: list[tuple[str, str]] = []
             for row in rows:
                 try:
                     sample_index = int(row.get("sample_index") or 0)
@@ -4187,14 +5110,22 @@ class MainWindow(QMainWindow):
                     status = str(row.get("status") or "无状态")
                     error = str(row.get("error") or "无详细原因")
                     self._latest_invalid_log_text = f"! 数据无效：{row.get('status')} · {row.get('error')}"
-                    self.latest_invalid_label.setText(
-                        f"最近无效读数 #{row.get('sample_index') or self._last_sample_index}：{status} · {error}"
+                    invalid_detail = (
+                        f"最近无效读数 #{row.get('sample_index') or self._last_sample_index}："
+                        f"{status} · {error}"
                     )
-                    self.latest_invalid_label.setToolTip(self._latest_invalid_log_text)
+                    self.latest_invalid_label.setToolTip(invalid_detail)
+                    self.latest_invalid_label.setText(invalid_detail)
                     self.latest_invalid_log_button.setEnabled(True)
+                    self.latest_invalid_label.setVisible(True)
+                    self.latest_invalid_log_button.setVisible(True)
+                    self._update_latest_invalid_summary()
                     if status in {"timeout", "scpi_timeout"}:
                         self._show_recovery_guidance("普通读超时" if status == "timeout" else "SCPI响应超时")
-                    self._append_log(self._latest_invalid_log_text)
+                    log_timestamp = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
+                    invalid_log_entries.append(
+                        (self._latest_invalid_log_text, f"{log_timestamp}  {self._latest_invalid_log_text}")
+                    )
                     continue
                 value = float(row["value_si"])
                 elapsed = float(row["elapsed_s"])
@@ -4210,6 +5141,8 @@ class MainWindow(QMainWindow):
                         self._last_actual_range_si = None
                 self._plot_x.append(elapsed)
                 self._plot_y.append(value)
+                if self._plot_y_origin is None:
+                    self._plot_y_origin = value
                 self._plot_break_before.append(self._plot_break_pending)
                 self._plot_break_pending = False
                 self._plot_metadata.append({
@@ -4221,6 +5154,21 @@ class MainWindow(QMainWindow):
                     "mode": row.get("mode", self._current_mode.value),
                     "range_si": row.get("range_si"),
                 })
+            if invalid_log_entries:
+                self._store_log_entries(invalid_log_entries)
+            if len(self._plot_x) > MAX_PLOT_POINTS:
+                compact_limit = max(5, int(MAX_PLOT_POINTS * 0.75))
+                plot_x, plot_y, plot_breaks, plot_metadata = downsample_plot_data(
+                    self._plot_x,
+                    self._plot_y,
+                    self._plot_break_before,
+                    self._plot_metadata,
+                    max_points=compact_limit,
+                )
+                self._plot_x = deque(plot_x)
+                self._plot_y = deque(plot_y)
+                self._plot_break_before = deque(plot_breaks)
+                self._plot_metadata = deque(plot_metadata)
             valid_rows = [r for r in rows if r.get("status") == "ok" and r.get("value_si") not in (None, "")]
             if valid_rows:
                 self.plot_empty_overlay.hide()
@@ -4233,7 +5181,7 @@ class MainWindow(QMainWindow):
                 self.latest_value_label.setText(f"{displayed:.10g} {unit}")
                 self._update_readout_context()
                 if self._baseline is not None:
-                    self.baseline_line.setValue(self._baseline)
+                    self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
                     self.baseline_line.show()
                     delta = value - self._baseline
                     percent = relative_change_percent(value, self._baseline, self._parse_threshold())
@@ -4283,7 +5231,7 @@ class MainWindow(QMainWindow):
             return _format_sampling_interval(1.0 / value) if value > 0 else "0 s"
 
         self.stats_label.setText(
-            f"全程统计 · 有效点 n={count} · 最大 {fmt(maximum)} (n={count}) · "
+            f"统计范围：全程 · 有效点 n={count} · 最大 {fmt(maximum)} (n={count}) · "
             f"最小 {fmt(minimum)} (n={count}) · 平均 {fmt(mean)} (n={count}) · "
             f"样本标准差 s {fmt(deviation)} (n={count})\n"
             f"采集遥测 · 尝试 {attempts} · 有效 {valid} · 异常 {abnormal} · 最近有效间隔中位数 {interval(median)} · "
@@ -4303,8 +5251,10 @@ class MainWindow(QMainWindow):
             request_id = self._region_stats_request_id
             self._region_stats_scanning = True
             self._region_stats_pending_rows.clear()
+            self._region_stats_pending_overflow = False
             self._region_stats_values = None
             self._region_stats_last_sample_index = 0
+            self._region_stats_mode = self._current_mode
             task = _RegionStatisticsTask(request_id, path, left, right, self._current_mode)
             task.signals.completed.connect(self._on_region_stats_finished)
             self._region_stats_tasks[request_id] = task
@@ -4350,69 +5300,109 @@ class MainWindow(QMainWindow):
 
     def _on_region_stats_finished(self, request_id: int, result: object, error: object) -> None:
         self._region_stats_tasks.pop(request_id, None)
+        if self._shutdown_started:
+            self._maybe_complete_shutdown()
+            return
         if request_id != self._region_stats_request_id:
             return
         self._region_stats_scanning = False
+        if self._region_stats_mode != self._current_mode:
+            self._region_stats_pending_rows.clear()
+            self._region_stats_pending_overflow = False
+            self._region_stats_values = None
+            self._update_region_stats()
+            return
         if error:
             self._region_stats_pending_rows.clear()
+            self._region_stats_pending_overflow = False
             self._region_stats_label.setText(f"原始 CSV 区间统计失败：{error}")
             return
         if not isinstance(result, dict) or not isinstance(result.get("stats"), RunningStats):
             self._region_stats_pending_rows.clear()
+            self._region_stats_pending_overflow = False
             self._region_stats_label.setText("原始 CSV 区间统计失败：返回结果无效")
             return
 
         stats = result["stats"]
         last_sample_index = int(result["last_sample_index"])
         left, right = self._region_stats_bounds or (0.0, 0.0)
+        needs_rescan = self._region_stats_pending_overflow or not _region_sample_rows_are_contiguous(
+            self._region_stats_pending_rows, last_sample_index
+        )
+        if needs_rescan:
+            self._region_stats_pending_rows.clear()
+            self._region_stats_pending_overflow = False
+            self._region_stats_values = None
+            self._update_region_stats()
+            return
         for row in self._region_stats_pending_rows:
-            try:
-                sample_index = int(row.get("sample_index", 0))
-            except (TypeError, ValueError):
-                continue
+            sample_index = _parse_region_sample_index(row.get("sample_index"))
+            if sample_index is None:
+                self._region_stats_pending_rows.clear()
+                self._region_stats_pending_overflow = False
+                self._region_stats_values = None
+                self._update_region_stats()
+                return
             if sample_index <= last_sample_index:
                 continue
             last_sample_index = sample_index
             if row.get("status") != "ok" or row.get("mode") != self._current_mode.value:
                 continue
             try:
-                elapsed = float(row["elapsed_s"])
-                value = float(row["value_si"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if math.isfinite(elapsed) and math.isfinite(value) and left <= elapsed <= right:
+                elapsed, value = _region_successful_row_values(row, sample_index)
+            except ValueError:
+                self._region_stats_pending_rows.clear()
+                self._region_stats_pending_overflow = False
+                self._region_stats_values = None
+                self._update_region_stats()
+                return
+            if left <= elapsed <= right:
                 stats.add(value)
         self._region_stats_pending_rows.clear()
+        self._region_stats_pending_overflow = False
         self._region_stats_values = stats
         self._region_stats_last_sample_index = last_sample_index
         self._show_region_stats(stats, "完整原始 CSV")
 
     def _on_region_samples(self, rows: list[dict]) -> None:
+        if self._region_stats_mode is not None and self._region_stats_mode != self._current_mode:
+            self._update_region_stats()
+            return
         if self._region_stats_scanning:
+            if len(self._region_stats_pending_rows) + len(rows) > MAX_PENDING_GUI_ROWS:
+                self._region_stats_pending_overflow = True
             self._region_stats_pending_rows.extend(rows)
+            if len(self._region_stats_pending_rows) > MAX_PENDING_GUI_ROWS:
+                del self._region_stats_pending_rows[:-MAX_PENDING_GUI_ROWS]
             return
         if self._region_stats_values is None or self._region_stats_bounds is None:
             if self._experiment_csv_path is None:
                 self._update_region_stats()
             return
         left, right = self._region_stats_bounds
+        if not _region_sample_rows_are_contiguous(rows, self._region_stats_last_sample_index):
+            self._region_stats_values = None
+            self._update_region_stats()
+            return
         changed = False
         for row in rows:
-            try:
-                sample_index = int(row.get("sample_index", 0))
-            except (TypeError, ValueError):
-                continue
+            sample_index = _parse_region_sample_index(row.get("sample_index"))
+            if sample_index is None:
+                self._region_stats_values = None
+                self._update_region_stats()
+                return
             if sample_index <= self._region_stats_last_sample_index:
                 continue
             self._region_stats_last_sample_index = sample_index
             if row.get("status") != "ok" or row.get("mode") != self._current_mode.value:
                 continue
             try:
-                elapsed = float(row["elapsed_s"])
-                value = float(row["value_si"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if math.isfinite(elapsed) and math.isfinite(value) and left <= elapsed <= right:
+                elapsed, value = _region_successful_row_values(row, sample_index)
+            except ValueError:
+                self._region_stats_values = None
+                self._update_region_stats()
+                return
+            if left <= elapsed <= right:
                 self._region_stats_values.add(value)
                 changed = True
         if changed:
@@ -4432,7 +5422,7 @@ class MainWindow(QMainWindow):
             return f"{scaled:.8g} {unit}"
 
         self._region_stats_label.setText(
-            f"{left:.6g}–{right:.6g} s · n={stats.count} · 最大 {fmt(stats.maximum)} (n={stats.count}) · "
+            f"选中区间 {left:.6g}–{right:.6g} s · n={stats.count} · 最大 {fmt(stats.maximum)} (n={stats.count}) · "
             f"最小 {fmt(stats.minimum)} (n={stats.count}) · 均值 {fmt(stats.mean)} (n={stats.count}) · "
             f"样本标准差 s {fmt(stats.sample_stddev)} (n={stats.count})"
             f" · {source}"
@@ -4481,7 +5471,7 @@ class MainWindow(QMainWindow):
         sample_number = int(metadata.get("sample_index") or idx + 1) if metadata else idx + 1
         self._selected_plot_point = (selected_x, selected_y, sample_number)
         self._selected_plot_metadata = metadata
-        self._locked_cursor_marker.setData([selected_x], [selected_y])
+        self._locked_cursor_marker.setData([selected_x], [selected_y - (self._plot_y_origin or 0.0)])
         self._locked_cursor_marker.show()
         self.cursor_label.setText(
             f"已锁定：{self._describe_plot_point(selected_x, selected_y, sample_number, metadata)} · 单击曲线可重新选点"
@@ -4514,7 +5504,7 @@ class MainWindow(QMainWindow):
             self.plot_widget.addItem(self._crosshair_x, ignoreBounds=True)
             self.plot_widget.addItem(self._crosshair_y, ignoreBounds=True)
         self._crosshair_x.setPos(xs[idx])
-        self._crosshair_y.setPos(y)
+        self._crosshair_y.setPos(float(y) - (self._plot_y_origin or 0.0))
         metadata = self._plot_metadata[idx] if idx < len(self._plot_metadata) else None
         sample_number = int(metadata.get("sample_index") or idx + 1) if metadata else idx + 1
         preview = self._describe_plot_point(float(xs[idx]), float(y), sample_number, metadata)
@@ -4584,7 +5574,7 @@ class MainWindow(QMainWindow):
             self.baseline_line.hide()
             self.change_label.setText("未设置基准值")
         else:
-            self.baseline_line.setValue(self._baseline)
+            self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
             self.baseline_line.show()
         if self._experiment_active:
             if self._baseline is None:
@@ -4641,7 +5631,9 @@ class MainWindow(QMainWindow):
         self._add_event_marker(event_text, elapsed_s=elapsed_s)
         self._update_controls()
 
-    def _add_event_marker(self, text: str, elapsed_s: float | None = None) -> None:
+    def _add_event_marker(
+        self, text: str, elapsed_s: float | None = None, *, reposition_labels: bool = True
+    ) -> None:
         line = pg.InfiniteLine(
             angle=90, movable=False,
             pen=pg.mkPen("#e9c46a", width=1, style=Qt.PenStyle.DashLine),
@@ -4663,7 +5655,14 @@ class MainWindow(QMainWindow):
         item.setData(Qt.ItemDataRole.UserRole, marker_elapsed)
         item.setToolTip("点击或按 Enter 将图表定位到该事件")
         self.event_list_widget.addItem(item)
-        self._position_event_labels()
+        if reposition_labels:
+            self._position_event_labels()
+
+    def _add_event_markers(self, events: list[tuple[float, str]]) -> None:
+        for elapsed_s, text in events:
+            self._add_event_marker(text, elapsed_s=elapsed_s, reposition_labels=False)
+        if events:
+            self._position_event_labels()
 
     def _focus_event_item(self, item: QListWidgetItem | None) -> None:
         if item is None:
@@ -4680,6 +5679,110 @@ class MainWindow(QMainWindow):
         self.view_box.setRange(
             xRange=(elapsed - span / 2, elapsed + span / 2), padding=0
         )
+
+    def _sync_plot_y_span_control(self, *_args) -> None:
+        edit = getattr(self, "y_axis_span_edit", None)
+        if edit is None:
+            return
+        unit = descriptor(self._current_mode).unit_si
+        self.y_axis_span_unit_label.setText("Ω" if unit == "Ohm" else unit)
+        if edit.hasFocus():
+            return
+        y_min, y_max = self.view_box.viewRange()[1]
+        span = float(y_max - y_min)
+        if math.isfinite(span) and span > 0:
+            edit.setText(f"{span:.8g}")
+
+    def _sync_plot_y_axis(self, *_args) -> None:
+        axis = getattr(self, "y_axis", None)
+        if isinstance(axis, _OffsetValueAxis):
+            axis.value_offset = self._plot_y_origin or 0.0
+            y_min, y_max = self.view_box.viewRange()[1]
+            axis.display_factor, axis.display_unit = _engineering_axis_scale(
+                float(y_max - y_min), descriptor(self._current_mode).unit_si,
+            )
+            spec = descriptor(self._current_mode)
+            title = spec.display_quantity
+            span = float(y_max - y_min)
+            if axis.value_offset and math.isfinite(span) and span > 0 and abs(axis.value_offset) > span * 1e6:
+                origin_value, origin_unit = engineering_value(axis.value_offset, spec.unit_si)
+                title = f"{title} · 刻度相对 {origin_value:.6g} {origin_unit}"
+            if self._history_mode:
+                title = f"历史数据 · {title}"
+            if (
+                axis.labelText != title
+                or axis.labelUnits != axis.display_unit
+            ):
+                self.plot_widget.setLabel(
+                    "left", title, units=axis.display_unit, color="#697470",
+                )
+            axis.update()
+
+    def _apply_plot_y_span(self, *_args) -> None:
+        try:
+            requested_span = float(self.y_axis_span_edit.text().strip())
+        except (TypeError, ValueError, OverflowError):
+            self.statusBar().showMessage("请输入大于 0 的有限纵轴跨度", 8000)
+            return
+        if not math.isfinite(requested_span) or requested_span <= 0:
+            self.statusBar().showMessage("请输入大于 0 的有限纵轴跨度", 8000)
+            return
+        if not self._plot_y:
+            self.statusBar().showMessage("请先显示有效测量数据，再设置纵轴跨度", 8000)
+            return
+        y_min, y_max = self.view_box.viewRange()[1]
+        previous_y_range = (float(y_min), float(y_max))
+        previous_origin = self._plot_y_origin
+        previous_follow = self.follow_check.isChecked()
+        center = y_min + (y_max - y_min) / 2
+        current_origin = self._plot_y_origin or 0.0
+        target_origin = current_origin + center
+        if math.isfinite(target_origin):
+            self._rebase_plot_y_origin(target_origin)
+            center = 0.0
+        # Y is plotted as a delta from the first reading, avoiding the ULP
+        # floor imposed by large absolute values such as 30 MΩ.
+        minimum_span = math.ulp(center) * 2
+        span = max(requested_span, minimum_span)
+        self._update_plot_data_limits()
+        y_limits = self.view_box._effectiveLimits()[1]
+        maximum_span = None
+        if y_limits[0] is not None and y_limits[1] is not None:
+            maximum_span = float(y_limits[1] - y_limits[0])
+            if math.isfinite(maximum_span) and maximum_span > 0:
+                span = min(span, maximum_span)
+                center = min(max(center, y_limits[0] + span / 2), y_limits[1] - span / 2)
+        boundary_limited = span < max(requested_span, minimum_span) and maximum_span is not None
+        lower, upper = center - span / 2, center + span / 2
+        if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
+            if previous_origin is not None:
+                self._rebase_plot_y_origin(previous_origin)
+                self.view_box.setRange(yRange=previous_y_range, padding=0)
+            self.statusBar().showMessage("这个纵轴跨度小于图表可表示的范围", 8000)
+            return
+        self.follow_check.setChecked(False)
+        self.view_box.state["targetRange"][1] = [lower, upper]
+        self.view_box.updateViewRange(forceY=True)
+        actual_y_min, actual_y_max = self.view_box.viewRange()[1]
+        actual_span = float(actual_y_max - actual_y_min)
+        unit = "Ω" if descriptor(self._current_mode).unit_si == "Ohm" else descriptor(self._current_mode).unit_si
+        self._sync_plot_y_span_control()
+        if not math.isfinite(actual_span) or actual_span <= 0:
+            if previous_origin is not None:
+                self._rebase_plot_y_origin(previous_origin)
+            self.view_box.state["targetRange"][1] = list(previous_y_range)
+            self.view_box.updateViewRange(forceY=True)
+            self.follow_check.setChecked(previous_follow)
+            self._sync_plot_y_span_control()
+            self.statusBar().showMessage("图表边界无法应用该跨度，已恢复之前的纵轴视图", 8000)
+        elif boundary_limited:
+            self.statusBar().showMessage(f"受图表边界限制；当前纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
+        elif span > requested_span:
+            self.statusBar().showMessage(f"输入范围低于当前浮点精度；当前纵轴跨度为 {actual_span:.8g} {unit}", 8000)
+        elif not math.isclose(actual_span, span, rel_tol=1e-6, abs_tol=minimum_span):
+            self.statusBar().showMessage(f"受图表边界限制；当前纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
+        else:
+            self.statusBar().showMessage(f"纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
 
     def _position_event_labels(self, *_args) -> None:
         if not self._event_labels:
@@ -4776,6 +5879,7 @@ class MainWindow(QMainWindow):
         self._user_stop_pending = False
         self._last_acquisition_issue = ""
         self.recovery_hint_label.clear()
+        self.recovery_hint_label.setToolTip("")
         self.recovery_hint_label.hide()
         self._experiment_csv_path = Path(directory) / "measurements.csv"
         self._update_controls()
@@ -4787,6 +5891,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "选择实验保存根目录", current)
         if folder:
             self.output_root.setText(folder)
+            self._save_profiles()
 
     def _validate_experiment_name_field(self, *_args) -> bool:
         try:
@@ -4797,7 +5902,7 @@ class MainWindow(QMainWindow):
             self.experiment_name_validation.setStyleSheet("color: #b42318;")
         else:
             self._experiment_name_valid = True
-            self.experiment_name_validation.setText("名称有效；重复实验会使用独立时间戳目录，不会覆盖旧数据。")
+            self.experiment_name_validation.setText("名称有效；如有同名实验，可选择先备份再覆盖、另存目录或改名。")
             self.experiment_name_validation.setStyleSheet("")
         if hasattr(self, "start_button"):
             self._update_controls()
@@ -4842,6 +5947,7 @@ class MainWindow(QMainWindow):
     def _on_safe_events_exported(self, destination: str, error: object) -> None:
         self._safe_events_export_task = None
         if self._shutdown_started:
+            self._record_shutdown_file_task_result("事件安全副本", error)
             return
         self.export_events_safe_button.setEnabled(
             self._experiment_directory() is not None and not self._experiment_active
@@ -4890,6 +5996,7 @@ class MainWindow(QMainWindow):
     def _on_safe_measurements_exported(self, destination: str, error: object) -> None:
         self._safe_measurements_export_task = None
         if self._shutdown_started:
+            self._record_shutdown_file_task_result("测量安全副本", error)
             return
         directory = self._experiment_directory()
         self.files_safe_measurements_button.setEnabled(
@@ -4901,6 +6008,52 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(
             f"已导出测量安全副本；原始 measurements.csv 未修改：{destination}", 10000
+        )
+
+    def _export_share_package(self) -> None:
+        if self._experiment_active:
+            QMessageBox.information(
+                self, "\u8bf7\u5148\u505c\u6b62\u91c7\u96c6",
+                "\u5206\u4eab\u5305\u9700\u8981\u7a33\u5b9a\u7684\u5b9e\u9a8c\u6587\u4ef6\u3002\u505c\u6b62\u91c7\u96c6\u540e\u518d\u5bfc\u51fa\uff1b\u5206\u4eab\u5305\u662f\u5355\u72ec\u7684\u8131\u654f\u526f\u672c\uff0c\u539f\u59cb\u6570\u636e\u4e0d\u4f1a\u4fee\u6539\u3002",
+            )
+            return
+        directory = self._experiment_directory()
+        if directory is None or not (directory / "measurements.csv").is_file() or not (directory / "config.json").is_file():
+            self.statusBar().showMessage("\u7f3a\u5c11 config.json \u6216 measurements.csv\uff0c\u65e0\u6cd5\u751f\u6210\u5b9e\u9a8c\u5206\u4eab\u5305\u3002", 8000)
+            return
+        suggestion = directory.with_name(f"{directory.name}_share.zip")
+        destination_text, _selected_filter = QFileDialog.getSaveFileName(
+            self, "\u5bfc\u51fa\u8131\u654f\u5b9e\u9a8c\u5206\u4eab\u5305", str(suggestion), "ZIP \u6587\u4ef6 (*.zip)"
+        )
+        if not destination_text:
+            return
+        destination = Path(destination_text)
+        if destination.suffix.casefold() != ".zip":
+            destination = destination.with_suffix(".zip")
+        task = _SharePackageExportTask(directory, destination)
+        task.signals.completed.connect(self._on_share_package_exported)
+        self._share_export_task = task
+        self.files_share_package_button.setEnabled(False)
+        self.statusBar().showMessage("\u6b63\u5728\u540e\u53f0\u751f\u6210\u8131\u654f\u5206\u4eab\u5305\uff1b\u539f\u59cb\u5b9e\u9a8c\u6587\u4ef6\u4fdd\u6301\u4e0d\u53d8\u3002")
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(str, object)
+    def _on_share_package_exported(self, destination: str, error: object) -> None:
+        self._share_export_task = None
+        if self._shutdown_started:
+            self._record_shutdown_file_task_result("实验分享包", error)
+            return
+        directory = self._experiment_directory()
+        self.files_share_package_button.setEnabled(
+            directory is not None and not self._experiment_active
+            and (directory / "measurements.csv").is_file()
+            and (directory / "config.json").is_file()
+        )
+        if error:
+            self._show_error(f"\u8131\u654f\u5206\u4eab\u5305\u5bfc\u51fa\u5931\u8d25\uff1a{error}")
+            return
+        self.statusBar().showMessage(
+            f"\u5df2\u751f\u6210\u8131\u654f\u5206\u4eab\u5305\uff1b\u539f\u59cb\u5b9e\u9a8c\u6587\u4ef6\u672a\u4fee\u6539\uff1a{destination}", 12000
         )
 
     def _update_experiment_directory_controls(self) -> None:
@@ -4916,6 +6069,12 @@ class MainWindow(QMainWindow):
             self.files_safe_measurements_button.setEnabled(
                 directory is not None and not self._experiment_active
                 and (directory / "measurements.csv").is_file()
+            )
+        if hasattr(self, "files_share_package_button"):
+            self.files_share_package_button.setEnabled(
+                directory is not None and not self._experiment_active
+                and (directory / "measurements.csv").is_file()
+                and (directory / "config.json").is_file()
             )
         available = directory is not None
         self.recent_experiment_path.setText(str(directory) if available else "尚无可用实验目录")
@@ -4948,6 +6107,11 @@ class MainWindow(QMainWindow):
         )
         self.files_safe_measurements_button.setEnabled(
             available and not self._experiment_active and (directory / "measurements.csv").is_file()
+        )
+        self.files_share_package_button.setEnabled(
+            available and not self._experiment_active
+            and (directory / "measurements.csv").is_file()
+            and (directory / "config.json").is_file()
         )
         if directory is None:
             self.experiment_file_list.addItem("尚无实验文件；完成一次测量后会在此列出原始数据和导出结果。")
@@ -5037,6 +6201,7 @@ class MainWindow(QMainWindow):
         self._snapshot_pending = False
         self._snapshot_task = None
         if self._shutdown_started:
+            self._record_shutdown_file_task_result("实验快照", error)
             return
         self._update_controls()
         if error:
@@ -5047,52 +6212,376 @@ class MainWindow(QMainWindow):
             20000,
         )
 
+    def _plot_y_anchor_at_x(self, plot_x: float) -> float | None:
+        """Return the linearly interpolated visible curve value at a plot time."""
+        if not math.isfinite(plot_x):
+            return None
+        try:
+            x_values, y_values = self.curve.getData()
+            if x_values is None or y_values is None:
+                return None
+            x_values = np.asarray(x_values)
+            y_values = np.asarray(y_values)
+            if x_values.ndim != 1 or y_values.ndim != 1 or not len(x_values) or len(x_values) != len(y_values):
+                return None
+            if not self._plot_x_nondecreasing:
+                valid = np.isfinite(x_values) & np.isfinite(y_values)
+                if not np.any(valid):
+                    return None
+                valid_indices = np.flatnonzero(valid)
+                nearest_offset = int(np.argmin(np.abs(x_values[valid] - plot_x)))
+                return float(y_values[valid_indices[nearest_offset]])
+
+            left_edge = int(np.searchsorted(x_values, plot_x, side="left"))
+            right_edge = int(np.searchsorted(x_values, plot_x, side="right"))
+            if left_edge < right_edge:
+                exact_values = y_values[left_edge:right_edge]
+                exact_values = exact_values[np.isfinite(exact_values)]
+                if exact_values.size:
+                    return float(exact_values[-1])
+
+            left = left_edge - 1
+            while left >= 0 and not math.isfinite(float(y_values[left])):
+                left -= 1
+            right = left_edge
+            while right < len(y_values) and not math.isfinite(float(y_values[right])):
+                right += 1
+
+            if left < 0:
+                return float(y_values[right]) if right < len(y_values) else None
+            if right >= len(y_values):
+                return float(y_values[left])
+            left_x = float(x_values[left])
+            right_x = float(x_values[right])
+            if right == left + 1 and right_x > left_x:
+                fraction = min(1.0, max(0.0, (plot_x - left_x) / (right_x - left_x)))
+                left_y = float(y_values[left])
+                right_y = float(y_values[right])
+                return left_y + fraction * (right_y - left_y)
+
+            # A NaN between samples marks a real break in the trace. Anchor to
+            # the nearest finite endpoint instead of interpolating across it.
+            return float(y_values[left] if plot_x - left_x <= right_x - plot_x else y_values[right])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+
+    def _plot_y_zoom_anchor_at_x(self, plot_x: float) -> tuple[float, float] | None:
+        """Return a nearby recorded sample as (plot coordinate, raw reading)."""
+        if not math.isfinite(plot_x):
+            return None
+        try:
+            x_values = self._plot_y_anchor_x
+            y_values = self._plot_y_anchor_values
+            if x_values.ndim != 1 or y_values.ndim != 1 or len(x_values) != len(y_values) or not len(x_values):
+                return None
+            if not self._plot_x_nondecreasing:
+                valid_indices = np.flatnonzero(np.isfinite(x_values) & np.isfinite(y_values))
+                if not valid_indices.size:
+                    return None
+                index = int(valid_indices[np.argmin(np.abs(x_values[valid_indices] - plot_x))])
+            else:
+                left_edge = int(np.searchsorted(x_values, plot_x, side="left"))
+                right_edge = int(np.searchsorted(x_values, plot_x, side="right"))
+                if left_edge < right_edge:
+                    exact_indices = np.flatnonzero(np.isfinite(y_values[left_edge:right_edge]))
+                    if exact_indices.size:
+                        index = left_edge + int(exact_indices[-1])
+                    else:
+                        index = -1
+                else:
+                    index = -1
+                if index < 0:
+                    left = left_edge - 1
+                    while left >= 0 and not math.isfinite(float(y_values[left])):
+                        left -= 1
+                    right = left_edge
+                    while right < len(y_values) and not math.isfinite(float(y_values[right])):
+                        right += 1
+                    if left < 0:
+                        index = right if right < len(y_values) else -1
+                    elif right >= len(y_values):
+                        index = left
+                    else:
+                        index = left if plot_x - float(x_values[left]) <= float(x_values[right]) - plot_x else right
+            if index < 0:
+                return None
+            absolute = float(y_values[index])
+            origin = self._plot_y_origin if self._plot_y_origin is not None else 0.0
+            return absolute - origin, absolute
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+
     def _refresh_curve(self) -> None:
+        if self._plot_y_origin is None:
+            self._plot_y_origin = next(
+                (float(value) for value in self._plot_y if math.isfinite(float(value))),
+                None,
+            )
+        origin = self._plot_y_origin if self._plot_y_origin is not None else 0.0
+        self.view_box.zero_y = -origin
+        self.view_box.y_anchor_tolerance = math.ulp(origin)
+        if hasattr(self, "y_axis"):
+            self.y_axis.value_offset = origin
+            self.y_axis.setToolTip(
+                "纵轴使用相对坐标保持高读数下的精细缩放；极窄跨度时刻度显示为参考读数 + 偏移量。"
+            )
         x_values: list[float] = []
         y_values: list[float] = []
+        previous_x = None
+        reference_step = None
+        self._plot_x_nondecreasing = True
+        self._plot_x_uniformly_spaced = True
         for index, (x, y) in enumerate(zip(self._plot_x, self._plot_y)):
-            if index and index < len(self._plot_break_before) and self._plot_break_before[index]:
+            current_x = float(x)
+            has_break = bool(index and index < len(self._plot_break_before) and self._plot_break_before[index])
+            if not math.isfinite(current_x):
+                self._plot_x_nondecreasing = False
+                self._plot_x_uniformly_spaced = False
+            elif previous_x is not None:
+                step = current_x - previous_x
+                if step < 0:
+                    self._plot_x_nondecreasing = False
+                    self._plot_x_uniformly_spaced = False
+                elif step == 0 or has_break:
+                    self._plot_x_uniformly_spaced = False
+                elif reference_step is None:
+                    reference_step = step
+                elif not math.isclose(step, reference_step, rel_tol=1e-3):
+                    self._plot_x_uniformly_spaced = False
+            elif has_break:
+                self._plot_x_uniformly_spaced = False
+            if math.isfinite(current_x):
+                previous_x = current_x
+            if has_break:
                 # Keep X nondecreasing for pyqtgraph's clipToView bisect, and
                 # retain an explicit NaN in Y so finite-only connectivity never
                 # bridges a failed reading or a gap in imported history.
                 x_values.append(float(x))
                 y_values.append(math.nan)
-            x_values.append(float(x))
-            y_values.append(float(y))
+            x_values.append(current_x)
+            y_values.append(float(y) - origin)
+        # PyQtGraph's clipToView bisects X, while autoDownsample assumes an
+        # evenly spaced X sequence. Preserve recorded samples/order whenever
+        # those assumptions do not hold for imported or event-marked data.
         self.curve.setData(
-            x_values, y_values, connect="finite", autoDownsample=True,
-            downsampleMethod="peak", clipToView=True,
+            x_values,
+            y_values,
+            connect="finite",
+            autoDownsample=self._plot_x_uniformly_spaced,
+            downsampleMethod="peak",
+            clipToView=self._plot_x_nondecreasing,
         )
+        self._plot_y_anchor_x = np.asarray(self._plot_x, dtype=float)
+        self._plot_y_anchor_values = np.asarray(self._plot_y, dtype=float)
+        if self._baseline is not None:
+            self.baseline_line.setValue(float(self._baseline) - origin)
+            self.baseline_line.show()
+        if self._selected_plot_point is not None:
+            selected_x, selected_y, _sample_number = self._selected_plot_point
+            self._locked_cursor_marker.setData([selected_x], [selected_y - origin])
+        if self._crosshair_y is not None and self._plot_y:
+            self._crosshair_y.setPos(float(self._plot_y[-1]) - origin)
+        self.y_axis.update()
+
+    def _rebase_plot_for_zoom(self, center_y: float, absolute_anchor=None) -> None:
+        old_origin = self._plot_y_origin or 0.0
+        try:
+            absolute_anchor = float(absolute_anchor)
+        except (TypeError, ValueError, OverflowError):
+            absolute_anchor = math.nan
+        new_origin = absolute_anchor if math.isfinite(absolute_anchor) else old_origin + float(center_y)
+        if math.isfinite(new_origin):
+            self._rebase_plot_y_origin(new_origin)
+        actual_origin = self._plot_y_origin or 0.0
+        self.view_box._last_zoom_rebase_delta = actual_origin - old_origin
+        self.view_box._last_zoom_rebase_changed = self.view_box._last_zoom_rebase_delta != 0.0
+
+    def _rebase_plot_y_origin(self, new_origin: float) -> None:
+        """Move the plot coordinate origin while preserving the visible range."""
+        if not math.isfinite(new_origin):
+            return
+        old_origin = self._plot_y_origin or 0.0
+        if new_origin == old_origin:
+            return
+        try:
+            low, high = (float(value) for value in self.view_box.viewRange()[1])
+        except (AttributeError, TypeError, ValueError, IndexError, OverflowError):
+            low = high = 0.0
+        shift = old_origin - new_origin
+        self._plot_y_origin = new_origin
+        self._refresh_curve()
+        self._update_plot_data_limits()
+        if math.isfinite(low + shift) and math.isfinite(high + shift) and high + shift > low + shift:
+            self.view_box.setRange(yRange=(low + shift, high + shift), padding=0)
+
+    def _schedule_history_detail_reload(self) -> None:
+        timer = getattr(self, "_history_range_timer", None)
+        if (
+            self._history_mode and self._history_overview_data is not None
+            and self._experiment_csv_path is not None and timer is not None
+        ):
+            timer.start()
+
+    def _show_history_overview(self) -> None:
+        overview = self._history_overview_data
+        if overview is None:
+            return
+        timer = getattr(self, "_history_range_timer", None)
+        if timer is not None:
+            timer.stop()
+        task = self._history_range_task
+        if task is not None:
+            task.cancel()
+        self._history_range_sequence += 1
+        self._history_range_pending = False
+        self._history_range_task = None
+        self._history_detail_range = None
+        self._history_detail_is_downsampled = False
+        self._plot_x.clear()
+        self._plot_y.clear()
+        self._plot_metadata.clear()
+        self._plot_break_before.clear()
+        self._plot_x.extend(overview["x"])
+        self._plot_y.extend(overview["y"])
+        self._plot_metadata.extend(overview["metadata"])
+        self._plot_break_before.extend(overview["break_before"])
+        self._selected_plot_point = None
+        self._selected_plot_metadata = None
+        self._locked_cursor_marker.hide()
+        self._refresh_curve()
+
+    def _load_history_detail_for_view(self) -> None:
+        if not self._history_mode or self._history_overview_data is None or self._experiment_csv_path is None:
+            return
+        try:
+            x_bounds = self.view_box.viewRange()[0]
+            left, right = float(x_bounds[0]), float(x_bounds[1])
+        except (AttributeError, TypeError, ValueError, IndexError, OverflowError):
+            return
+        if not (math.isfinite(left) and math.isfinite(right)) or right <= left:
+            return
+        overview = self._history_overview_data
+        full_left, full_right = float(overview["x"][0]), float(overview["x"][-1])
+        full_span = max(full_right - full_left, 1e-12)
+        requested_span = right - left
+        if requested_span >= full_span * 0.85:
+            self._show_history_overview()
+            return
+
+        detail_range = self._history_detail_range
+        if (
+            detail_range is not None and not self._history_detail_is_downsampled
+            and detail_range[0] <= left and detail_range[1] >= right
+        ):
+            return
+        left = max(full_left, left - requested_span * 0.05)
+        right = min(full_right, right + requested_span * 0.05)
+        previous = self._history_range_task
+        if previous is not None:
+            previous.cancel()
+        self._history_range_sequence += 1
+        request_id = self._history_range_sequence
+        self._history_range_requested = (left, right)
+        task = _HistoryRangeLoadTask(
+            request_id, self._experiment_csv_path, left, right, MAX_PLOT_POINTS,
+            range_index=overview.get("_range_index"),
+        )
+        task.signals.completed.connect(self._on_history_detail_loaded)
+        self._history_range_task = task
+        self._active_history_range_tasks[request_id] = task
+        self._history_range_pending = True
+        self.chart_source_label.setText("历史文件 · 正在读取当前时间窗细节")
+        self.chart_source_label.setToolTip(
+            f"正在后台扫描 {self._experiment_csv_path}；完整运行概览和原始 CSV 均保留。"
+        )
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(int, str, object, object)
+    def _on_history_detail_loaded(self, request_id: int, path: str, result: object, error: object) -> None:
+        self._active_history_range_tasks.pop(request_id, None)
+        current_task = self._history_range_task
+        if current_task is not None and current_task.request_id == request_id:
+            self._history_range_task = None
+            self._history_range_pending = False
+        if self._shutdown_started:
+            self._maybe_complete_shutdown()
+            return
+        if request_id != self._history_range_sequence:
+            return
+        if not self._history_mode or self._experiment_csv_path is None or str(self._experiment_csv_path) != path:
+            return
+        self.chart_source_label.setText(f"历史：{Path(path).name}")
+        self.chart_source_label.setToolTip(f"当前图表数据来源：历史文件 {path}")
+        if error:
+            if error != "图表细节加载已取消":
+                self.statusBar().showMessage(f"历史图表细节读取失败：{error}", 10000)
+            return
+        if not isinstance(result, dict):
+            self.statusBar().showMessage("历史图表细节读取失败：后台任务未返回数据", 10000)
+            return
+        self._plot_x.clear()
+        self._plot_y.clear()
+        self._plot_metadata.clear()
+        self._plot_break_before.clear()
+        self._plot_x.extend(result.get("x", ()))
+        self._plot_y.extend(result.get("y", ()))
+        self._plot_metadata.extend(result.get("metadata", ()))
+        self._plot_break_before.extend(result.get("break_before", ()))
+        self._history_detail_range = self._history_range_requested
+        self._history_detail_is_downsampled = (
+            int(result.get("valid_count", 0) or 0) > len(self._plot_x)
+        )
+        self._selected_plot_point = None
+        self._selected_plot_metadata = None
+        self._locked_cursor_marker.hide()
+        self._refresh_curve()
+        self.plot_empty_overlay.setVisible(not self._plot_x)
+        self._position_event_labels()
 
     def _update_plot_data_limits(self) -> None:
-        if not self._plot_x or not self._plot_y:
+        points = self._history_overview_data if self._history_mode and self._history_overview_data else None
+        plot_x = points["x"] if points is not None else self._plot_x
+        plot_y = points["y"] if points is not None else self._plot_y
+        if not plot_x or not plot_y:
+            self.view_box.set_pan_y_data_bounds(None)
             return
-        first_x = float(self._plot_x[0])
-        last_x = float(self._plot_x[-1])
-        min_y = min(float(value) for value in self._plot_y)
-        max_y = max(float(value) for value in self._plot_y)
+        first_x = float(plot_x[0])
+        last_x = float(plot_x[-1])
+        min_y = min(float(value) for value in plot_y)
+        max_y = max(float(value) for value in plot_y)
+        origin = self._plot_y_origin or 0.0
+        min_y -= origin
+        max_y -= origin
+        self.view_box.set_pan_y_data_bounds((min_y, max_y))
         x_margin = max((last_x - first_x) * 0.05, abs(first_x) * 1e-12, 1e-6)
-        y_span = max(max_y - min_y, abs(min_y) * 1e-12, abs(max_y) * 1e-12, 1e-12)
-        y_margin = max(y_span * 0.08, 1e-15)
+        y_margin = _plot_y_margin(min_y + origin, max_y + origin)
+        y_view_min, y_view_max = _plot_y_view_limits(min_y, max_y)
         self.view_box.setLimits(
             xMin=0.0 if self.follow_check.isChecked() else first_x - x_margin,
             xMax=last_x + max(x_margin, AUTO_FOLLOW_WINDOW_S) if self.follow_check.isChecked() else last_x + x_margin,
-            yMin=min_y - y_margin,
-            yMax=max_y + y_margin,
+            yMin=y_view_min,
+            yMax=y_view_max,
         )
 
     def _autoscale_plot(self) -> None:
         self.follow_check.setChecked(False)
+        if self._history_mode and self._history_overview_data is not None:
+            self._show_history_overview()
         self._update_plot_data_limits()
-        if self._plot_x and self._plot_y:
+        points = self._history_overview_data if self._history_mode and self._history_overview_data else None
+        plot_x = points["x"] if points is not None else self._plot_x
+        plot_y = points["y"] if points is not None else self._plot_y
+        if plot_x and plot_y:
             self.plot_widget.getPlotItem().enableAutoRange(x=False, y=False)
-            first_x = float(self._plot_x[0])
-            last_x = float(self._plot_x[-1])
-            min_y = min(float(value) for value in self._plot_y)
-            max_y = max(float(value) for value in self._plot_y)
+            first_x = float(plot_x[0])
+            last_x = float(plot_x[-1])
+            min_y = min(float(value) for value in plot_y)
+            max_y = max(float(value) for value in plot_y)
+            origin = self._plot_y_origin or 0.0
+            min_y -= origin
+            max_y -= origin
             x_margin = max((last_x - first_x) * 0.05, abs(first_x) * 1e-12, 1e-6)
-            y_span = max(max_y - min_y, abs(min_y) * 1e-12, abs(max_y) * 1e-12, 1e-12)
-            y_margin = max(y_span * 0.08, 1e-15)
+            y_margin = _plot_y_margin(min_y + origin, max_y + origin)
             self.view_box.setRange(
                 xRange=(first_x - x_margin, last_x + x_margin),
                 yRange=(min_y - y_margin, max_y + y_margin),
@@ -5151,6 +6640,7 @@ class MainWindow(QMainWindow):
             "latest_invalid_tooltip": self.latest_invalid_label.toolTip(),
             "latest_invalid_log": self._latest_invalid_log_text,
             "recovery_hint": self.recovery_hint_label.text(),
+            "recovery_hint_full": self.recovery_hint_label.toolTip() or self.recovery_hint_label.text(),
             "acquisition_issue": self._last_acquisition_issue,
         }
 
@@ -5177,7 +6667,7 @@ class MainWindow(QMainWindow):
         if self._baseline is None:
             self.baseline_line.hide()
         else:
-            self.baseline_line.setValue(self._baseline)
+            self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
             self.baseline_line.show()
         self.latest_value_label.setText(snapshot["latest_text"])
         self.actual_rate_label.setText(snapshot["rate_text"])
@@ -5186,17 +6676,26 @@ class MainWindow(QMainWindow):
         self.latest_invalid_label.setText(snapshot["latest_invalid_text"])
         self.latest_invalid_label.setToolTip(snapshot["latest_invalid_tooltip"])
         self._latest_invalid_log_text = snapshot["latest_invalid_log"]
+        if self._latest_invalid_log_text:
+            self._update_latest_invalid_summary()
+        self.latest_invalid_label.setVisible(
+            not self._short_viewport_layout or bool(self._latest_invalid_log_text)
+        )
         self.latest_invalid_log_button.setEnabled(bool(self._latest_invalid_log_text))
+        self.latest_invalid_log_button.setVisible(bool(self._latest_invalid_log_text))
         self._last_acquisition_issue = snapshot["acquisition_issue"]
-        self.recovery_hint_label.setText(snapshot["recovery_hint"])
-        self.recovery_hint_label.setVisible(bool(snapshot["recovery_hint"]))
+        recovery_hint = snapshot.get("recovery_hint_full", snapshot["recovery_hint"])
+        self.recovery_hint_label.setToolTip(recovery_hint)
+        self.recovery_hint_label.setText(
+            "采集已停止 · 悬停查看" if self._short_viewport_layout and recovery_hint else recovery_hint
+        )
+        self.recovery_hint_label.setVisible(bool(recovery_hint))
         self._refresh_curve()
         self._update_plot_data_limits()
         self.plot_empty_overlay.setVisible(not self._plot_x)
         self.follow_check.setChecked(bool(snapshot["follow"]))
         self._on_follow_toggled(bool(snapshot["follow"]))
-        for elapsed, text in snapshot["events"]:
-            self._add_event_marker(text, elapsed_s=elapsed)
+        self._add_event_markers(snapshot["events"])
         if self._plot_x:
             self.view_box.setRange(
                 xRange=snapshot["x_range"], yRange=snapshot["y_range"], padding=0
@@ -5207,26 +6706,47 @@ class MainWindow(QMainWindow):
         self._update_stats(self._global_stats)
 
     def _clear_plot(self, *, preserve_live_snapshot: bool = False) -> None:
+        history_timer = getattr(self, "_history_range_timer", None)
+        if history_timer is not None:
+            history_timer.stop()
+        self._history_range_sequence += 1
+        if self._history_range_task is not None:
+            self._history_range_task.cancel()
+        self._history_range_task = None
+        self._history_range_pending = False
+        self._history_overview_data = None
+        self._history_detail_range = None
+        self._history_detail_is_downsampled = False
         self._region_stats_request_id += 1
         for task in self._region_stats_tasks.values():
             task.cancel()
         self._region_stats_scanning = False
         self._region_stats_pending_rows.clear()
+        self._region_stats_pending_overflow = False
+        self._region_stats_mode = None
         self._region_stats_values = None
         self._region_stats_last_sample_index = 0
         self._region_stats_bounds = None
         self._experiment_csv_path = None
         self._plot_x.clear()
         self._plot_y.clear()
+        self._plot_y_anchor_x = np.asarray([], dtype=float)
+        self._plot_y_anchor_values = np.asarray([], dtype=float)
+        self._plot_y_origin = None
+        self.view_box.zero_y = 0.0
+        self.y_axis.value_offset = 0.0
         self._plot_metadata.clear()
         self._plot_break_before.clear()
         self._plot_break_pending = False
         self._latest_invalid_log_text = ""
         self.latest_invalid_label.setText("最近无效读数：无")
         self.latest_invalid_label.setToolTip("采集中的无效读数及其原因会显示在这里")
+        self.latest_invalid_label.setVisible(not self._short_viewport_layout)
         self.latest_invalid_log_button.setEnabled(False)
+        self.latest_invalid_log_button.setVisible(not self._short_viewport_layout)
         self._last_acquisition_issue = ""
         self.recovery_hint_label.clear()
+        self.recovery_hint_label.setToolTip("")
         self.recovery_hint_label.hide()
         if not preserve_live_snapshot:
             self._live_plot_snapshot = None
@@ -5280,6 +6800,7 @@ class MainWindow(QMainWindow):
         self._history_load_pending = True
         self._history_load_task = task
         self.history_button.setEnabled(False)
+        self._update_controls()
         self.statusBar().showMessage("正在后台读取并分析历史 CSV；界面仍可继续操作…")
         QThreadPool.globalInstance().start(task)
 
@@ -5288,13 +6809,24 @@ class MainWindow(QMainWindow):
         if self._shutdown_started:
             self._history_load_pending = False
             self._history_load_task = None
+            self._maybe_complete_shutdown()
             return
         self._history_load_pending = False
         self._history_load_task = None
         self.history_button.setEnabled(True)
+        self._update_controls()
         if error == "历史 CSV 加载已取消":
             return
         if error:
+            if error.startswith(("CSV混合测量模式：", "CSV混合单位：")):
+                warning = (
+                    f"警告：{error} 当前文件未加载，现有曲线保持不变；"
+                    "请按单一测量模式和单位拆分文件后再导入。"
+                )
+                self.statusBar().showMessage(warning, 12000)
+                self._append_log(f"! {warning}")
+                QMessageBox.warning(self, "混合 CSV 未加载", warning)
+                return
             self._show_error(f"加载历史CSV失败：{error}")
             return
         if result is None:
@@ -5317,6 +6849,12 @@ class MainWindow(QMainWindow):
         self._save_live_plot_snapshot()
         self._clear_plot(preserve_live_snapshot=True)
         self._history_mode = True
+        self._history_overview_data = {
+            "x": list(xs), "y": list(ys),
+            "metadata": list(plot_metadata), "break_before": list(plot_break_before),
+            "_range_index": result.get("_range_index"),
+        }
+        self._history_detail_range = None
         self._plot_x.extend(xs)
         self._plot_y.extend(ys)
         self._plot_break_before.extend(plot_break_before)
@@ -5339,8 +6877,7 @@ class MainWindow(QMainWindow):
         self.chart_source_label.setToolTip(f"当前图表数据来源：历史文件 {path}")
         self.view_mode_label.setText("历史文件视图")
         self.return_live_button.setEnabled(True)
-        for event_elapsed, event_text in history_events:
-            self._add_event_marker(event_text, elapsed_s=event_elapsed)
+        self._add_event_markers(history_events)
         spec = descriptor(self._current_mode)
         self.plot_widget.setLabel("left", f"历史数据 · {spec.display_quantity}", units=spec.unit_si, color="#697470")
         displayed, unit = engineering_value(last_value, spec.unit_si)
@@ -5353,7 +6890,7 @@ class MainWindow(QMainWindow):
             self.baseline_line.hide()
             self.change_label.setText("未设置基准值")
         else:
-            self.baseline_line.setValue(self._baseline)
+            self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
             self.baseline_line.show()
             delta = last_value - self._baseline
             percent = relative_change_percent(last_value, self._baseline, self._parse_threshold())
@@ -5488,7 +7025,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 15000)
 
     def _store_log_entry(self, message: str, formatted: str) -> None:
-        self._log_entries.append((_classify_log_message(message), formatted))
+        self._store_log_entries([(message, formatted)])
+
+    def _store_log_entries(self, entries: Iterable[tuple[str, str]]) -> None:
+        """Append a log batch and rebuild the filtered views once for the batch."""
+        categorized = [(_classify_log_message(message), formatted) for message, formatted in entries]
+        if not categorized:
+            return
+        self._log_entries.extend(categorized)
         self._render_filtered_log()
 
     @Slot()
@@ -5543,18 +7087,25 @@ class MainWindow(QMainWindow):
         lines, dropped = self._worker.take_scpi_log_update()
         if not lines and not dropped:
             return
+        entries = []
         if dropped:
             dropped_message = f"! SCPI显示日志缓冲曾丢弃较早的 {dropped} 行；测量读数和原始响应仍逐点保存在CSV中。"
-            self._store_log_entry(dropped_message, f"{datetime.now().astimezone().strftime('%H:%M:%S.%f')[:-3]}  {dropped_message}")
-        for timestamp, message in lines:
-            self._store_log_entry(message, f"{timestamp}  {message}")
+            dropped_time = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
+            entries.append((dropped_message, f"{dropped_time}  {dropped_message}"))
+        entries.extend((message, f"{timestamp}  {message}") for timestamp, message in lines)
+        self._store_log_entries(entries)
 
     @Slot(str)
     def _show_error(self, message: str) -> None:
+        operation_was_pending = self._configure_pending or self._zero_pending
         self._connection_pending = False
         self._start_pending = False
         self._diagnostic_pending = False
+        self._configure_pending = False
+        self._zero_pending = False
         self._event_save_pending = False
+        if operation_was_pending:
+            self._set_operation_status("操作失败", state="failure", detail=message)
         self.statusBar().showMessage(message, 12000)
         self._append_log(f"! {message}")
         self._update_controls()
@@ -5564,11 +7115,70 @@ class MainWindow(QMainWindow):
     def _on_worker_thread_finished(self) -> None:
         self._shutdown_finished = True
         if self._shutdown_started:
-            self.close()
+            self._maybe_complete_shutdown()
+
+    def _pending_background_shutdown_tasks(self) -> list[str]:
+        file_tasks = (
+            ("_safe_events_export_task", "事件安全副本"),
+            ("_safe_measurements_export_task", "测量安全副本"),
+            ("_share_export_task", "实验分享包"),
+            ("_snapshot_task", "实验快照"),
+        )
+        pending = [label for attribute, label in file_tasks if getattr(self, attribute, None) is not None]
+        if self._history_load_task is not None:
+            pending.append("历史 CSV 读取")
+        if self._active_history_range_tasks or self._history_range_task is not None:
+            pending.append("历史图表区间读取")
+        if self._region_stats_tasks:
+            pending.append("区间统计")
+        return pending
+
+    def _set_shutdown_task_wait_status(self, labels: list[str]) -> None:
+        names = "、".join(labels)
+        message = f"正在等待后台任务完成（{names}）；完成后安全退出…"
+        self.shutdown_status_label.setText(message)
+        self.shutdown_status_label.show()
+        self.statusBar().showMessage(message)
+
+    def _record_shutdown_file_task_result(self, label: str, error: object) -> None:
+        if error:
+            self._shutdown_file_errors.append(f"{label}：{error}")
+        self._maybe_complete_shutdown()
+
+    def _maybe_complete_shutdown(self) -> None:
+        if not self._shutdown_started or not self._shutdown_finished:
+            return
+        pending = self._pending_background_shutdown_tasks()
+        if pending:
+            self._set_shutdown_task_wait_status(pending)
+            return
+        if self._shutdown_file_errors and not self._shutdown_file_errors_reported:
+            details = "\n".join(self._shutdown_file_errors)
+            QMessageBox.warning(
+                self,
+                "后台文件任务未完成",
+                f"程序关闭前，以下文件任务未能成功完成：\n\n{details}\n\n请检查目标文件和磁盘空间。",
+            )
+            self._shutdown_file_errors_reported = True
+        self.close()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        history_timer = getattr(self, "_history_range_timer", None)
+        if history_timer is not None:
+            history_timer.stop()
+        self._history_range_sequence += 1
+        active_range_tasks = tuple(self._active_history_range_tasks.values())
+        for task in active_range_tasks:
+            task.cancel()
+        if self._history_range_task is not None and all(
+            task is not self._history_range_task for task in active_range_tasks
+        ):
+            self._history_range_task.cancel()
+        self._history_range_pending = False
         if self._shutdown_finished or not self._worker_thread.isRunning():
+            self._save_profiles()
             self._shutdown_started = True
+            self._shutdown_finished = True
             self._clock_timer.stop()
             history_task = getattr(self, "_history_load_task", None)
             if history_task is not None:
@@ -5576,8 +7186,17 @@ class MainWindow(QMainWindow):
             self._region_stats_request_id += 1
             self._region_stats_scanning = False
             self._region_stats_pending_rows.clear()
+            self._region_stats_pending_overflow = False
+            self._region_stats_mode = None
             for task in self._region_stats_tasks.values():
                 task.cancel()
+            pending_tasks = self._pending_background_shutdown_tasks()
+            if pending_tasks:
+                event.ignore()
+                self.setEnabled(False)
+                self.setWindowTitle(f"正在完成后台任务 · {self._base_window_title}")
+                self._set_shutdown_task_wait_status(pending_tasks)
+                return
             event.accept()
             return
 
@@ -5597,21 +7216,34 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        self._save_profiles()
         self._shutdown_started = True
         history_task = getattr(self, "_history_load_task", None)
         if history_task is not None:
             history_task.cancel()
         self._clock_timer.stop()
+        self._region_stats_request_id += 1
+        self._region_stats_scanning = False
+        self._region_stats_pending_rows.clear()
+        self._region_stats_pending_overflow = False
+        self._region_stats_mode = None
         for task in self._region_stats_tasks.values():
             task.cancel()
-        self.shutdown_status_label.setText(
-            "正在等待当前读数结束；随后刷新并保存 CSV…" if self._acquiring
-            else "正在等待当前仪器操作结束；随后关闭串口连接并退出…"
-        )
+        pending_tasks = self._pending_background_shutdown_tasks()
+        if pending_tasks:
+            self.shutdown_status_label.setText(
+                "正在等待当前读数结束；随后完成后台任务并退出…" if self._acquiring
+                else "正在关闭仪器连接并等待后台任务完成后退出…"
+            )
+        else:
+            self.shutdown_status_label.setText(
+                "正在等待当前读数结束；随后刷新并保存 CSV…" if self._acquiring
+                else "正在等待当前仪器操作结束；随后关闭串口连接并退出…"
+            )
         self.shutdown_status_label.show()
         self.statusBar().showMessage(self.shutdown_status_label.text())
         self.setEnabled(False)
-        self.setWindowTitle("正在安全关闭 · Fluke 8845A 科研测量与长期记录")
+        self.setWindowTitle(f"正在安全关闭 · {self._base_window_title}")
         self._append_log("正在等待当前读数结束、保存数据并关闭仪器连接…")
         self._worker.request_stop()
         self._bridge.close_app.emit()

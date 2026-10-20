@@ -1,4 +1,5 @@
 import json
+import csv
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,15 @@ def test_collect_runtime_licenses_copies_exact_materials_and_hash_manifest(tmp_p
     assert (output_root / "third-party" / "qt-for-python" / "LGPL-3.0.txt").read_text(encoding="utf-8") == "LGPLv3 license"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["python_runtime_version"] == "3.12.10"
+    assert manifest["review_status"] == (
+        "partial; see docs/licenses/windows-portable-review-2026-10-20.md"
+    )
+    assert manifest["known_open_items"] == [
+        "Qt/PySide module and third-party notices require final exact-bundle review.",
+        "Qt/PySide corresponding source, including applicable wheel patches and provenance, requires confirmation.",
+        "Qt/PySide library replacement and relaunch have not been verified against this exact package.",
+        "Microsoft Visual C++ runtime source and applicable redistribution terms require confirmation.",
+    ]
     assert {component["name"] for component in manifest["components"]} == {
         "CPython", "numpy", "pyqtgraph", "PySide6_Essentials", "shiboken6", "pyserial", "OpenSSL", "Nuitka runtime library",
     }
@@ -98,6 +108,13 @@ def test_collect_runtime_licenses_copies_exact_materials_and_hash_manifest(tmp_p
     assert native["PySide6/QtCore.pyd"]["family"] == "Qt/PySide/Shiboken"
     assert native["vcruntime140.dll"]["family"] == "Microsoft Visual C++ runtime"
     assert native["Fluke8845A.exe"]["family"] == "Fluke8845A application executable"
+    with (output_root / "windows-qt-runtime-inventory.csv").open(encoding="utf-8", newline="") as handle:
+        inventory = list(csv.DictReader(handle))
+    assert len(inventory) == 1
+    assert inventory[0]["path"] == "PySide6/QtCore.pyd"
+    assert inventory[0]["family"] == "Qt/PySide/Shiboken"
+    assert inventory[0]["bytes"] == str(len(b"MZ Qt binding"))
+    assert inventory[0]["sha256"] == native["PySide6/QtCore.pyd"]["sha256"]
 
 
 def test_collector_rejects_wrong_pyserial_license_version(tmp_path):

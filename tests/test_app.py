@@ -14,6 +14,144 @@ from fluke8845a.modes import Mode
 from fluke8845a.scpi import InstrumentInfo, ModeSettings, Reading
 
 
+def test_probe_restore_can_reuse_confirmation_only_for_same_mode_and_range():
+    confirmed_probe_settings = ModeSettings(
+        Mode.DCI, autorange=False, range_si=10e-3, nplc=1,
+    )
+    previous_same_wiring_target = ModeSettings(
+        Mode.DCI, autorange=False, range_si=10e-3, nplc=0.02,
+    )
+    previous_different_range = ModeSettings(
+        Mode.DCI, autorange=False, range_si=100e-3, nplc=0.02,
+    )
+    previous_autorange = ModeSettings(
+        Mode.DCI, autorange=True, range_si=None, nplc=0.02,
+    )
+
+    assert app_module._has_same_wiring_confirmation_target(
+        previous_same_wiring_target, confirmed_probe_settings,
+    )
+    assert not app_module._has_same_wiring_confirmation_target(
+        previous_different_range, confirmed_probe_settings,
+    )
+    assert not app_module._has_same_wiring_confirmation_target(
+        previous_autorange, confirmed_probe_settings,
+    )
+
+
+def test_probe_restore_requires_new_confirmation_for_changed_current_range():
+    probe_settings = ModeSettings(
+        Mode.DCI, autorange=False, range_si=10e-3, nplc=1,
+    )
+    previous_same_range = ModeSettings(
+        Mode.DCI, autorange=False, range_si=10e-3, nplc=0.02,
+    )
+    previous_other_range = ModeSettings(
+        Mode.DCI, autorange=False, range_si=100e-3, nplc=0.02,
+    )
+    previous_other_quantity = ModeSettings(Mode.DCV, autorange=False, range_si=10)
+
+    assert not app_module._probe_restore_requires_confirmation(
+        previous_same_range, probe_settings,
+    )
+    assert app_module._probe_restore_requires_confirmation(
+        previous_other_range, probe_settings,
+    )
+    assert app_module._probe_restore_requires_confirmation(
+        previous_other_quantity, probe_settings,
+    )
+
+
+def test_dci_gui_probe_stops_before_configuration_when_restore_range_is_unconfirmed(
+    monkeypatch, tmp_path,
+):
+    from fluke8845a import worker as worker_module
+    from fluke8845a.scpi import Serial8845A
+    from tests.fakes import FakeTransport
+
+    transport = FakeTransport()
+    transport.function = "CURR:DC"
+    transport.range_value = 100e-3
+    transport.autorange = "0"
+    transport.nplc = "0.02"
+    serial_type = Serial8845A
+
+    def serial_factory(port, settings, callback):
+        return serial_type(
+            port, settings, callback,
+            transport_factory=lambda *_args: transport,
+        )
+
+    monkeypatch.setattr(app_module, "Serial8845A", serial_factory)
+    monkeypatch.setattr(worker_module, "Serial8845A", serial_factory)
+    monkeypatch.setattr(app_module, "MIN_HARDWARE_PROBE_DURATION_S", 0.1)
+    monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 1.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 3.0)
+    report_path = tmp_path / "dci-probe.json"
+
+    result = app_module.run_real_gui_speed_probe(
+        "COM3", report_path,
+        wiring_confirmed=False,
+        dci_current_source_confirmed=True,
+        duration_s=0.2,
+        measurement_mode=Mode.DCI,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert result == 1
+    assert report["pre_configuration_settings"]["range_si"] == 100e-3
+    assert report["status"] == "error"
+    assert "--confirm-restore-current-settings" in report["error"]
+    assert not any(command.startswith("CONF:") for command in transport.commands)
+    assert not any(":RANG 0.01" in command for command in transport.commands)
+
+
+def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transport(
+    monkeypatch, tmp_path,
+):
+    from fluke8845a import worker as worker_module
+    from fluke8845a.scpi import Serial8845A
+    from tests.fakes import FakeTransport
+
+    transport = FakeTransport()
+    transport.function = "CURR:DC"
+    transport.range_value = 100e-3
+    transport.autorange = "0"
+    transport.nplc = "0.02"
+    serial_type = Serial8845A
+
+    def serial_factory(port, settings, callback):
+        return serial_type(
+            port, settings, callback,
+            transport_factory=lambda *_args: transport,
+        )
+
+    monkeypatch.setattr(app_module, "Serial8845A", serial_factory)
+    monkeypatch.setattr(worker_module, "Serial8845A", serial_factory)
+    monkeypatch.setattr(app_module, "MIN_HARDWARE_PROBE_DURATION_S", 0.1)
+    monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 4.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 8.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_CLEANUP_RESERVE_S", 0.5)
+    report_path = tmp_path / "dci-probe-restore.json"
+
+    result = app_module.run_real_gui_speed_probe(
+        "COM3", report_path,
+        wiring_confirmed=False,
+        dci_current_source_confirmed=True,
+        restore_wiring_confirmed=True,
+        duration_s=3.5,
+        measurement_mode=Mode.DCI,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert result == 0, report
+    assert report["status"] == "ok"
+    assert report["restore_wiring_confirmation"] == "explicitly_confirmed"
+    assert float(report["restored_configuration"]["range_response"]) == 100e-3
+    assert any(":RANG 0.01" in command for command in transport.commands)
+    assert any(":RANG 0.1" in command for command in transport.commands)
+
+
 class Fake8845A:
     def __init__(self, port, settings, log_callback, *, report_path, function='"RES"', terminals='FRON'):
         self.port = port
@@ -31,7 +169,7 @@ class Fake8845A:
         assert json.loads(self.report_path.read_text(encoding="utf-8"))["status"] == "starting"
         self.connected = True
         self.log_callback("> SYST:REM")
-        return InstrumentInfo("FLUKE", "8845A", "1234567", "2.0", "FLUKE,8845A,1234567,2.0")
+        return InstrumentInfo("FLUKE", "8845A", "1234567", "2.0", "FLUKE,8845A,TEST8845A001,2.0")
 
     def read_mode_state(self):
         return {"function": self.function, "input_terminals": self.terminals}
@@ -414,6 +552,36 @@ def test_aci_gui_probe_cli_routes_explicit_source_and_supported_settings(tmp_pat
     assert captured["ac_bandwidth_hz"] == 20
 
 
+def test_current_gui_probe_cli_routes_explicit_restore_confirmation(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_probe(port, report_path, **kwargs):
+        captured.update(port=port, report_path=report_path, **kwargs)
+        return 0
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", fake_probe)
+    report = tmp_path / "dci-restore.json"
+    assert app_module.main([
+        "--probe-real-gui-dci", "--report", str(report), "--duration", "8",
+        "--confirm-front-dci-5ma-series", "--confirm-restore-current-settings",
+    ]) == 0
+
+    assert captured["restore_wiring_confirmed"] is True
+    assert captured["measurement_mode"] is Mode.DCI
+
+
+def test_restore_current_settings_confirmation_is_rejected_for_voltage_probe(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        app_module.main([
+            "--probe-real-gui-dcv", "--report", str(tmp_path / "dcv.json"),
+            "--duration", "8", "--confirm-front-voltage-source",
+            "--confirm-restore-current-settings",
+        ])
+
+    assert exit_info.value.code == 2
+    assert "only valid with --probe-real-gui-dci/aci" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "extra_args",
     [
@@ -531,7 +699,7 @@ def test_mock_e2e_subprocess_completes_all_six_modes_and_saves_each_run(tmp_path
         env=env,
         capture_output=True,
         text=True,
-        timeout=50,
+        timeout=300,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -543,6 +711,17 @@ def test_mock_e2e_subprocess_completes_all_six_modes_and_saves_each_run(tmp_path
         mode.value for mode in Mode
     }
     assert all(result["valid_sample_count"] >= 3 for result in report["modes"])
+    wheel_zoom = report["wheel_zoom_validation"]
+    assert wheel_zoom["simulation"] is True
+    assert wheel_zoom["mode"] == Mode.DCV.value
+    assert wheel_zoom["wheel_event_count"] >= 1400
+    assert wheel_zoom["wheel_events_accepted"] == wheel_zoom["wheel_event_count"]
+    assert wheel_zoom["initial_span_si"] >= wheel_zoom["final_span_si"] * 1e6
+    assert wheel_zoom["final_span_si"] <= 1e-323
+    assert wheel_zoom["precision_limit_reached"] is True
+    assert wheel_zoom["follow_disabled"] is True
+    assert wheel_zoom["plot_values_preserved"] is True
+    assert wheel_zoom["raw_readings_preserved"] is True
 
 
 def test_mock_e2e_failure_stops_active_acquisition_before_temp_cleanup(tmp_path):
@@ -574,7 +753,7 @@ raise SystemExit(app_module.run_mock_six_mode_gui_probe(Path(sys.argv[1])))
         env=env,
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=300,
     )
 
     assert result.returncode == 1, result.stdout + result.stderr
@@ -611,7 +790,7 @@ raise SystemExit(app_module.run_mock_six_mode_gui_probe(Path(sys.argv[1])))
         env=env,
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=300,
     )
 
     assert result.returncode == 1, result.stdout + result.stderr

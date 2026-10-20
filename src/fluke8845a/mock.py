@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from .modes import Mode, descriptor
-from .scpi import InstrumentInfo, ModeSettings, Reading, compare_firmware
+from .scpi import InstrumentInfo, ModeSettings, Reading
+from .versioning import compare_firmware
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,16 +62,17 @@ class Mock8845A:
         settings.validate()
         if not self.connected:
             raise ConnectionError("Mock未连接")
-        self._settings = settings
         spec = descriptor(settings.mode)
         selected_range = settings.range_si if not settings.autorange else next(
             (r for r in spec.ranges_si if r >= self._base_value(spec.quantity) * 1.1),
             spec.ranges_si[-1],
         )
+        self._settings = replace(settings, range_readback_si=selected_range)
         self._log(f"MOCK配置：{spec.label}；量程={'自动' if settings.autorange else selected_range} SI")
         return {
             "function": spec.function,
             "range_response": "AUTO" if settings.autorange else str(selected_range),
+            "range_readback_si": selected_range,
             "autorange_response": str(settings.autorange),
             "nplc_response": str(settings.nplc) if settings.nplc is not None else None,
             "ac_bandwidth_response": str(settings.ac_bandwidth_hz) if settings.ac_bandwidth_hz is not None else None,
@@ -93,6 +95,7 @@ class Mock8845A:
             mode=self._settings.mode,
             autorange=self._settings.autorange,
             range_si=self._settings.range_si,
+            range_readback_si=self._settings.range_readback_si,
             nplc=settings.nplc,
             ac_bandwidth_hz=settings.ac_bandwidth_hz,
             analog_filter=self._settings.analog_filter,

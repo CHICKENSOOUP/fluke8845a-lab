@@ -15,20 +15,38 @@ from threading import Event, Lock
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from .analysis import RunningStats
-from .modes import Mode, descriptor, mode_from_scpi_function
+from .filter_policy import digital_filter_firmware_support, digital_filter_nplc_is_slow
+from .modes import (
+    Mode, descriptor, mode_from_scpi_function,
+    mode_transition_requires_wiring_confirmation, range_label,
+)
 from .mock import Mock8845A, MockScenario
 from .scpi import (
     InstrumentError, InstrumentLocalModeError, ModeSettings, ReadingError,
     Rs232TerminalModeError, ScpiTimeout, Serial8845A, SerialSettings, UnsupportedRange,
-    digital_filter_firmware_support, digital_filter_nplc_is_slow,
 )
 from .state import AcquisitionState, AcquisitionStateMachine, InvalidTransition
-from .storage import ExperimentRecorder, prepare_experiment_storage, validate_experiment_name
+from .storage import (
+    ExperimentNameLock, ExperimentRecorder, archive_latest_existing_experiment_directory,
+    mark_stale_experiment_interrupted, reserve_experiment_directory,
+    validate_experiment_name,
+)
 
 log = logging.getLogger(__name__)
 ACTUAL_RATE_WINDOW_POINTS = 21
 MAX_PENDING_GUI_ROWS = 10_000
 MAX_PENDING_GUI_SCPI_LOG_LINES = 5_000
+CONNECTION_WATCH_INTERVAL_MS = 10_000
+
+
+def _host_clock_values() -> tuple[int, str, str]:
+    monotonic_ns = time.monotonic_ns()
+    now = datetime.now(timezone.utc)
+    return (
+        monotonic_ns,
+        now.isoformat(timespec="microseconds"),
+        now.astimezone().isoformat(timespec="microseconds"),
+    )
 
 
 class MeasurementWorker(QObject):
@@ -61,14 +79,21 @@ class MeasurementWorker(QObject):
         self.control_mode = "disconnected"
         self.current_mode: Mode | None = None
         self._settings_by_mode: dict[Mode, ModeSettings] = {}
+        self.last_zero_readback_ok: bool | None = None
+        self.last_zero_message = ""
         self._machine = AcquisitionStateMachine()
         self._recorder: ExperimentRecorder | None = None
+        self._experiment_name_lock: ExperimentNameLock | None = None
+        self.last_experiment_backup_path: Path | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._take_sample)
+        self._connection_watch_timer = QTimer(self)
+        self._connection_watch_timer.setInterval(CONNECTION_WATCH_INTERVAL_MS)
+        self._connection_watch_timer.timeout.connect(self._check_idle_connection)
         self._target_interval_s: float | None = 1.0
         self._last_value: float | None = None
-        self._valid_receipts_ns: deque[int] = deque(maxlen=ACTUAL_RATE_WINDOW_POINTS)
+        self._valid_response_ends_ns: deque[int] = deque(maxlen=ACTUAL_RATE_WINDOW_POINTS)
         self._consecutive_timeouts = 0
         self._one_shot = False
         self._pending_rows: list[dict] = []
@@ -88,7 +113,7 @@ class MeasurementWorker(QObject):
         if self.simulation:
             return "就绪（MOCK模拟）"
         if self.control_mode == "local":
-            return "LOCAL 本地操作（前面板可用；软件测量、配置和ZERO已停用）"
+            return "已发送 LOCAL 请求（仪表状态无法通过SCPI回读；请核对面板；软件测量、配置和ZERO已停用）"
         return "就绪（REMOTE远程控制；除LOCAL外面板按键已禁用）"
 
     def _require_computer_control(self) -> bool:
@@ -114,7 +139,17 @@ class MeasurementWorker(QObject):
             self.scpi_logs_ready.emit()
         # Every raw reading is already preserved in measurements.csv. Keep the
         # run log bounded to setup commands and faults during long experiments.
-        if self._recorder is not None and (line.startswith("! ") or (line.startswith("> ") and line != "> READ?")):
+        is_per_sample_range_query = (
+            line.startswith("> ") and line[2:].strip().upper().endswith(":RANG?")
+        )
+        if self._recorder is not None and (
+            line.startswith("! ")
+            or (
+                line.startswith("> ")
+                and line != "> READ?"
+                and not is_per_sample_range_query
+            )
+        ):
             try:
                 self._recorder.log("SCPI", line)
             except OSError:
@@ -130,18 +165,29 @@ class MeasurementWorker(QObject):
             self._ui_scpi_log_notification_pending = False
             return lines, dropped
 
-    def _emit_active_settings(self, settings: ModeSettings) -> None:
+    def _emit_active_settings(
+        self,
+        settings: ModeSettings,
+        *,
+        filter_state_override: str | None = None,
+        filter_readback_confirmed: bool = False,
+    ) -> None:
         """Publish only settings confirmed by a readback or a verified configure call."""
         filter_state = None
         spec = descriptor(settings.mode)
         if spec.digital_filter:
-            if self.simulation:
+            if filter_state_override is not None:
+                filter_state = filter_state_override
+            elif self.simulation:
                 filter_state = "simulation"
             else:
                 firmware = ""
                 if self.instrument is not None and hasattr(self.instrument, "range_firmware"):
                     firmware = self.instrument.range_firmware[0] or ""
-                if digital_filter_firmware_support(settings.mode, firmware) is True:
+                filter_support = digital_filter_firmware_support(settings.mode, firmware)
+                if filter_support is False:
+                    filter_state = "unsupported"
+                elif filter_readback_confirmed:
                     filter_state = "readback_on" if settings.digital_filter else "readback_off"
                 elif digital_filter_nplc_is_slow(settings.mode, settings.nplc):
                     filter_state = "unprobed"
@@ -151,10 +197,12 @@ class MeasurementWorker(QObject):
             "mode": settings.mode.value,
             "autorange": settings.autorange,
             "range_si": settings.range_si,
+            "range_readback_si": settings.range_readback_si,
+            "simulation": self.simulation,
             "nplc": settings.nplc,
             "ac_bandwidth_hz": settings.ac_bandwidth_hz,
             "analog_filter": settings.analog_filter,
-            "digital_filter": settings.digital_filter,
+            "digital_filter": None if filter_state == "unsupported" else settings.digital_filter,
             "digital_filter_state": filter_state,
             "autozero": settings.autozero,
             "input_impedance_auto": (
@@ -163,18 +211,79 @@ class MeasurementWorker(QObject):
             ),
         })
 
+    def _require_wiring_confirmation(
+        self,
+        settings: ModeSettings,
+        confirmed_settings: ModeSettings | None,
+        *,
+        starting_experiment: bool,
+    ) -> bool:
+        """Require a confirmation bound to the mode and input range being used."""
+        if (
+            self.simulation
+            and isinstance(self.instrument, Mock8845A)
+            and self.instrument.connected
+        ):
+            return True
+        transition_requires_confirmation = mode_transition_requires_wiring_confirmation(
+            self.current_mode, settings.mode,
+        )
+        if not starting_experiment and not transition_requires_confirmation:
+            return True
+        confirmation_matches = (
+            isinstance(confirmed_settings, ModeSettings)
+            and confirmed_settings.mode == settings.mode
+            and confirmed_settings.autorange == settings.autorange
+            and confirmed_settings.range_si == settings.range_si
+        )
+        if confirmation_matches:
+            return True
+        self.error.emit(
+            f"已阻止对真实仪器执行 {descriptor(settings.mode).label} 操作："
+            "请先阅读接线提示，并确认目标模式、量程和自动量程状态与本次操作一致。"
+        )
+        return False
+
     @Slot(str, object, object, bool)
     def connect_real(self, port: str, serial_settings: SerialSettings, mode_settings: ModeSettings, use_mock: bool = False) -> None:
-        self._connect(port, serial_settings, mode_settings, use_mock, None)
+        self._connect(port, serial_settings, mode_settings, use_mock, None, None)
+
+    @Slot(str, object, object, bool, object)
+    def connect_real_with_profiles(
+        self,
+        port: str,
+        serial_settings: SerialSettings,
+        mode_settings: ModeSettings,
+        use_mock: bool,
+        firmware_profiles_by_serial: object,
+    ) -> None:
+        """Connect with cached, operator-entered versions available before readback."""
+        self._connect(
+            port, serial_settings, mode_settings, use_mock, None,
+            firmware_profiles_by_serial,
+        )
 
     @Slot(object, object)
     def connect_mock(self, mode_settings: ModeSettings, scenario: MockScenario) -> None:
-        self._connect("MOCK", SerialSettings(), mode_settings, True, scenario)
+        self._connect("MOCK", SerialSettings(), mode_settings, True, scenario, None)
 
     @Slot(str, str)
     def set_firmware_versions(self, outguard_version: str, inguard_version: str) -> None:
         """Store operator-verified front-panel software versions without SCPI writes."""
+        outguard_version = str(outguard_version or "").strip()
+        inguard_version = str(inguard_version or "").strip()
         if self.state != AcquisitionState.STOPPED:
+            instrument = self.instrument
+            if (
+                not self.simulation
+                and instrument is not None
+                and getattr(instrument, "connected", False)
+                and outguard_version == str(getattr(instrument, "outguard_version", "") or "").strip()
+                and inguard_version == str(getattr(instrument, "inguard_version", "") or "").strip()
+            ):
+                # Configuration readback can repeat the already-loaded profile
+                # while a run is active. That is a no-op, not a profile change.
+                return
             self.error.emit("采集中不能修改面板软件版本记录")
             return
         if (
@@ -183,19 +292,96 @@ class MeasurementWorker(QObject):
             or not hasattr(self.instrument, "set_firmware_versions")
         ):
             return
-        outguard_version = str(outguard_version or "").strip()
-        inguard_version = str(inguard_version or "").strip()
+        previous_outguard_version = self.instrument.range_firmware[0] or ""
         self.instrument.set_firmware_versions(outguard_version, inguard_version)
         self.log_line.emit(
             "已记录操作员从仪表面板核对的软件版本："
             f"OutG SW={outguard_version.strip() or '未核对'}，"
             f"InG SW={inguard_version.strip() or '未核对'}；未通过SCPI读取"
         )
+        if self.current_mode is not None:
+            settings = self._settings_by_mode.get(self.current_mode)
+            if settings is not None and descriptor(settings.mode).digital_filter:
+                firmware = self.instrument.range_firmware[0] or ""
+                support = digital_filter_firmware_support(settings.mode, firmware)
+                previous_support = digital_filter_firmware_support(
+                    settings.mode, previous_outguard_version
+                )
+                if support is False:
+                    filter_state = "unsupported"
+                elif previous_support is True and support is True:
+                    # Updating the saved version text does not alter the meter's
+                    # measured filter state. Keep its successful readback intact.
+                    return
+                elif previous_support is None and support is not False:
+                    # Unknown firmware allowed a successful FILT:DIG? query at
+                    # connection/configuration time. Recording InG alone or a
+                    # supported OutG version does not invalidate that readback.
+                    filter_state = "readback_on" if settings.digital_filter else "readback_off"
+                elif digital_filter_nplc_is_slow(settings.mode, settings.nplc):
+                    filter_state = "unprobed"
+                else:
+                    filter_state = "unprobed_inactive"
+                self._emit_active_settings(settings, filter_state_override=filter_state)
 
-    def _connect(self, port, serial_settings, mode_settings, use_mock, scenario) -> None:
+    @staticmethod
+    def _profile_text(value: object) -> str:
+        if not isinstance(value, str) or len(value) > 64:
+            return ""
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            return ""
+        return value.strip()
+
+    def _apply_saved_firmware_profile(self, profiles_by_serial: object) -> None:
+        if not isinstance(profiles_by_serial, dict) or self.info is None:
+            return
+        profile = profiles_by_serial.get(self.info.serial_number)
+        if not isinstance(profile, dict):
+            return
+        outguard = self._profile_text(profile.get("outguard_sw", ""))
+        inguard = self._profile_text(profile.get("inguard_sw", ""))
+        if not outguard and not inguard:
+            return
+        assert self.instrument is not None
+        if hasattr(self.instrument, "set_firmware_versions"):
+            self.instrument.set_firmware_versions(outguard, inguard)
+            self.log_line.emit(
+                "已按序列号加载操作员面板软件版本记录："
+                f"OutG SW={outguard or '未核对'}，InG SW={inguard or '未核对'}；未通过SCPI读取"
+            )
+
+    def _connect(
+        self, port, serial_settings, mode_settings, use_mock, scenario,
+        firmware_profiles_by_serial=None,
+    ) -> None:
         if self.instrument is not None and self.instrument.connected:
             self.error.emit("请先断开当前仪器连接")
             return
+        self.current_mode = None
+        self._settings_by_mode.clear()
+        self._connection_watch_timer.stop()
+        if self.instrument is not None:
+            previous = self.instrument
+            try:
+                if self.simulation:
+                    previous.close()
+                else:
+                    previous.close(restore_local=False)
+            except Exception as exc:
+                message = f"旧串口句柄未能释放，暂不开始重连：{exc}"
+                self.log_line.emit(f"! {message}")
+                self.connection_progress.emit(message)
+                self.control_mode = "disconnected"
+                self.control_mode_changed.emit(self.control_mode)
+                self.connected_changed.emit(False, message)
+                self.status_changed.emit(message)
+                self.error.emit(message)
+                return
+            self.instrument = None
+            self.info = None
+            self.current_mode = None
+            self._settings_by_mode.clear()
+            self.control_mode = "disconnected"
         try:
             self._connection_stage_states: dict[str, str] = {}
             self._emit_connection_stage("device", "running", f"已选择设备：{port}")
@@ -211,6 +397,7 @@ class MeasurementWorker(QObject):
                 self.info = self.instrument.connect()
             else:
                 self.info = self.instrument.connect(progress_callback=self._on_serial_connection_progress)
+                self._apply_saved_firmware_profile(firmware_profiles_by_serial)
             active_stage = "configuration"
             self._emit_connection_stage(
                 "configuration", "running",
@@ -224,9 +411,11 @@ class MeasurementWorker(QObject):
             self.control_mode = "computer"
             if use_mock:
                 self.current_mode = mode_settings.mode
-                self._settings_by_mode[mode_settings.mode] = mode_settings
                 actual = self.instrument.configure(mode_settings)
-                active_settings = mode_settings
+                active_settings = replace(
+                    mode_settings, range_readback_si=actual.get("range_readback_si")
+                )
+                self._settings_by_mode[mode_settings.mode] = active_settings
                 self.log_line.emit(f"MOCK模式已配置：{actual}")
             else:
                 actual = self.instrument.read_mode_state()
@@ -236,7 +425,10 @@ class MeasurementWorker(QObject):
                 if self.current_mode is not None:
                     try:
                         active_settings = self.instrument.read_settings(self.current_mode)
+                        self._settings_by_mode[self.current_mode] = active_settings
                     except ScpiTimeout:
+                        raise
+                    except InstrumentLocalModeError:
                         raise
                     except Exception as exc:
                         self.log_line.emit(f"! 已连接，但当前设置回读失败：{exc}")
@@ -250,12 +442,17 @@ class MeasurementWorker(QObject):
             )
             self.configuration_ready.emit({"idn": self.info.idn_raw, **actual, "simulation": use_mock})
             if active_settings is not None:
-                self._emit_active_settings(active_settings)
+                self._emit_active_settings(
+                    active_settings, filter_readback_confirmed=not use_mock,
+                )
             self._emit_connection_stage("ready", "success", "连接已就绪")
             self.connected_changed.emit(True, f"{'模拟' if use_mock else '已连接'} · {self.info.idn_raw}")
             self.control_mode_changed.emit(self.control_mode)
             self.status_changed.emit(self._ready_status())
+            if not use_mock:
+                self._connection_watch_timer.start()
         except Exception as exc:
+            self._connection_watch_timer.stop()
             failed_stage = getattr(self, "_connection_active_stage", locals().get("active_stage", "device"))
             if getattr(self, "_connection_stage_states", {}).get(failed_stage) != "failure":
                 self._emit_connection_stage(failed_stage, "failure", f"{_connection_stage_label(failed_stage)}失败：{exc}")
@@ -263,14 +460,21 @@ class MeasurementWorker(QObject):
             self.log_line.emit(f"! 连接失败：{exc}")
             if self.instrument is not None:
                 try:
-                    self.instrument.close()
+                    self.instrument.close(
+                        restore_local=not isinstance(exc, InstrumentLocalModeError)
+                    )
                 except Exception:
                     pass
             self.instrument = None
             self.info = None
             self.control_mode = "disconnected"
             self.control_mode_changed.emit(self.control_mode)
-            self.connected_changed.emit(False, "未连接")
+            if isinstance(exc, InstrumentLocalModeError):
+                message = "连接期间检测到仪表处于LOCAL本地控制；请切到Computer后重新连接"
+                self.connected_changed.emit(False, message)
+                self.status_changed.emit(message)
+            else:
+                self.connected_changed.emit(False, "未连接")
             self.error.emit(str(exc))
 
     def _emit_connection_stage(self, stage: str, status: str, message: str) -> None:
@@ -304,8 +508,11 @@ class MeasurementWorker(QObject):
             self.control_mode_result.emit(False, "MOCK模拟器没有仪器面板控制方式")
             self.error.emit("MOCK模拟器没有仪器面板控制方式")
             return
-        if mode == self.control_mode:
-            self.control_mode_result.emit(True, f"仪器已处于{'Computer' if mode == 'computer' else 'Local'}模式")
+        if mode == "local" and mode == self.control_mode:
+            self.control_mode_result.emit(
+                True,
+                "软件仍记录为已发送 Local 请求；仪表状态无法回读，请核对面板",
+            )
             return
 
         try:
@@ -314,14 +521,19 @@ class MeasurementWorker(QObject):
                 self.info = refreshed_info
             self.control_mode = mode
             if mode == "local":
+                self._connection_watch_timer.stop()
                 self.current_mode = None
                 self._settings_by_mode.clear()
                 self.configuration_ready.emit({
                     "idn": self.info.idn_raw, "function": "", "input_terminals": "",
                     "simulation": False,
                 })
-                message = "已发送SYST:LOC；仪表交由前面板操作，软件测量与配置已暂停"
+                message = (
+                    "已发送 SYST:LOC；该状态无法通过 SCPI 回读，请在仪表面板确认 LOCAL。"
+                    "软件测量、配置与 ZERO 已暂停"
+                )
             else:
+                self._connection_watch_timer.start()
                 state = self.instrument.read_mode_state()
                 self.current_mode = mode_from_scpi_function(state["function"])
                 self._settings_by_mode.clear()
@@ -329,7 +541,10 @@ class MeasurementWorker(QObject):
                 if self.current_mode is not None:
                     try:
                         active_settings = self.instrument.read_settings(self.current_mode)
+                        self._settings_by_mode[self.current_mode] = active_settings
                     except ScpiTimeout:
+                        raise
+                    except InstrumentLocalModeError:
                         raise
                     except Exception as exc:
                         self.log_line.emit(f"! 切回Computer后读取当前参数失败：{exc}")
@@ -337,7 +552,7 @@ class MeasurementWorker(QObject):
                     "idn": self.info.idn_raw, **state, "simulation": False,
                 })
                 if active_settings is not None:
-                    self._emit_active_settings(active_settings)
+                    self._emit_active_settings(active_settings, filter_readback_confirmed=True)
                 message = "已切回Computer软件控制，并重新读取仪表当前状态"
             self.control_mode_changed.emit(self.control_mode)
             self.status_changed.emit(self._ready_status())
@@ -347,6 +562,8 @@ class MeasurementWorker(QObject):
             self.log_line.emit(f"! 切换仪器控制方式失败：{exc}")
             if isinstance(exc, ScpiTimeout):
                 self._close_after_scpi_timeout()
+            elif isinstance(exc, InstrumentLocalModeError):
+                self._mark_instrument_local()
             else:
                 try:
                     self.instrument.close(restore_local=True)
@@ -354,13 +571,16 @@ class MeasurementWorker(QObject):
                     self.log_line.emit(f"! 切换失败后释放仪器控制权失败：{close_exc}")
                 self.instrument = None
                 self.control_mode = "disconnected"
+                self._connection_watch_timer.stop()
                 self.control_mode_changed.emit(self.control_mode)
                 self.connected_changed.emit(False, "控制方式切换失败，连接已关闭")
             self.error.emit(f"切换仪器控制方式失败：{exc}")
             self.control_mode_result.emit(False, str(exc))
 
-    @Slot(object)
-    def configure_mode(self, settings: ModeSettings) -> None:
+    @Slot(object, object)
+    def configure_mode(
+        self, settings: ModeSettings, confirmed_settings: ModeSettings | None = None,
+    ) -> None:
         if self.state != AcquisitionState.STOPPED:
             self.error.emit("必须先停止采集，再切换测量模式")
             return
@@ -369,22 +589,45 @@ class MeasurementWorker(QObject):
             return
         if not self._require_computer_control():
             return
+        if not self._require_wiring_confirmation(
+            settings, confirmed_settings, starting_experiment=False,
+        ):
+            return
         try:
             actual = self.instrument.configure(settings)
             self.current_mode = settings.mode
-            self._settings_by_mode[settings.mode] = settings
+            confirmed_settings = replace(
+                settings, range_readback_si=actual.get("range_readback_si")
+            )
+            self._settings_by_mode[settings.mode] = confirmed_settings
             self.configuration_ready.emit({"idn": self.info.idn_raw, **actual, "simulation": self.simulation})
-            self._emit_active_settings(settings)
+            self._emit_active_settings(
+                confirmed_settings, filter_readback_confirmed=not self.simulation,
+            )
             self.log_line.emit(f"模式切换完成：{descriptor(settings.mode).label}")
             self.status_changed.emit(self._ready_status())
         except Exception as exc:
             self.log_line.emit(f"! 配置测量模式失败：{exc}")
-            if isinstance(exc, ScpiTimeout):
+            if isinstance(exc, InstrumentLocalModeError):
+                self._mark_instrument_local()
+            elif isinstance(exc, ScpiTimeout):
                 self._close_after_scpi_timeout()
+            elif not self.simulation and self.instrument is not None and not self.instrument.connected:
+                self._close_after_transport_failure("串口通信异常，连接已关闭；请重新连接")
             self.error.emit(str(exc))
 
-    @Slot(object, str, str, object, bool)
-    def start_experiment(self, mode_settings: ModeSettings, name: str, root: str, interval_s: float | None, one_shot: bool = False) -> None:
+    @Slot(object, str, str, object, bool, str, str, object)
+    def start_experiment(
+        self,
+        mode_settings: ModeSettings,
+        name: str,
+        root: str,
+        interval_s: float | None,
+        one_shot: bool = False,
+        duplicate_name_action: str = "",
+        expected_duplicate_path: str = "",
+        confirmed_settings: ModeSettings | None = None,
+    ) -> None:
         if self.state != AcquisitionState.STOPPED:
             self.error.emit("当前已有实验运行，请先停止")
             return
@@ -393,17 +636,51 @@ class MeasurementWorker(QObject):
             return
         if not self._require_computer_control():
             return
+        reserved_directory: Path | None = None
+        self.last_experiment_backup_path = None
         try:
             mode_settings.validate()
+            if not self._require_wiring_confirmation(
+                mode_settings, confirmed_settings, starting_experiment=True,
+            ):
+                return
             if interval_s is not None and interval_s < 0:
                 raise ValueError("目标采样间隔不能为负数")
             name = validate_experiment_name(name)
-            experiment_root = prepare_experiment_storage(root)
-            # Do all filesystem checks before issuing any configuration command.
+            if duplicate_name_action not in {"", "create-copy", "overwrite"}:
+                raise ValueError("同名实验操作无效；请重新预检并选择覆盖、独立目录或取消")
+            self._experiment_name_lock = ExperimentNameLock(root, name).acquire()
+            if duplicate_name_action == "overwrite":
+                if not expected_duplicate_path:
+                    raise ValueError("缺少预检确认的实验目录；请重新预检后再选择覆盖")
+                reserved_directory = reserve_experiment_directory(root, name)
+                recovery = mark_stale_experiment_interrupted(
+                    root,
+                    name,
+                    expected_directory=expected_duplicate_path,
+                    lock=self._experiment_name_lock,
+                )
+                if recovery is not None:
+                    self._write_log(
+                        "检测到未正常结束的旧实验；已在同名锁保护下标记为 interrupted，"
+                        "原始 CSV 保持不变，完整目录将作为覆盖备份保留"
+                    )
+                self.last_experiment_backup_path = archive_latest_existing_experiment_directory(
+                    root, name, expected_directory=expected_duplicate_path,
+                    reserved_directory=reserved_directory,
+                )
+                self._write_log(f"旧实验目录已安全备份至：{self.last_experiment_backup_path}")
+            else:
+                reserved_directory = reserve_experiment_directory(root, name)
+            # Atomically claim the final output path before issuing any instrument command.
+            experiment_root = reserved_directory.parent
             actual = self.instrument.configure(mode_settings)
+            confirmed_mode_settings = replace(
+                mode_settings, range_readback_si=actual.get("range_readback_si")
+            )
             self.current_mode = mode_settings.mode
-            self._settings_by_mode[mode_settings.mode] = mode_settings
-            self._valid_receipts_ns.clear()
+            self._settings_by_mode[mode_settings.mode] = confirmed_mode_settings
+            self._valid_response_ends_ns.clear()
             self._last_value = None
             self._consecutive_timeouts = 0
             self._running_stats = RunningStats()
@@ -423,16 +700,19 @@ class MeasurementWorker(QObject):
                 range_firmware, range_firmware_source = self.instrument.range_firmware
             else:
                 range_firmware, range_firmware_source = (
-                    info.firmware or "", "*IDN?" if info.firmware else "未知"
+                    "", "未知"
                 )
             metadata = {
                 "simulation": self.simulation,
                 "control_mode": self.control_mode,
                 "device": {"manufacturer": info.manufacturer, "model": info.model,
                            "serial_number": info.serial_number,
-                           "firmware": info.firmware or None,
+                           "idn_version_candidate": info.idn_version_candidate or None,
                            "idn_revision": info.idn_revision,
-                           "firmware_source": "*IDN? semantic version" if info.firmware else None,
+                           "idn_version_candidate_source": (
+                               "*IDN?修订字段中的未验证数字候选"
+                               if info.idn_version_candidate else None
+                           ),
                            "front_panel_software": panel_software,
                            "range_firmware": range_firmware or None,
                            "range_firmware_source": range_firmware_source,
@@ -442,15 +722,26 @@ class MeasurementWorker(QObject):
                 "target_interval_s": interval_s,
                 "initial_target_interval_s": interval_s,
                 "target_interval_changes": [],
-                "actual_interval_method": "PC monotonic timestamp delta from consecutive measurement attempts; frequency uses valid sample receipt timestamps.",
-                "timestamp_definition": "timestamp_local/timestamp_utc and elapsed_s mark host command start. The instrument conversion is not hardware-timestamped; read_duration_s bounds serial command/read time.",
+                "actual_interval_method": "actual_interval_s and desktop/Web interval telemetry use the difference between consecutive valid host READ? response-end monotonic timestamps; invalid attempts have no interval value.",
+                "timestamp_definition": "timestamp_local/timestamp_utc and elapsed_s retain host READ? request-start semantics. host_read_request_start_* and host_read_response_end_* record host wall-clock and monotonic boundaries around READ? only; response end is captured as the query receives a response or raises. read_duration_s is that READ? request/response duration and excludes the later range query. The instrument conversion is not hardware-timestamped.",
                 "acquisition_method": "one READ? per point; the host reads every response before sending the next query.",
                 "mock_scenario": asdict(self.instrument.scenario) if self.simulation else None,
             }
-            self._recorder = ExperimentRecorder.create(experiment_root, name, metadata, mode_settings)
+            if self.last_experiment_backup_path is not None:
+                metadata["replaced_experiment_backup"] = str(self.last_experiment_backup_path)
+            self._recorder = ExperimentRecorder.create(
+                experiment_root,
+                name,
+                metadata,
+                confirmed_mode_settings,
+                reserved_directory=reserved_directory,
+            )
+            reserved_directory = None
             self._recorder.metadata["actual_device_configuration"] = actual
             self._recorder._write_metadata()
-            self._emit_active_settings(mode_settings)
+            self._emit_active_settings(
+                confirmed_mode_settings, filter_readback_confirmed=not self.simulation,
+            )
             self.experiment_started.emit(str(self._recorder.directory))
             self._machine.start()
             self.status_changed.emit("单次测量中（MOCK模拟）" if self.simulation and one_shot else
@@ -464,11 +755,36 @@ class MeasurementWorker(QObject):
                 self._timer.start(0)
         except Exception as exc:
             self.log_line.emit(f"! 实验启动失败：{exc}")
-            if isinstance(exc, ScpiTimeout):
+            if reserved_directory is not None:
+                try:
+                    reserved_directory.rmdir()
+                except OSError:
+                    # Preserve any files created concurrently or by partial startup.
+                    pass
+            if isinstance(exc, InstrumentLocalModeError):
+                self._mark_instrument_local()
+                reconnect = "仪表已切回LOCAL本地控制；请切到Computer后重新连接。"
+            elif isinstance(exc, ScpiTimeout):
                 self._close_after_scpi_timeout()
+            elif not self.simulation and self.instrument is not None and not self.instrument.connected:
+                self._close_after_transport_failure("串口通信异常，连接已关闭；请重新连接")
             if self._recorder is not None:
                 self._finish_experiment("start_error")
-            self.error.emit(str(exc))
+            else:
+                self._release_experiment_name_lock()
+            message = str(exc)
+            if self.last_experiment_backup_path is not None:
+                message += f"；旧实验目录已备份至：{self.last_experiment_backup_path}"
+            self.error.emit(message)
+
+    def _release_experiment_name_lock(self) -> None:
+        lock, self._experiment_name_lock = self._experiment_name_lock, None
+        if lock is None:
+            return
+        try:
+            lock.release()
+        except OSError as exc:
+            self.log_line.emit(f"! 释放实验名称锁失败：{exc}")
 
     def _delay_to_next_attempt_ms(self, last_attempt_ns: int | None) -> int:
         interval = self._target_interval_s
@@ -559,8 +875,18 @@ class MeasurementWorker(QObject):
             return
         try:
             requested.validate()
-            if requested.mode != self._recorder.mode:
-                raise ValueError("采集过程中不能更改测量模式")
+        except (TypeError, ValueError) as exc:
+            # Settings validation happens before any instrument command. A rejected
+            # speed request must not terminate an otherwise healthy long run.
+            self.log_line.emit(f"~ 实时调速参数未应用：{exc}")
+            self.measurement_speed_result.emit(False, f"实时调速参数无效，采集继续：{exc}")
+            return
+        if requested.mode != self._recorder.mode:
+            message = "采集过程中不能更改测量模式"
+            self.log_line.emit(f"~ 实时调速未应用：{message}")
+            self.measurement_speed_result.emit(False, f"实时调速未应用，采集继续：{message}")
+            return
+        try:
             current = self._recorder.settings
             if (requested.nplc, requested.ac_bandwidth_hz) == (current.nplc, current.ac_bandwidth_hz):
                 self.measurement_speed_result.emit(True, "当前测量速度已经是所选值")
@@ -579,7 +905,10 @@ class MeasurementWorker(QObject):
                 stored, nplc=requested.nplc, ac_bandwidth_hz=requested.ac_bandwidth_hz
             )
             self._settings_by_mode[requested.mode] = applied_settings
-            self._emit_active_settings(applied_settings)
+            self._emit_active_settings(
+                applied_settings,
+                filter_readback_confirmed=not self.simulation and requested.nplc is not None,
+            )
             parts = []
             if requested.nplc is not None:
                 parts.append(f"NPLC={requested.nplc:g}")
@@ -593,15 +922,27 @@ class MeasurementWorker(QObject):
             self._storage_fault(exc)
             self.measurement_speed_result.emit(False, f"调速记录写入失败：{exc}")
         except Exception as exc:
-            if isinstance(exc, ScpiTimeout):
+            local_mode_failure = isinstance(exc, InstrumentLocalModeError)
+            if isinstance(exc, InstrumentLocalModeError):
+                reconnect = "仪表已切回LOCAL本地控制；请切到Computer后重新连接。"
+            elif isinstance(exc, ScpiTimeout):
                 self._close_after_scpi_timeout()
+                reconnect = "响应超时，串口已关闭，请重新连接。"
+            elif not self.simulation and self.instrument is not None and not self.instrument.connected:
+                self._close_after_transport_failure("实时调速通信异常，串口连接已关闭；请重新连接")
+                reconnect = "通信异常，串口已关闭，请重新连接。"
+            else:
+                reconnect = ""
             self.log_line.emit(f"! 实时调速失败，采集已停止：{exc}")
-            reconnect = "响应超时，串口已关闭，请重新连接。" if isinstance(exc, ScpiTimeout) else ""
             self.error.emit(f"实时调速失败：{exc}。{reconnect}为避免数据条件不明，当前采集已停止。")
             try:
                 if self.state != AcquisitionState.STOPPED:
                     self._machine.stop()
-                self._finish_experiment("speed_update_error")
+                self._finish_experiment(
+                    "instrument_local" if local_mode_failure else "speed_update_error"
+                )
+                if local_mode_failure:
+                    self._mark_instrument_local()
             except Exception:
                 log.exception("could not safely stop after speed update failure")
             self.measurement_speed_result.emit(False, f"实时调速失败，采集已停止：{exc}")
@@ -653,15 +994,12 @@ class MeasurementWorker(QObject):
         if self._stop_requested.is_set():
             self.stop()
             return
-        routine_start_ns = time.monotonic_ns()
-        host_time = datetime.now(timezone.utc)
-        host_utc = host_time.isoformat(timespec="microseconds")
-        host_local = host_time.astimezone().isoformat(timespec="microseconds")
         try:
             self._recorder.check_storage_reserve()
         except OSError as storage_exc:
             self._storage_fault(storage_exc)
             return
+        request_start_ns, request_start_utc, request_start_local = _host_clock_values()
         try:
             reading = self.instrument.read()
         except Exception as exc:
@@ -669,36 +1007,81 @@ class MeasurementWorker(QObject):
                     "timeout" if isinstance(exc, (TimeoutError, ScpiTimeout)) else
                     "overflow" if isinstance(exc, ReadingError) and exc.status == "overflow" else
                     "invalid" if isinstance(exc, ReadingError) else "communication_error")
-            now_ns = time.monotonic_ns()
+            fallback_end_ns, fallback_end_utc, fallback_end_local = _host_clock_values()
+            timing = getattr(exc, "read_timing", None)
+            if timing is None:
+                read_start_ns = request_start_ns
+                read_start_utc = request_start_utc
+                read_start_local = request_start_local
+                read_end_ns = fallback_end_ns
+                read_end_utc = fallback_end_utc
+                read_end_local = fallback_end_local
+            else:
+                read_start_ns = timing.read_request_start_monotonic_ns
+                read_start_utc = timing.read_request_start_utc
+                read_start_local = timing.read_request_start_local
+                read_end_ns = timing.read_response_end_monotonic_ns
+                read_end_utc = timing.read_response_end_utc
+                read_end_local = timing.read_response_end_local
             try:
                 row = self._recorder.append_reading(
-                    None, mode=self._recorder.mode, started_monotonic_ns=routine_start_ns,
-                    timestamp_local=host_local,
-                    timestamp_utc=host_utc,
-                    read_duration_s=(now_ns - routine_start_ns) / 1e9,
+                    None, mode=self._recorder.mode, started_monotonic_ns=read_start_ns,
+                    timestamp_local=read_start_local,
+                    timestamp_utc=read_start_utc,
+                    host_read_request_start_local=read_start_local,
+                    host_read_request_start_utc=read_start_utc,
+                    host_read_request_start_monotonic_ns=read_start_ns,
+                    host_read_response_end_local=read_end_local,
+                    host_read_response_end_utc=read_end_utc,
+                    host_read_response_end_monotonic_ns=read_end_ns,
+                    read_duration_s=(read_end_ns - read_start_ns) / 1e9,
                     status=code, error=str(exc),
-                    raw_reading=getattr(exc, "raw", getattr(exc, "partial_response", "")),
+                    raw_reading=getattr(
+                        exc, "measurement_raw", getattr(exc, "raw", getattr(exc, "partial_response", ""))
+                    ),
                 )
-            except OSError as storage_exc:
+            except Exception as storage_exc:
                 self._storage_fault(storage_exc)
                 return
             try:
                 self._recorder.log("ERROR", str(exc))
-            except OSError as storage_exc:
+            except Exception as storage_exc:
                 self._storage_fault(storage_exc)
                 return
-            self.log_line.emit(f"! {code}：{exc}")
+            # The error is already written to the run log and attached to the
+            # failed CSV row. The coalesced sample mailbox delivers that row to
+            # the GUI; a separate Qt signal per bad read would create an
+            # unbounded event queue when malformed responses repeat quickly.
             self._queue_ui_row(row)
-            if isinstance(exc, ScpiTimeout):
-                self._close_after_scpi_timeout()
-                self._finish_experiment("scpi_timeout")
-                self.status_changed.emit("SCPI响应超时，已停止采集并关闭连接；请重新连接")
+            if not self.simulation and isinstance(exc, (TimeoutError, ScpiTimeout)):
+                if isinstance(exc, ScpiTimeout):
+                    message = "SCPI响应超时，连接已关闭；请重新连接后开始新实验/分段"
+                    completion_status = "scpi_timeout"
+                else:
+                    message = "串口读取超时，连接已关闭；请重新连接后开始新实验/分段"
+                    completion_status = "read_timeout"
+                self._close_after_transport_failure(message)
+                self._finish_experiment(completion_status)
+                self.status_changed.emit(message)
                 return
             if code == "timeout":
                 self._consecutive_timeouts += 1
             else:
                 self._consecutive_timeouts = 0
+            if (
+                not self.simulation
+                and code == "communication_error"
+                and not isinstance(exc, Rs232TerminalModeError)
+            ):
+                message = "串口通信异常，连接已关闭；请重新连接后开始新实验/分段"
+                self._close_after_transport_failure(message)
+                self._finish_experiment("communication_error")
+                self.status_changed.emit(message)
+                return
             if not self.instrument.connected:
+                self._connection_watch_timer.stop()
+                self.control_mode = "disconnected"
+                self.control_mode_changed.emit(self.control_mode)
                 self.connected_changed.emit(False, "连接中断")
                 try:
                     self.instrument.close()
@@ -707,6 +1090,7 @@ class MeasurementWorker(QObject):
                 self._finish_experiment("disconnected")
                 return
             if code == "instrument_local":
+                self._connection_watch_timer.stop()
                 self.connected_changed.emit(False, "仪器已切回LOCAL本地控制")
                 try:
                     self.instrument.close(restore_local=False)
@@ -718,6 +1102,7 @@ class MeasurementWorker(QObject):
                 self.status_changed.emit("仪器已切回LOCAL；采集已停止，请重新连接恢复远程控制")
                 return
             if isinstance(exc, Rs232TerminalModeError):
+                self._connection_watch_timer.stop()
                 self.connected_changed.emit(
                     False, "RS-232终端模式；串口已关闭，请切换到Computer模式"
                 )
@@ -752,13 +1137,20 @@ class MeasurementWorker(QObject):
                 self.stop()
                 return
         else:
+            if not reading.read_response_end_utc or not reading.read_response_end_local:
+                _end_ns, end_utc, end_local = _host_clock_values()
+                reading = replace(
+                    reading,
+                    read_response_end_utc=reading.read_response_end_utc or end_utc,
+                    read_response_end_local=reading.read_response_end_local or end_local,
+                )
             try:
                 row = self._recorder.append_reading(reading, mode=self._recorder.mode)
-            except OSError as storage_exc:
+            except Exception as storage_exc:
                 self._storage_fault(storage_exc)
                 return
             self._last_value = reading.value_si
-            self._valid_receipts_ns.append(reading.received_monotonic_ns)
+            self._valid_response_ends_ns.append(reading.read_response_end_monotonic_ns)
             self._running_stats.add(reading.value_si)
             self._consecutive_timeouts = 0
             self._queue_ui_row(row)
@@ -770,25 +1162,65 @@ class MeasurementWorker(QObject):
         if self._stop_requested.is_set():
             self.stop()
             return
-        if self._target_interval_s is None:
-            delay_ms = 0
-        else:
-            elapsed = (time.monotonic_ns() - routine_start_ns) / 1e9
-            delay_ms = max(0, int((self._target_interval_s - elapsed) * 1000))
-        self._timer.start(delay_ms)
+        self._timer.start(self._delay_to_next_attempt_ms(self._recorder.last_attempt_ns))
 
     def _close_after_scpi_timeout(self) -> None:
         """Close a desynchronized serial session before another query can consume late bytes."""
+        self._close_after_transport_failure("SCPI响应超时，串口连接已关闭；请重新连接")
+
+    def _close_after_transport_failure(self, message: str) -> None:
+        """Close a failed serial session without SCPI recovery on a desynchronized port."""
+        self._connection_watch_timer.stop()
         instrument = self.instrument
         if instrument is not None:
             try:
-                instrument.close()
+                instrument.close(restore_local=False)
             except Exception as exc:
-                self.log_line.emit(f"! 超时后关闭串口失败：{exc}")
+                self.log_line.emit(f"! 通信失败后关闭串口失败：{exc}")
         self.control_mode = "disconnected"
         self.control_mode_changed.emit(self.control_mode)
-        self.connected_changed.emit(False, "SCPI响应超时，连接已关闭")
-        self.status_changed.emit("SCPI响应超时，串口连接已关闭；请重新连接")
+        self.connected_changed.emit(False, message)
+        self.status_changed.emit(message)
+
+    @Slot()
+    def _check_idle_connection(self) -> None:
+        """Probe the meter only when no measurement command is in progress."""
+        if self.simulation or self.instrument is None or self.control_mode != "computer":
+            self._connection_watch_timer.stop()
+            return
+        if not self.instrument.connected:
+            message = "检测到串口连接已中断；请重新连接"
+            self._close_after_transport_failure(message)
+            self._finish_idle_connection_failure("disconnected", message)
+            return
+        if self.state not in {AcquisitionState.STOPPED, AcquisitionState.PAUSED}:
+            return
+        try:
+            self.instrument.check_connection()
+        except InstrumentLocalModeError:
+            message = "空闲连接检查发现仪器已切回LOCAL；串口已关闭，请切回Computer后重新连接"
+            self._mark_instrument_local()
+            self._finish_idle_connection_failure("instrument_local", message)
+        except ScpiTimeout as exc:
+            message = f"空闲连接检查超时：{exc}；串口已关闭，请重新连接"
+            self._close_after_scpi_timeout()
+            self._finish_idle_connection_failure("scpi_timeout", message)
+        except Exception as exc:
+            message = f"空闲连接检查失败：{exc}；串口已关闭，请重新连接"
+            self._close_after_transport_failure(message)
+            self._finish_idle_connection_failure("communication_error", message)
+
+    def _finish_idle_connection_failure(self, completion_status: str, message: str) -> None:
+        if self._recorder is not None:
+            if self.state != AcquisitionState.STOPPED:
+                self._machine.stop()
+            self._finish_experiment(completion_status)
+        self.status_changed.emit(message)
+
+    def _mark_instrument_local(self) -> None:
+        self._close_after_transport_failure(
+            "检测到仪表已切回LOCAL本地控制；串口已关闭，请切到Computer后重新连接"
+        )
 
     def _queue_ui_row(self, row: dict) -> None:
         self._pending_rows.append(row)
@@ -823,10 +1255,10 @@ class MeasurementWorker(QObject):
             "abnormal_count": max(0, attempt_count - valid_count),
         })
 
-        receipts = tuple(self._valid_receipts_ns)
+        response_ends = tuple(self._valid_response_ends_ns)
         intervals_s = [
-            (receipts[index] - receipts[index - 1]) / 1e9
-            for index in range(1, len(receipts))
+            (response_ends[index] - response_ends[index - 1]) / 1e9
+            for index in range(1, len(response_ends))
         ]
         if intervals_s:
             minimum = min(intervals_s)
@@ -860,12 +1292,19 @@ class MeasurementWorker(QObject):
             return rows, self._ui_latest_hz, dict(self._ui_latest_stats)
 
     def _actual_hz(self) -> float:
-        if len(self._valid_receipts_ns) < 2:
+        if len(self._valid_response_ends_ns) < 2:
             return 0.0
-        span = (self._valid_receipts_ns[-1] - self._valid_receipts_ns[0]) / 1e9
-        return (len(self._valid_receipts_ns) - 1) / span if span > 0 else 0.0
+        span = (self._valid_response_ends_ns[-1] - self._valid_response_ends_ns[0]) / 1e9
+        return (len(self._valid_response_ends_ns) - 1) / span if span > 0 else 0.0
 
-    def _storage_fault(self, exc: OSError) -> None:
+    def _storage_fault(self, exc: Exception) -> None:
+        if self._recorder is not None:
+            try:
+                self._recorder.log("ERROR", f"采集存储失败：{exc}")
+            except Exception:
+                # A full or failing disk may also reject the diagnostic log;
+                # preserve the original failure and continue best-effort cleanup.
+                log.exception("could not write storage failure to experiment run log")
         self.log_line.emit(f"! CSV写入失败，已停止采集：{exc}")
         log.exception("experiment storage failed")
         self._timer.stop()
@@ -896,45 +1335,111 @@ class MeasurementWorker(QObject):
 
     @Slot()
     def zero(self) -> None:
+        self.last_zero_readback_ok = None
+        self.last_zero_message = ""
+
+        def report_failure(message: str, *, readback_ok: bool | None = None) -> None:
+            self.last_zero_readback_ok = readback_ok
+            self.last_zero_message = message
+            self.zero_result.emit(message)
+
         if self.state != AcquisitionState.STOPPED:
-            self.error.emit("请停止采集后再执行ZERO")
+            message = "ZERO未执行：请停止采集后再执行ZERO"
+            report_failure(message)
+            self.error.emit(message)
             return
         if self.instrument is None or not self.instrument.connected:
-            self.error.emit("仪器未连接")
+            message = "ZERO未执行：仪器未连接"
+            report_failure(message)
+            self.error.emit(message)
             return
         if not self._require_computer_control():
+            report_failure("ZERO未执行：仪表当前为LOCAL本地操作，请先切换到Computer")
+            return
+        if self.current_mode is None or self.current_mode not in self._settings_by_mode:
+            message = "ZERO未执行：必须先读取或应用当前测量配置，并确认配置回读。"
+            report_failure(message)
+            self.error.emit(message)
             return
         try:
             self.instrument.zero()
-            if self.current_mode is None:
-                self.zero_result.emit("ZERO:AUTO ONCE 命令已发送并检查错误队列；当前测量模式未知，无法回读配置。")
-                return
             try:
                 actual = self.instrument.read_settings(self.current_mode)
-                self._emit_active_settings(actual)
+                self._settings_by_mode[self.current_mode] = actual
+                self._emit_active_settings(actual, filter_readback_confirmed=not self.simulation)
                 pieces = [f"模式 {actual.mode.value}"]
-                pieces.append("自动量程" if actual.autorange else f"固定量程 {actual.range_si:g}")
+                if actual.autorange:
+                    range_text = "自动量程"
+                    if actual.range_readback_si is not None:
+                        range_text += (
+                            f"；当前量程回读 {range_label(actual.range_readback_si, descriptor(actual.mode).unit_si)}"
+                            "（当前快照，可能随输入变化）"
+                        )
+                    else:
+                        range_text += "（当前量程回读不可用）"
+                    pieces.append(range_text)
+                else:
+                    pieces.append(
+                        f"固定量程 {range_label(actual.range_si, descriptor(actual.mode).unit_si)}"
+                    )
                 if actual.nplc is not None:
                     pieces.append(f"{actual.nplc:g} NPLC")
                 if actual.ac_bandwidth_hz is not None:
                     pieces.append(f"交流带宽 {actual.ac_bandwidth_hz} Hz")
-                pieces.append(f"模拟滤波 {'开' if actual.analog_filter else '关'}")
+                if descriptor(actual.mode).analog_filter:
+                    pieces.append(f"模拟滤波 {'开' if actual.analog_filter else '关'}")
+                else:
+                    pieces.append("模拟滤波 不适用")
                 pieces.append(f"自动零点 {'开' if actual.autozero else '关'}")
-                self.zero_result.emit(
-                    "ZERO:AUTO ONCE 命令已发送且错误队列无报错；执行后配置回读：" + " · ".join(pieces)
-                    + "。此回读只确认配置；本软件没有零点值查询项，不代表已取得ZERO测量结果。"
+                self.last_zero_readback_ok = True
+                command_status = (
+                    "MOCK模拟：未向真实仪器发送ZERO命令；模拟配置回读："
+                    if self.simulation
+                    else "ZERO:AUTO ONCE 命令已发送且错误队列无报错；执行后配置回读："
                 )
+                self.last_zero_message = (
+                    command_status + " · ".join(pieces)
+                    + "。此配置回读只确认配置；本软件没有零点值查询项，不代表已取得ZERO测量结果。"
+                )
+                self.zero_result.emit(self.last_zero_message)
             except Exception as readback_error:
-                if isinstance(readback_error, ScpiTimeout):
+                if isinstance(readback_error, InstrumentLocalModeError):
+                    self._mark_instrument_local()
+                elif isinstance(readback_error, ScpiTimeout):
                     self._close_after_scpi_timeout()
-                self.zero_result.emit(
-                    f"ZERO:AUTO ONCE 命令已发送且错误队列无报错，但执行后配置回读失败：{readback_error}。"
+                elif not self.simulation and self.instrument is not None and not self.instrument.connected:
+                    self._close_after_transport_failure("ZERO回读通信异常，连接已关闭；请重新连接")
+                failure_message = (
+                    (
+                        "MOCK模拟操作已执行，但模拟配置回读失败："
+                        if self.simulation
+                        else "ZERO:AUTO ONCE 命令已发送且错误队列无报错，但执行后配置回读失败："
+                    ) + f"{readback_error}。"
                 )
-            self.status_changed.emit("ZERO命令已发送；配置回读结果见状态提示")
+                report_failure(failure_message, readback_ok=False)
+                self.error.emit(
+                    (
+                        "MOCK模拟配置回读失败："
+                        if self.simulation
+                        else "ZERO命令已发送，但执行后配置回读失败："
+                    ) + str(readback_error)
+                )
+                if not isinstance(readback_error, InstrumentLocalModeError):
+                    self.status_changed.emit("ZERO命令已发送；配置回读结果见状态提示")
         except Exception as exc:
-            if isinstance(exc, ScpiTimeout):
+            failure_message = (
+                f"MOCK模拟 ZERO失败（未操作真实仪器）：{exc}"
+                if self.simulation
+                else f"ZERO命令或执行确认失败，仪器状态需核对：{exc}"
+            )
+            report_failure(failure_message, readback_ok=False)
+            if isinstance(exc, InstrumentLocalModeError):
+                self._mark_instrument_local()
+            elif isinstance(exc, ScpiTimeout):
                 self._close_after_scpi_timeout()
-            self.error.emit(f"ZERO失败：{exc}")
+            elif not self.simulation and self.instrument is not None and not self.instrument.connected:
+                self._close_after_transport_failure("ZERO通信异常，连接已关闭；请重新连接")
+            self.error.emit(failure_message)
 
     @Slot()
     def diagnose(self) -> None:
@@ -947,8 +1452,12 @@ class MeasurementWorker(QObject):
             result = self.instrument.diagnose()
             self.diagnostic_ready.emit("\n".join(f"{key}: {value}" for key, value in result.items()))
         except Exception as exc:
-            if isinstance(exc, ScpiTimeout):
+            if isinstance(exc, InstrumentLocalModeError):
+                self._mark_instrument_local()
+            elif isinstance(exc, ScpiTimeout):
                 self._close_after_scpi_timeout()
+            elif not self.simulation and self.instrument is not None and not self.instrument.connected:
+                self._close_after_transport_failure("诊断通信异常，连接已关闭；请重新连接")
             self.error.emit(f"诊断查询失败：{exc}")
 
     def _finish_experiment(self, status: str) -> None:
@@ -983,6 +1492,7 @@ class MeasurementWorker(QObject):
             self.experiment_finished.emit(directory)
             saved_ok = finalization_error is None and status not in {"storage_error", "start_error"}
             self.experiment_save_result.emit(directory, saved_ok, result_message)
+        self._release_experiment_name_lock()
         if finalization_error is not None:
             self.status_changed.emit(result_message)
         elif status in {"storage_error", "start_error"}:
@@ -995,6 +1505,7 @@ class MeasurementWorker(QObject):
     @Slot()
     def shutdown(self) -> None:
         self._timer.stop()
+        self._connection_watch_timer.stop()
         if self._recorder is not None:
             if self.state != AcquisitionState.STOPPED:
                 self._machine.stop()

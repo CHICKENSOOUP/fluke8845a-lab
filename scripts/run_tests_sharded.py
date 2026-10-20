@@ -1,4 +1,4 @@
-"""Run the complete pytest suite in bounded, independently logged shards."""
+"""Run the complete pytest suite in independently logged parallel shards."""
 
 from __future__ import annotations
 
@@ -22,21 +22,27 @@ SHARDS = {
         "tests/test_app.py",
         "tests/test_scpi.py",
         "tests/test_webapp.py",
+        "tests/test_web_chart_history.py",
+        "tests/test_web_share_export_endpoint.py",
         "tests/test_worker.py",
     ),
     "release": (
+        "tests/test_build_identity.py",
         "tests/test_build_provenance.py",
         "tests/test_hardware_probe_manifest.py",
         "tests/test_package_release.py",
         "tests/test_runtime_licenses.py",
+        "tests/test_share_export.py",
         "tests/test_windows_launcher.py",
     ),
     "core": (
         "tests/test_analysis.py",
         "tests/test_history_import.py",
         "tests/test_icon_builder.py",
+        "tests/test_filter_policy.py",
         "tests/test_mock.py",
         "tests/test_modes.py",
+        "tests/test_plot_history.py",
         "tests/test_state.py",
         "tests/test_storage.py",
         "tests/test_test_shards.py",
@@ -104,15 +110,22 @@ def default_output_root() -> Path:
     return Path(tempfile.gettempdir()) / "Fluke8845A_Test_Artifacts" / "pytest-shards"
 
 
+def write_console_text(value: str, stream=None) -> None:
+    """Write diagnostics even when a Windows console encoding cannot represent a log character."""
+    stream = stream or sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    stream.write(value.encode(encoding, errors="backslashreplace").decode(encoding))
+
+
 def run_shards(
     *,
     python: Path = Path(sys.executable),
-    timeout_seconds: int = 50,
+    timeout_seconds: int | None = None,
     root: Path = ROOT,
     output_root: Path | None = None,
 ) -> int:
-    if not 1 <= timeout_seconds <= 55:
-        raise ValueError("timeout-seconds must be between 1 and 55")
+    if timeout_seconds is not None and timeout_seconds < 1:
+        raise ValueError("timeout-seconds must be positive when specified")
     root = Path(root).resolve()
     validate_shard_coverage(root)
     output_root = Path(output_root) if output_root is not None else default_output_root()
@@ -120,7 +133,7 @@ def run_shards(
     run_directory.mkdir(parents=True, exist_ok=False)
 
     running: dict[str, tuple[subprocess.Popen, object, object, float]] = {}
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     try:
         for name, modules in SHARDS.items():
             shard_directory = run_directory / name
@@ -148,7 +161,7 @@ def run_shards(
             running[name] = (process, stdout_stream, stderr_stream, time.monotonic())
 
         while any(process.poll() is None for process, *_rest in running.values()):
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 processes = [process for process, *_rest in running.values()]
                 with ThreadPoolExecutor(max_workers=len(processes)) as executor:
                     list(executor.map(_stop_process_tree, processes))
@@ -170,7 +183,7 @@ def run_shards(
                 content = log_path.read_bytes()
                 if content:
                     print(f"--- {name}/{log_name} ---")
-                    sys.stdout.write(content.decode("utf-8", errors="replace"))
+                    write_console_text(content.decode("utf-8", errors="replace"))
                     if not content.endswith(b"\n"):
                         sys.stdout.write("\n")
             failed |= code != 0
@@ -188,7 +201,7 @@ def run_shards(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", type=Path, default=Path(sys.executable), help="Python executable with pytest installed")
-    parser.add_argument("--timeout-seconds", type=int, default=50, help="shared hard limit for all parallel test shards (1–55)")
+    parser.add_argument("--timeout-seconds", type=int, default=None, help="optional shared watchdog for all parallel test shards; omitted by default")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--output-root", type=Path, help="directory for unique per-run shard logs and pytest basetemp")
     args = parser.parse_args(argv)

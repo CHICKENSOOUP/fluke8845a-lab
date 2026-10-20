@@ -106,7 +106,7 @@ def create_manifest(report_path: Path, manifest_path: Path | None = None, exe_pa
         "collection_duration_s": report.get("collection_duration_s"),
         "sample_count": len(rows),
         "invalid_count": report.get("invalid_count", 0),
-        "displayed_actual_rate": report.get("displayed_actual_rate"),
+        "displayed_actual_interval": report.get("displayed_actual_interval"),
         "csv_reconstructed_actual_rate_hz": report.get("csv_reconstructed_actual_rate_hz"),
         "evidence_files": {
             label: {"size_bytes": path.stat().st_size, "sha256": sha256(path)}

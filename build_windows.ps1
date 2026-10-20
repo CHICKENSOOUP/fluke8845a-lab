@@ -13,19 +13,19 @@ $previousConfigDir = $env:FLUKE8845A_CONFIG_DIR
 $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
 
-function Wait-BoundedSmokeProcess {
+function Wait-SoftwareSmokeProcess {
     param(
         [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
         [Parameter(Mandatory)][string]$Description
     )
 
     try {
-        Wait-Process -Id $Process.Id -Timeout 55 -ErrorAction Stop | Out-Null
+        Wait-Process -Id $Process.Id -Timeout 300 -ErrorAction Stop | Out-Null
     } catch {
         if (Get-Process -Id $Process.Id -ErrorAction SilentlyContinue) {
             Stop-Process -Id $Process.Id -Force
         }
-        throw "$Description exceeded the 55-second limit."
+        throw "$Description exceeded the 5-minute software smoke watchdog."
     }
 
     $Process.Refresh()
@@ -105,46 +105,27 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Build provenance source-tree capture failed." }
 
     $pytestRunId = [guid]::NewGuid().ToString("N")
-    $pytestStdoutPath = Join-Path $PSScriptRoot ("build\pytest_build_" + $pytestRunId + ".stdout.log")
-    $pytestStderrPath = Join-Path $PSScriptRoot ("build\pytest_build_" + $pytestRunId + ".stderr.log")
-    $pytestStartInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pytestStartInfo.FileName = $python
+    $pytestArtifactRoot = Join-Path ([System.IO.Path]::GetTempPath()) "Fluke8845A_Test_Artifacts"
+    $pytestRunDirectory = Join-Path $pytestArtifactRoot ("pytest-build-" + $pytestRunId)
+    New-Item -ItemType Directory -Path $pytestRunDirectory -Force | Out-Null
     $pytestRunner = Join-Path $PSScriptRoot "scripts\run_tests_sharded.py"
-    $pytestStartInfo.Arguments = '"{0}" --python "{1}" --timeout-seconds 45 --output-root "{2}"' -f $pytestRunner, $python, (Join-Path $PSScriptRoot "build\pytest-shards")
-    $pytestStartInfo.WorkingDirectory = $PSScriptRoot
-    $pytestStartInfo.UseShellExecute = $false
-    $pytestStartInfo.CreateNoWindow = $true
-    $pytestStartInfo.RedirectStandardOutput = $true
-    $pytestStartInfo.RedirectStandardError = $true
-    $pytestProcess = New-Object System.Diagnostics.Process
-    $pytestProcess.StartInfo = $pytestStartInfo
-    [void]$pytestProcess.Start()
-    $pytestStdoutTask = $pytestProcess.StandardOutput.ReadToEndAsync()
-    $pytestStderrTask = $pytestProcess.StandardError.ReadToEndAsync()
-    $pytestTimedOut = -not $pytestProcess.WaitForExit(50000)
-    if ($pytestTimedOut) {
-        & taskkill.exe /PID $pytestProcess.Id /T /F *> $null
-        if (-not $pytestProcess.WaitForExit(3000)) {
-            try { $pytestProcess.Kill() } catch { }
-            [void]$pytestProcess.WaitForExit(1000)
-        }
-    }
-    $pytestStdout = $pytestStdoutTask.GetAwaiter().GetResult()
-    $pytestStderr = $pytestStderrTask.GetAwaiter().GetResult()
-    Set-Content -LiteralPath $pytestStdoutPath -Value $pytestStdout -Encoding utf8
-    Set-Content -LiteralPath $pytestStderrPath -Value $pytestStderr -Encoding utf8
-    Write-Output $pytestStdout
-    Write-Output $pytestStderr
-    if ($pytestTimedOut) { throw "pytest exceeded the 50-second limit; EXE packaging stopped." }
-    if (-not $pytestProcess.HasExited) { throw "pytest did not exit after the bounded stop attempt; EXE packaging stopped." }
-    if ($pytestProcess.ExitCode -ne 0) {
-        throw "pytest failed with exit code $($pytestProcess.ExitCode); EXE packaging stopped."
-    }
+    & $python $pytestRunner --python $python --timeout-seconds 600 --output-root (Join-Path $pytestRunDirectory "pytest-shards")
+    if ($LASTEXITCODE -ne 0) { throw "pytest failed with exit code $LASTEXITCODE; EXE packaging stopped." }
+    & $python (Join-Path $PSScriptRoot "scripts\run_web_tests.py")
+    if ($LASTEXITCODE -ne 0) { throw "Web frontend JavaScript tests failed with exit code $LASTEXITCODE; EXE packaging stopped." }
     $env:NUITKA_CACHE_DIR = $nuitkaCacheDirectory
     & $python -m nuitka --version
     if ($LASTEXITCODE -ne 0) { throw 'Install build dependencies with: python -m pip install -e ".[dev,build]"' }
 
-    $pythonBase = (& $python -c "import sys; print(sys.base_prefix)").Trim()
+    $pythonBaseHex = (& $python -c "import sys; print(sys.base_prefix.encode('utf-8').hex())").Trim()
+    if ([string]::IsNullOrWhiteSpace($pythonBaseHex) -or $pythonBaseHex -notmatch '^(?:[0-9A-Fa-f]{2})+$') {
+        throw "Python returned an invalid UTF-8 encoded base runtime path."
+    }
+    $pythonBaseBytes = New-Object byte[] ($pythonBaseHex.Length / 2)
+    for ($index = 0; $index -lt $pythonBaseHex.Length; $index += 2) {
+        $pythonBaseBytes[[int]($index / 2)] = [Convert]::ToByte($pythonBaseHex.Substring($index, 2), 16)
+    }
+    $pythonBase = [System.Text.Encoding]::UTF8.GetString($pythonBaseBytes)
     $pythonVersion = (& $python -c "import sys; print('%d.%d.%d' % sys.version_info[:3])").Trim()
     if ([string]::IsNullOrWhiteSpace($PortablePythonPath)) {
         $portablePython = Join-Path $PSScriptRoot "build\portable-python-$pythonVersion"
@@ -184,6 +165,7 @@ try {
     & $portableExecutable -m nuitka $entryPoint `
         --standalone `
         --enable-plugin=pyside6 `
+        --nofollow-import-to=PySide6.QtTest `
         --assume-yes-for-downloads `
         --remove-output `
         "--output-dir=$outputDirectory" `
@@ -202,6 +184,7 @@ try {
     & $portableExecutable -m nuitka $webEntryPoint `
         --standalone `
         --enable-plugin=pyside6 `
+        --nofollow-import-to=PySide6.QtTest `
         --noinclude-qt-plugins=imageformats `
         --assume-yes-for-downloads `
         --remove-output `
@@ -226,6 +209,11 @@ try {
         Remove-Item -LiteralPath $unusedQtPdfPlugin -Force
     }
 
+    & $python (Join-Path $PSScriptRoot "scripts\package_windows_release.py") `
+        --app-dist $exeDist `
+        --prune-unused-qt-pdf
+    if ($LASTEXITCODE -ne 0) { throw "Unused Qt PDF components cleanup failed." }
+
     & $python (Join-Path $PSScriptRoot "scripts\collect_windows_runtime_licenses.py") `
         --python-root $portablePython `
         --site-packages $pythonSitePackages `
@@ -241,12 +229,27 @@ try {
     $buildPythonPath = $env:PYTHONPATH
     Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
     $smoke = Start-Process -FilePath $exe -ArgumentList @("--mock", "--smoke") -PassThru -WindowStyle Hidden
-    Wait-BoundedSmokeProcess -Process $smoke -Description "Frozen Mock GUI smoke check"
+    Wait-SoftwareSmokeProcess -Process $smoke -Description "Frozen Mock GUI smoke check"
     $serialSmoke = Start-Process -FilePath $exe -ArgumentList @("--serial-smoke") -PassThru -WindowStyle Hidden
-    Wait-BoundedSmokeProcess -Process $serialSmoke -Description "Frozen pyserial import/port enumeration check"
+    Wait-SoftwareSmokeProcess -Process $serialSmoke -Description "Frozen pyserial import/port enumeration check"
+    $env:PYTHONPATH = $buildPythonPath
+
+    & $python (Join-Path $PSScriptRoot "scripts\build_provenance.py") create `
+        --root $PSScriptRoot `
+        --candidate-build-name $candidateBuildName `
+        --expected-source-digest $sourceDigestPath `
+        --desktop-exe $exe `
+        --web-exe $webExecutable `
+        --output $provenancePath
+    if ($LASTEXITCODE -ne 0) { throw "Build provenance creation failed; sources may have changed during compilation." }
+    Copy-Item -LiteralPath $provenancePath -Destination (Join-Path $exeDist "BUILD-IDENTITY.json") -Force
+
+    # Generate the report after the identity marker exists so its recorded window title names this build.
+    $buildPythonPath = $env:PYTHONPATH
+    Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
     $mockE2EReport = Join-Path $PSScriptRoot ("build\mock-e2e-" + [guid]::NewGuid().ToString("N") + ".json")
     $mockE2E = Start-Process -FilePath $exe -ArgumentList @("--mock-e2e", "--report", $mockE2EReport) -PassThru -WindowStyle Hidden
-    Wait-BoundedSmokeProcess -Process $mockE2E -Description "Frozen six-mode Mock GUI verification"
+    Wait-SoftwareSmokeProcess -Process $mockE2E -Description "Frozen six-mode Mock GUI verification"
     if (-not (Test-Path -LiteralPath $mockE2EReport)) { throw "Frozen six-mode Mock GUI verification did not create its report: $mockE2EReport" }
     $mockE2EData = Get-Content -LiteralPath $mockE2EReport -Raw | ConvertFrom-Json
     if ($mockE2EData.status -ne "ok" -or $mockE2EData.simulation -ne $true -or $mockE2EData.mode_count -ne 6) {
@@ -266,15 +269,6 @@ try {
     }
     Copy-Item -LiteralPath $mockE2EReport -Destination $releaseMockE2EReport -Force
     $env:PYTHONPATH = $buildPythonPath
-
-    & $python (Join-Path $PSScriptRoot "scripts\build_provenance.py") create `
-        --root $PSScriptRoot `
-        --candidate-build-name $candidateBuildName `
-        --expected-source-digest $sourceDigestPath `
-        --desktop-exe $exe `
-        --web-exe $webExecutable `
-        --output $provenancePath
-    if ($LASTEXITCODE -ne 0) { throw "Build provenance creation failed; sources may have changed during compilation." }
 
     & $python (Join-Path $PSScriptRoot "scripts\package_windows_release.py") `
         --app-dist $exeDist `

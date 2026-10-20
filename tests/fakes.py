@@ -7,7 +7,7 @@ from fluke8845a.scpi import SerialSettings
 
 
 class FakeTransport:
-    def __init__(self, idn="FLUKE,8845A,12345678,2.0", settings: SerialSettings | None = None, terminals="FRONT"):
+    def __init__(self, idn="FLUKE,8845A,TEST8845A001,2.0", settings: SerialSettings | None = None, terminals="FRONT"):
         self.settings = settings or SerialSettings()
         self.idn = idn
         self.terminals = terminals
@@ -31,6 +31,9 @@ class FakeTransport:
         self.input_impedance_auto = "0"
         self.bandwidth_response_override = None
         self.local_error_on_read = False
+        self.trigger_source = "IMM"
+        self.trigger_count = "1"
+        self.sample_count = "1"
 
     def open(self):
         self.is_open = True
@@ -46,6 +49,9 @@ class FakeTransport:
         if upper_command.startswith("CONF:"):
             function = command.split(":", 1)[1]
             self.function = function
+            self.trigger_source = "IMM"
+            self.trigger_count = "1"
+            self.sample_count = "1"
             self.input_impedance_auto = "0"
             mode = mode_from_scpi_function(function)
             if mode is not None:
@@ -64,8 +70,10 @@ class FakeTransport:
         elif ":FILT:DIG " in upper_command:
             prefix = command[:upper_command.index(":FILT:DIG")]
             self.digital_filters[prefix.upper()] = "1" if upper_command.endswith(" ON") else "0"
-        elif upper_command.startswith("ZERO:AUTO "):
-            self.autozero = "1" if upper_command.endswith(" ON") else "0"
+        elif upper_command == "ZERO:AUTO ON":
+            self.autozero = "1"
+        elif upper_command == "ZERO:AUTO OFF":
+            self.autozero = "0"
         elif upper_command.startswith("INP:IMP:AUTO "):
             self.input_impedance_auto = "1" if upper_command.endswith(" ON") else "0"
         elif ":NPLC " in upper_command:
@@ -90,6 +98,12 @@ class FakeTransport:
             response = self.force_function or self.function
         elif command == "ROUT:TERM?":
             response = self.terminals
+        elif command == "TRIG:SOUR?":
+            response = self.trigger_source
+        elif command == "TRIG:COUN?":
+            response = self.trigger_count
+        elif command == "SAMP:COUN?":
+            response = self.sample_count
         elif command.endswith(":RANG:AUTO?"):
             response = self.autorange
         elif command.endswith(":RANG?"):

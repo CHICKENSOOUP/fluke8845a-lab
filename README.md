@@ -34,7 +34,13 @@ python -m fluke8845a
 
 启动本机网页界面：运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
-开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1`。该入口会并行运行完整 pytest 分片套件，共用 45 秒分片限时和 50 秒外层看门狗，并把每片日志保留在 `build\pytest-shards`。若依赖装在其他 Python 环境，可加 `-PythonPath .\.venv-build\Scripts\python.exe`。Windows 便携构建需要 64 位 Python 3.12 环境；每次构建也会调用相同的分片测试入口。
+开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1`。该入口会并行运行完整 pytest 分片套件，不设 60 秒测试上限；日志保存在系统临时目录。若依赖装在其他 Python 环境，可加 `-PythonPath .\.venv-build\Scripts\python.exe`。Windows 便携构建需要 64 位 Python 3.12 和 Node.js 22 或更新版本；构建会先运行 Python 与 Web 前端测试，通过后才开始编译。
+
+Web 前端测试需要 Node.js 22 或更新版本（窄屏布局测试通过全局 WebSocket 检查隔离 Chromium）。可在仓库根目录单独运行：
+
+```powershell
+python scripts/run_web_tests.py
+```
 
 ```powershell
 py -3.12 -m venv .venv-build
@@ -47,7 +53,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 当前 GitHub 版本仅发布源码，不含预编译 Windows 程序。发布便携程序前，仍需完成精确的第三方组件清单、Qt/PySide 对应源码交付和 Qt 库替换说明。
 
-每次推送到 `main` 都会在 Python 3.11 和 3.12 Windows 环境分别运行完整 pytest 分片套件（分片总限时 50 秒，工作流步骤上限 60 秒），并从新解压的源码 ZIP 首次创建环境、安装锁定依赖和启动 Mock 桌面界面（最多 60 秒）；全部通过后，同一工作流会为该提交创建 GitHub 预发布版本，并同时发布源码 ZIP、SHA-256 校验文件和 GHCR Packages 源码包。推送 `v*` 标签也会同时发布正式 GitHub Release 和 Packages。自动发布流程见[发布说明](docs/releasing.md)。
+每次推送到 `main` 都会在 Python 3.11 和 3.12 Windows 环境分别运行完整 pytest 分片套件，并运行 Web 前端测试；测试步骤不设 60 秒上限，由 10/20 分钟的工作流作业时限保护。流程也会从新解压的源码 ZIP 创建环境、安装锁定依赖并启动 Mock 桌面界面；全部通过后，同一工作流会为该提交创建 GitHub 预发布版本，并同时发布源码 ZIP、SHA-256 校验文件和 GHCR Packages 源码包。推送 `v*` 标签也会同时发布正式 GitHub Release 和 Packages。自动发布流程见[发布说明](docs/releasing.md)。
 
 ### 仪器与验证状态
 
@@ -63,6 +69,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 - [使用指南](docs/user-guide.md)
 - [短时真机 GUI 探测](docs/hardware-probes.md)
 - [已知限制](docs/known-limitations.md)
+- [v1.1.0 发布说明](docs/release-notes-v1.1.0.md)
 - [v1.0.7 发布说明](docs/release-notes-v1.0.7.md)
 - [v1.0.6 发布说明](docs/release-notes-v1.0.6.md)
 - [v1.0.5 发布说明](docs/release-notes-v1.0.5.md)
@@ -106,13 +113,19 @@ python -m fluke8845a
 
 Start the local browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
 
-Install developer dependencies with `python -m pip install -e ".[dev]"`. In PowerShell, run the complete pytest suite in parallel shards; the shared shard limit is 45 seconds and the outer watchdog is 50 seconds. Per-shard logs are retained under `build\pytest-shards`. If the dependencies are installed in another Python environment, pass `-PythonPath .\.venv-build\Scripts\python.exe`:
+Install developer dependencies with `python -m pip install -e ".[dev]"`. In PowerShell, run the complete pytest suite in parallel shards; no 60-second cap is applied, and per-shard logs are kept outside the checkout in the system temporary directory. If the dependencies are installed in another Python environment, pass `-PythonPath .\.venv-build\Scripts\python.exe`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1
 ```
 
-For a reproducible local build, use 64-bit Python 3.12 and install the locked test/build dependencies before invoking the script:
+Run the Web frontend tests separately with Node.js 22 or newer (the narrow-layout browser check uses the built-in WebSocket client):
+
+```powershell
+python scripts/run_web_tests.py
+```
+
+For a reproducible local build, use 64-bit Python 3.12 and Node.js 22 or newer, then install the locked test/build dependencies before invoking the script. The build runs both the Python and Web frontend tests before Nuitka compilation:
 
 ```powershell
 py -3.12 -m venv .venv-build
@@ -125,7 +138,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 By default `build_windows.ps1` uses `.venv\Scripts\python.exe` and caches its compiler under `build/nuitka-cache`; `-PythonPath` selects another installed Python environment, `-PortablePythonPath` selects an existing matching portable runtime, and `$env:NUITKA_CACHE_DIR` in PowerShell reuses an existing Nuitka compiler cache. The current GitHub source release does not include a prebuilt Windows executable. A binary release can be considered after its exact third-party license inventory, Qt/PySide source delivery, and Qt replacement instructions are complete and verified.
 
-Every push to `main` runs the complete pytest shard suite on Windows with Python 3.11 and 3.12 (50-second shard limit, 60-second workflow-step limit), then extracts the source ZIP into a fresh directory, installs the locked environment, and launches the Mock desktop UI (60-second limit). After all checks pass, the workflow publishes a versioned, commit-specific GitHub prerelease and matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Titles and tags include the `pyproject.toml` version and commit; stable `v*` tags must match the project version. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
+Every push to `main` runs the complete pytest shard suite on Windows with Python 3.11 and 3.12 plus the Web frontend tests. Test steps have no 60-second cap; the workflow jobs provide 10- and 20-minute outer limits. The workflow then extracts the source ZIP into a fresh directory, installs the locked environment, and launches the Mock desktop UI. After all checks pass, it publishes a versioned, commit-specific GitHub prerelease and matching GHCR OCI source package containing the source ZIP and SHA-256 checksum. Titles and tags include the `pyproject.toml` version and commit; stable `v*` tags must match the project version. See the [release guide](docs/releasing.md) for download instructions and GHCR visibility details.
 
 ## Hardware and verification status
 
@@ -143,6 +156,7 @@ This source release does not bundle Qt libraries. Do not treat the project MIT l
 - [Usage guide](docs/user-guide.md)
 - [Short hardware GUI probes](docs/hardware-probes.md)
 - [Known limitations](docs/known-limitations.md)
+- [v1.1.0 release notes](docs/release-notes-v1.1.0.md)
 - [v1.0.7 release notes](docs/release-notes-v1.0.7.md)
 - [v1.0.6 release notes](docs/release-notes-v1.0.6.md)
 - [v1.0.5 release notes](docs/release-notes-v1.0.5.md)

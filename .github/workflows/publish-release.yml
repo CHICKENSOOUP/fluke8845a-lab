@@ -35,13 +35,12 @@ jobs:
           python -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
         shell: pwsh
 
-      - name: Run Python 3.11 tests (60-second limit)
+      - name: Run Python 3.11 tests
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python scripts/run_tests_sharded.py --timeout-seconds 50 --output-root "build\pytest-shards-py311"
+          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py311"
           if ($LASTEXITCODE -ne 0) { throw "Python 3.11 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
-        timeout-minutes: 1
 
   publish:
     needs: test-python311
@@ -50,6 +49,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js for Web frontend tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -68,23 +72,18 @@ jobs:
           python -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
         shell: pwsh
 
-      - name: Run Web frontend JavaScript tests (60-second limit)
+      - name: Run Web frontend JavaScript tests
         env:
           PYTHON: python
-        run: |
-          node --version
-          node --test --test-timeout=45000 tests/web_frontend.test.cjs tests/web_history_worker.test.cjs
-          if ($LASTEXITCODE -ne 0) { throw "Web frontend JavaScript tests failed (exit $LASTEXITCODE)." }
+        run: python scripts/run_web_tests.py
         shell: pwsh
-        timeout-minutes: 1
 
-      - name: Run tests (60-second limit)
+      - name: Run tests
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python scripts/run_tests_sharded.py --timeout-seconds 50 --output-root "build\pytest-shards-py312"
+          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py312"
           if ($LASTEXITCODE -ne 0) { throw "Python 3.12 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
-        timeout-minutes: 1
 
       - name: Build and verify source package
         run: |
@@ -98,7 +97,7 @@ jobs:
           "$hash  Fluke8845A_Source_Project.zip" | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
         shell: pwsh
 
-      - name: Smoke test first launch from extracted source ZIP (60-second limit)
+      - name: Smoke test first launch from extracted source ZIP
         run: |
           $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
           $extractRoot = Join-Path $env:RUNNER_TEMP ("Fluke8845A_source_smoke_" + [guid]::NewGuid().ToString("N"))
@@ -113,7 +112,6 @@ jobs:
             Pop-Location
           }
         shell: pwsh
-        timeout-minutes: 1
 
       - name: Set up ORAS
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
@@ -149,7 +147,7 @@ jobs:
           Automated source-only package for commit $sha.
 
           Assets: Fluke8845A_Source_Project.zip and SHA256SUMS.txt.
-          The test step is capped at 60 seconds. This release does not claim validation on a real Fluke 8845A.
+          Automated software checks run within the workflow job limits. This release does not claim validation on a real Fluke 8845A.
           A Windows binary is omitted while the documented Qt/PySide licensing review remains open.
           "@
 

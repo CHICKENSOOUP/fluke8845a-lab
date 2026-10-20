@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
+import math
+import re
 import shutil
 import socket
 import subprocess
@@ -21,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.archive_paths import ensure_path_within, ensure_regular_file_within
+from scripts.atomic_archive import atomic_archive_path
 from scripts.build_provenance import (
     BUILD_PROVENANCE_NAME,
     WINDOWS_ARCHIVE_SUFFIX,
@@ -32,11 +37,15 @@ from scripts.package_source import validate_packaged_web_resources, validate_web
 
 
 DIST = ROOT / "dist"
+SOFTWARE_SMOKE_TIMEOUT_SECONDS = 300
+WEB_STARTUP_TIMEOUT_SECONDS = 120
 APP_DIST = DIST / "Fluke8845A.dist"
 ARCHIVE = DIST / "Fluke8845A_Windows_x64.zip"
 MOCK_E2E_REPORT = "output/mock_validation/latest_frozen_exe_six_mode_e2e.json"
+BUILD_IDENTITY_NAME = "BUILD-IDENTITY.json"
 MOCK_E2E_MODES = {"DCV", "ACV", "DCI", "ACI", "RES2", "RES4"}
 UNSUPPORTED_QT_PDF_BASENAMES = {"qpdf.dll", "qt6pdf.dll", "qtpdf.pyd"}
+UNSUPPORTED_QT_COMPONENT_BASENAMES = UNSUPPORTED_QT_PDF_BASENAMES | {"qttest.pyd", "qt6test.dll"}
 REQUIRED_ENTRIES = {
     "Fluke8845A.exe",
     "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
@@ -47,13 +56,16 @@ REQUIRED_ENTRIES = {
     "README.md",
     "LICENSE",
     "THIRD-PARTY-NOTICES.md",
+    BUILD_IDENTITY_NAME,
     BUILD_PROVENANCE_NAME,
     "docs/user-guide.md",
     "docs/hardware-validation.md",
     "docs/qt-licensing-and-third-party-notices.md",
     "docs/licenses/LGPL-3.0.txt",
     "docs/licenses/windows-portable-review-2026-10-15.md",
+    "docs/licenses/windows-portable-review-2026-10-20.md",
     "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
+    "docs/licenses/windows-qt-runtime-inventory.csv",
     "docs/licenses/windows-source-offer.md",
     "docs/licenses/windows-runtime-license-manifest.json",
     "docs/licenses/third-party/cpython/LICENSE.txt",
@@ -79,7 +91,18 @@ EXCLUDED_PATH_PARTS = {
 }
 
 
-def validate_mock_e2e_report(report: dict, executable_sha256: str) -> None:
+def validate_runtime_build_identity(identity: dict, provenance: dict) -> None:
+    """Require the GUI's adjacent marker to describe this exact archive build."""
+    if not isinstance(identity, dict) or not isinstance(provenance, dict) or identity != provenance:
+        raise ValueError("GUI build identity does not match package provenance")
+
+
+def validate_mock_e2e_report(
+    report: dict,
+    executable_sha256: str,
+    *,
+    expected_source_tree_sha256: str | None = None,
+) -> None:
     """Reject stale, partial, or real/mocked-identity-mixed smoke reports."""
     if report.get("probe_type") != "mock_gui_six_mode_e2e" or report.get("status") != "ok":
         raise ValueError("Frozen Mock E2E report does not describe a successful GUI run")
@@ -87,6 +110,14 @@ def validate_mock_e2e_report(report: dict, executable_sha256: str) -> None:
         raise ValueError("Frozen Mock E2E report must identify simulated data")
     if str(report.get("executable_sha256", "")).upper() != executable_sha256.upper():
         raise ValueError("Frozen Mock E2E report executable SHA256 does not match the packaged EXE")
+    if expected_source_tree_sha256 is not None:
+        if not re.fullmatch(r"[0-9A-Fa-f]{64}", expected_source_tree_sha256):
+            raise ValueError("expected source tree SHA256 is malformed")
+        version = str(report.get("software_version", "")).strip()
+        title = report.get("window_title")
+        expected_label = f"v{version} · 构建 {expected_source_tree_sha256[:8].upper()}"
+        if not isinstance(title, str) or not title.endswith(expected_label):
+            raise ValueError("GUI title does not identify the packaged source build")
 
     modes = report.get("modes")
     if report.get("mode_count") != len(MOCK_E2E_MODES) or not isinstance(modes, list):
@@ -113,15 +144,97 @@ def validate_mock_e2e_report(report: dict, executable_sha256: str) -> None:
     if found_modes != MOCK_E2E_MODES:
         raise ValueError("Frozen Mock E2E report omits a measurement mode")
 
+    wheel_zoom = report.get("wheel_zoom_validation")
+    if not isinstance(wheel_zoom, dict):
+        raise ValueError("Frozen Mock E2E report omits the desktop wheel zoom validation")
+    if wheel_zoom.get("mode") != "DCV" or wheel_zoom.get("simulation") is not True:
+        raise ValueError("Frozen Mock E2E wheel zoom validation must use DCV Mock data")
+    if (
+        wheel_zoom.get("follow_disabled") is not True
+        or wheel_zoom.get("plot_values_preserved") is not True
+        or wheel_zoom.get("raw_readings_preserved") is not True
+    ):
+        raise ValueError("Frozen Mock E2E wheel zoom validation changed acquisition state or raw data")
+    if wheel_zoom.get("precision_limit_reached") is not True:
+        raise ValueError("Frozen Mock E2E wheel zoom did not reach and report the floating-point precision boundary")
+    wheel_event_count = wheel_zoom.get("wheel_event_count")
+    wheel_events_accepted = wheel_zoom.get("wheel_events_accepted")
+    initial_span = wheel_zoom.get("initial_span_si")
+    final_span = wheel_zoom.get("final_span_si")
+    if (
+        not isinstance(wheel_event_count, int) or isinstance(wheel_event_count, bool) or wheel_event_count < 1400
+        or not isinstance(wheel_events_accepted, int) or isinstance(wheel_events_accepted, bool)
+        or wheel_events_accepted != wheel_event_count
+    ):
+        raise ValueError("Frozen Mock E2E wheel zoom validation did not deliver and accept every wheel event")
+    if (
+        isinstance(initial_span, bool) or not isinstance(initial_span, (int, float))
+        or isinstance(final_span, bool) or not isinstance(final_span, (int, float))
+        or not math.isfinite(initial_span) or not math.isfinite(final_span)
+        or initial_span <= 0 or final_span <= 0
+        or final_span > initial_span * 1e-6 or final_span > 1e-323
+    ):
+        raise ValueError(
+            "Frozen Mock E2E wheel zoom did not shrink the Y span by at least six orders of magnitude "
+            "and reach the floating-point precision boundary"
+        )
+
+
+def validate_packaged_mock_e2e_report(
+    report: dict,
+    executable_sha256: str,
+    provenance: dict,
+) -> None:
+    """Bind an archived smoke report to the source identity of the same package."""
+    if not isinstance(provenance, dict):
+        raise ValueError("Portable package provenance is malformed")
+    source_digest = provenance.get("source_tree_sha256")
+    validate_mock_e2e_report(
+        report,
+        executable_sha256,
+        expected_source_tree_sha256=source_digest,
+    )
+
 
 def validate_portable_runtime_components(entries: set[str]) -> None:
-    """Reject Qt PDF binaries; the app does not use PDF rendering or image loading."""
-    unexpected = sorted(
+    """Reject unused Qt components that the application does not depend on."""
+    pdf_components = sorted(
         entry for entry in entries
         if Path(entry).name.casefold() in UNSUPPORTED_QT_PDF_BASENAMES
     )
-    if unexpected:
-        raise ValueError("Portable package contains unused Qt PDF components: " + ", ".join(unexpected))
+    other_components = sorted(
+        entry for entry in entries
+        if Path(entry).name.casefold() in UNSUPPORTED_QT_COMPONENT_BASENAMES
+        and Path(entry).name.casefold() not in UNSUPPORTED_QT_PDF_BASENAMES
+    )
+    details = []
+    if pdf_components:
+        details.append("unused Qt PDF components: " + ", ".join(pdf_components))
+    if other_components:
+        details.append("unused Qt components: " + ", ".join(other_components))
+    if details:
+        raise ValueError("Portable package contains " + "; ".join(details))
+
+
+def prune_unused_qt_pdf_components(app_dist: Path) -> list[str]:
+    """Remove known-unused Qt PDF files from a generated Nuitka runtime directory."""
+    app_dist = Path(app_dist).resolve(strict=True)
+    if not app_dist.is_dir():
+        raise ValueError(f"Nuitka runtime path is not a directory: {app_dist}")
+
+    removed: list[str] = []
+    candidates = sorted(app_dist.rglob("*"), key=lambda path: path.as_posix().casefold())
+    for candidate in candidates:
+        if candidate.name.casefold() not in UNSUPPORTED_QT_PDF_BASENAMES:
+            continue
+        if candidate.is_symlink():
+            raise ValueError(f"Cannot prune a symbolic link from the generated runtime: {candidate}")
+        if not candidate.is_file():
+            continue
+        ensure_regular_file_within(candidate, app_dist)
+        removed.append(candidate.relative_to(app_dist).as_posix())
+        candidate.unlink()
+    return removed
 
 
 def validate_runtime_license_manifest(
@@ -238,7 +351,72 @@ def validate_runtime_license_manifest(
         raise ValueError("Runtime license manifest must preserve the Qt/PySide review item")
 
 
-def verify_extracted_portable_release(archive_path: Path, executable_sha256: str) -> None:
+def validate_qt_runtime_inventory(manifest: dict, inventory_csv: bytes) -> None:
+    """Require the review-friendly Qt CSV to describe the exact Qt binaries in the manifest."""
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("native_binaries"), list):
+        raise ValueError("Runtime manifest does not list native binaries for the Qt inventory")
+    try:
+        inventory_text = inventory_csv.decode("utf-8-sig")
+    except (AttributeError, UnicodeDecodeError) as exc:
+        raise ValueError("Qt runtime CSV inventory is not valid UTF-8") from exc
+
+    reader = csv.DictReader(io.StringIO(inventory_text, newline=""))
+    required_fields = ["path", "family", "bytes", "sha256"]
+    if reader.fieldnames != required_fields:
+        raise ValueError("Qt runtime CSV inventory has an unexpected header")
+
+    def require_canonical_native_path(path: str) -> None:
+        relative = PurePosixPath(path)
+        if (
+            not path
+            or "\\" in path
+            or ":" in path
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or relative.suffix.casefold() not in {".dll", ".pyd", ".exe"}
+        ):
+            raise ValueError(f"Qt runtime inventory contains a non-canonical native binary path: {path}")
+
+    expected_rows: list[tuple[str, str, str, str]] = []
+    expected_paths: set[str] = set()
+    for record in manifest["native_binaries"]:
+        if not isinstance(record, dict):
+            raise ValueError("Runtime manifest contains an invalid native binary record")
+        if record.get("family") != "Qt/PySide/Shiboken":
+            continue
+        path = str(record.get("path", ""))
+        require_canonical_native_path(path)
+        if not path or path.casefold() in expected_paths:
+            raise ValueError(f"Runtime manifest repeats a native binary path: {path}")
+        expected_paths.add(path.casefold())
+        expected_rows.append((
+            path,
+            "Qt/PySide/Shiboken",
+            str(record.get("bytes", "")),
+            str(record.get("sha256", "")).upper(),
+        ))
+
+    actual_rows: list[tuple[str, str, str, str]] = []
+    seen_paths: set[str] = set()
+    for row in reader:
+        if None in row or any(row.get(field) is None for field in required_fields):
+            raise ValueError("Qt runtime CSV inventory has a malformed row")
+        path = row["path"]
+        require_canonical_native_path(path)
+        if not path or path.casefold() in seen_paths:
+            raise ValueError("Qt runtime CSV inventory has an empty or duplicate path")
+        seen_paths.add(path.casefold())
+        actual_rows.append((path, row["family"], row["bytes"], row["sha256"].upper()))
+
+    if sorted(actual_rows) != sorted(expected_rows):
+        raise ValueError("Qt runtime CSV inventory does not match the manifest native binary records")
+
+
+def verify_extracted_portable_release(
+    archive_path: Path,
+    executable_sha256: str,
+    expected_source_tree_sha256: str,
+) -> None:
     """Run serial enumeration and six-mode Mock acquisition from an extracted ZIP."""
     with tempfile.TemporaryDirectory(prefix="fluke8845a-portable-smoke-") as temporary:
         temporary_root = Path(temporary)
@@ -247,12 +425,21 @@ def verify_extracted_portable_release(archive_path: Path, executable_sha256: str
         with ZipFile(archive_path, "r") as archive:
             archive.extractall(release_root)
 
+        try:
+            provenance = json.loads((release_root / BUILD_PROVENANCE_NAME).read_text(encoding="utf-8"))
+            identity = json.loads((release_root / BUILD_IDENTITY_NAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Extracted portable build identity is unreadable: {exc}") from exc
+        validate_runtime_build_identity(identity, provenance)
+        if provenance.get("source_tree_sha256") != expected_source_tree_sha256:
+            raise RuntimeError("Extracted portable provenance differs from the expected source build")
+
         executable = release_root / "Fluke8845A.exe"
         if not executable.is_file():
             raise RuntimeError("Extracted portable ZIP has no Fluke8845A.exe")
         serial_result = subprocess.run(
             [str(executable), "--serial-smoke"], cwd=release_root,
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, timeout=SOFTWARE_SMOKE_TIMEOUT_SECONDS, check=False,
         )
         if serial_result.returncode != 0:
             raise RuntimeError(f"Extracted portable EXE serial smoke failed: {serial_result.returncode}")
@@ -260,12 +447,16 @@ def verify_extracted_portable_release(archive_path: Path, executable_sha256: str
         report_path = temporary_root / "portable_mock_e2e.json"
         mock_result = subprocess.run(
             [str(executable), "--mock-e2e", "--report", str(report_path)], cwd=release_root,
-            capture_output=True, text=True, timeout=55, check=False,
+            capture_output=True, text=True, timeout=SOFTWARE_SMOKE_TIMEOUT_SECONDS, check=False,
         )
         if mock_result.returncode != 0 or not report_path.is_file():
             raise RuntimeError(f"Extracted portable EXE six-mode Mock E2E failed: {mock_result.returncode}")
         report = json.loads(report_path.read_text(encoding="utf-8-sig"))
-        validate_mock_e2e_report(report, executable_sha256)
+        validate_mock_e2e_report(
+            report,
+            executable_sha256,
+            expected_source_tree_sha256=expected_source_tree_sha256,
+        )
         verify_local_web_release(release_root)
 
 
@@ -282,7 +473,7 @@ def verify_local_web_release(release_root: Path) -> None:
         [str(executable), "--port", str(port), "--no-browser"],
         cwd=release_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 12.0
+    deadline = time.monotonic() + WEB_STARTUP_TIMEOUT_SECONDS
     try:
         health = None
         while time.monotonic() < deadline:
@@ -295,19 +486,17 @@ def verify_local_web_release(release_root: Path) -> None:
             except (URLError, TimeoutError, OSError):
                 time.sleep(0.15)
         if not health or health.get("status") != "ok" or health.get("bind") != "127.0.0.1":
-            raise RuntimeError("Packaged web UI did not start on IPv4 loopback within 12 seconds")
-        with urlopen(base_url + "/", timeout=1.0) as response:
-            html = response.read().decode("utf-8")
-        with urlopen(base_url + "/app.js", timeout=1.0) as response:
-            javascript = response.read().decode("utf-8")
+            raise RuntimeError(
+                "Packaged web UI did not start on IPv4 loopback within "
+                f"{WEB_STARTUP_TIMEOUT_SECONDS} seconds"
+            )
         try:
-            validate_packaged_web_resources(html, javascript)
+            validate_local_web_resources(
+                base_url,
+                release_root / "Fluke8845A-Web.dist" / "fluke8845a" / "web",
+            )
         except ValueError as exc:
             raise RuntimeError(f"Packaged localhost UI resources are stale or incomplete: {exc}") from exc
-        for asset in ("/app.css",):
-            with urlopen(base_url + asset, timeout=1.0) as response:
-                if not response.read(256):
-                    raise RuntimeError(f"Packaged localhost asset is empty: {asset}")
         body = json.dumps({"action": "shutdown", "payload": {}}, ensure_ascii=False).encode("utf-8")
         request = Request(
             base_url + "/api/command", data=body, method="POST",
@@ -328,6 +517,36 @@ def verify_local_web_release(release_root: Path) -> None:
                 process.wait(timeout=2.0)
 
 
+LOCAL_WEB_STATIC_RESOURCES = (
+    ("/", "index.html"),
+    ("/app.css", "app.css"),
+    ("/app.js", "app.js"),
+    ("/history_worker.js", "history_worker.js"),
+)
+
+
+def validate_local_web_resources(base_url: str, web_root: Path) -> dict[str, bytes]:
+    """Require the running portable Web UI to serve its complete packaged assets uncached."""
+    web_root = Path(web_root)
+    resources: dict[str, bytes] = {}
+    for route, asset in LOCAL_WEB_STATIC_RESOURCES:
+        with urlopen(base_url + route, timeout=1.0) as response:
+            body = response.read()
+            cache_control = response.headers.get("Cache-Control", "")
+        if cache_control.strip().casefold() != "no-store":
+            raise ValueError(f"{route} must return Cache-Control: no-store")
+        source_path = web_root / asset
+        if not source_path.is_file() or body != source_path.read_bytes():
+            raise ValueError(f"Packaged localhost {route} differs from its complete package resource")
+        resources[asset] = body
+
+    validate_packaged_web_resources(
+        resources["index.html"].decode("utf-8"),
+        resources["app.js"].decode("utf-8"),
+    )
+    return resources
+
+
 def _release_files(app_dist: Path) -> list[tuple[Path, str]]:
     app_dist = Path(app_dist).resolve(strict=True)
     files: dict[str, Path] = {}
@@ -340,10 +559,12 @@ def _release_files(app_dist: Path) -> list[tuple[Path, str]]:
             continue
         files[relative] = ensure_regular_file_within(path, app_dist)
 
-    for relative in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md"):
+    for relative in ("LICENSE", "THIRD-PARTY-NOTICES.md"):
         source = ROOT / relative
         if source.is_file():
             files[relative] = ensure_regular_file_within(source, ROOT)
+    portable_readme = ROOT / "docs" / "portable-windows-quick-start.md"
+    files["README.md"] = ensure_regular_file_within(portable_readme, ROOT)
     return [(path, name) for name, path in sorted(files.items())]
 
 
@@ -433,6 +654,13 @@ def _validated_runtime_license_doc_paths(docs_target: Path, app_dist: Path) -> s
         ):
             raise ValueError(f"runtime license manifest does not match {value}")
         generated.add(relative_docs_path)
+
+    qt_inventory_relative = "licenses/windows-qt-runtime-inventory.csv"
+    qt_inventory_path = docs_target / Path(*PurePosixPath(qt_inventory_relative).parts)
+    if qt_inventory_path.exists():
+        inventory_data = ensure_regular_file_within(qt_inventory_path, app_dist).read_bytes()
+        validate_qt_runtime_inventory(manifest, inventory_data)
+        generated.add(qt_inventory_relative)
     return generated
 
 
@@ -441,9 +669,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app-dist", type=Path, default=APP_DIST, help="Nuitka .dist directory")
     parser.add_argument("--archive", type=Path, default=ARCHIVE, help="portable ZIP destination under dist/")
     parser.add_argument("--mock-report", type=Path, default=ROOT / MOCK_E2E_REPORT)
-    parser.add_argument("--provenance", type=Path, required=True, help="shared BUILD-PROVENANCE.json for this build")
+    parser.add_argument("--provenance", type=Path, help="shared BUILD-PROVENANCE.json for this build")
+    parser.add_argument(
+        "--prune-unused-qt-pdf",
+        action="store_true",
+        help="remove the unused Qt PDF plugin, binding, and support library from a generated dist directory",
+    )
     args = parser.parse_args(argv)
     app_dist = args.app_dist.resolve()
+    if args.prune_unused_qt_pdf:
+        try:
+            release_dist = DIST.resolve()
+            app_dist.relative_to(release_dist)
+            if app_dist == release_dist:
+                raise ValueError("refusing to prune the dist root itself")
+            if not app_dist.is_dir():
+                raise ValueError(f"Nuitka runtime directory does not exist: {app_dist}")
+            removed = prune_unused_qt_pdf_components(app_dist)
+        except (OSError, ValueError) as exc:
+            print(f"Unable to prune unused Qt PDF components: {exc}", file=sys.stderr)
+            return 2
+        print("Removed unused Qt PDF runtime components: " + (", ".join(removed) if removed else "none found"))
+        return 0
+    if args.provenance is None:
+        parser.error("--provenance is required when creating a portable archive")
+
     archive_path = args.archive.resolve()
     mock_report_path = args.mock_report.resolve()
     provenance_path = args.provenance.resolve()
@@ -483,72 +733,90 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Documentation contains an unsafe release path: {exc}", file=sys.stderr)
         return 2
 
-    DIST.mkdir(parents=True, exist_ok=True)
     try:
         archive_path.relative_to(DIST.resolve())
-        with ZipFile(archive_path, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
-            for source, member in _release_files(app_dist):
-                archive.write(source, member)
-            archive.write(mock_report_path, MOCK_E2E_REPORT)
-            archive.writestr(BUILD_PROVENANCE_NAME, provenance_path.read_bytes())
+        with atomic_archive_path(archive_path) as candidate_archive:
+            with ZipFile(candidate_archive, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
+                for source, member in _release_files(app_dist):
+                    archive.write(source, member)
+                archive.write(mock_report_path, MOCK_E2E_REPORT)
+                archive.writestr(BUILD_PROVENANCE_NAME, provenance_path.read_bytes())
 
-        with ZipFile(archive_path, "r") as archive:
-            names = set(archive.namelist())
-            missing = sorted(REQUIRED_ENTRIES - names)
-            unsafe = sorted(
-                name for name in names
-                if any(part in EXCLUDED_PATH_PARTS for part in Path(name).parts)
-                or "1234567" in name
+            with ZipFile(candidate_archive, "r") as archive:
+                names = set(archive.namelist())
+                missing = sorted(REQUIRED_ENTRIES - names)
+                unsafe = sorted(
+                    name for name in names
+                    if any(part in EXCLUDED_PATH_PARTS for part in Path(name).parts)
+                    or "1234567" in name
+                )
+                damaged = archive.testzip()
+                if missing:
+                    raise RuntimeError("Portable package is missing required files: " + ", ".join(missing))
+                validate_web_archive_resources(
+                    archive,
+                    "Fluke8845A-Web.dist/fluke8845a/web",
+                    ROOT / "src" / "fluke8845a" / "web",
+                )
+                validate_portable_runtime_components(names)
+                license_manifest = json.loads(archive.read("docs/licenses/windows-runtime-license-manifest.json").decode("utf-8"))
+                if not isinstance(license_manifest, dict):
+                    raise RuntimeError("Portable package runtime license manifest is not a JSON object")
+                license_records = license_manifest.get("license_files", [])
+                if not isinstance(license_records, list):
+                    license_records = []
+                license_contents = {
+                    path: archive.read("docs/licenses/" + path)
+                    for path in (str(record.get("path", "")) for record in license_records if isinstance(record, dict))
+                    if "docs/licenses/" + path in names and "\\" not in path
+                }
+                native_binary_contents = {
+                    name: archive.read(name)
+                    for name in names
+                    if PurePosixPath(name).suffix.casefold() in {".dll", ".pyd", ".exe"}
+                }
+                validate_runtime_license_manifest(license_manifest, license_contents, native_binary_contents)
+                validate_qt_runtime_inventory(
+                    license_manifest,
+                    archive.read("docs/licenses/windows-qt-runtime-inventory.csv"),
+                )
+                if unsafe:
+                    raise RuntimeError("Portable package contains excluded paths or identifiers: " + ", ".join(unsafe))
+                if damaged:
+                    raise RuntimeError(f"Portable package failed CRC verification at {damaged}")
+                exe_hash = hashlib.sha256(archive.read("Fluke8845A.exe")).hexdigest().upper()
+                archived_provenance = json.loads(archive.read(BUILD_PROVENANCE_NAME).decode("utf-8"))
+                archived_identity = json.loads(archive.read(BUILD_IDENTITY_NAME).decode("utf-8"))
+                validate_runtime_build_identity(archived_identity, archived_provenance)
+                validate_windows_archive_provenance(
+                    archived_provenance,
+                    {
+                        "Fluke8845A.exe": archive.read("Fluke8845A.exe"),
+                        "Fluke8845A-Web.dist/Fluke8845A-Web.exe": archive.read(
+                            "Fluke8845A-Web.dist/Fluke8845A-Web.exe"
+                        ),
+                    },
+                    expected_candidate_build_name=candidate_name,
+                )
+                report = json.loads(archive.read(MOCK_E2E_REPORT).decode("utf-8-sig"))
+                validate_packaged_mock_e2e_report(report, exe_hash, archived_provenance)
+            verify_extracted_portable_release(
+                candidate_archive,
+                exe_hash,
+                str(archived_provenance["source_tree_sha256"]),
             )
-            damaged = archive.testzip()
-            if missing:
-                raise RuntimeError("Portable package is missing required files: " + ", ".join(missing))
-            validate_web_archive_resources(
-                archive,
-                "Fluke8845A-Web.dist/fluke8845a/web",
-                ROOT / "src" / "fluke8845a" / "web",
-            )
-            validate_portable_runtime_components(names)
-            license_manifest = json.loads(archive.read("docs/licenses/windows-runtime-license-manifest.json").decode("utf-8"))
-            if not isinstance(license_manifest, dict):
-                raise RuntimeError("Portable package runtime license manifest is not a JSON object")
-            license_records = license_manifest.get("license_files", [])
-            if not isinstance(license_records, list):
-                license_records = []
-            license_contents = {
-                path: archive.read("docs/licenses/" + path)
-                for path in (str(record.get("path", "")) for record in license_records if isinstance(record, dict))
-                if "docs/licenses/" + path in names and "\\" not in path
-            }
-            native_binary_contents = {
-                name: archive.read(name)
-                for name in names
-                if PurePosixPath(name).suffix.casefold() in {".dll", ".pyd", ".exe"}
-            }
-            validate_runtime_license_manifest(license_manifest, license_contents, native_binary_contents)
-            if unsafe:
-                raise RuntimeError("Portable package contains excluded paths or identifiers: " + ", ".join(unsafe))
-            if damaged:
-                raise RuntimeError(f"Portable package failed CRC verification at {damaged}")
-            exe_hash = hashlib.sha256(archive.read("Fluke8845A.exe")).hexdigest().upper()
-            archived_provenance = json.loads(archive.read(BUILD_PROVENANCE_NAME).decode("utf-8"))
-            validate_windows_archive_provenance(
-                archived_provenance,
-                {
-                    "Fluke8845A.exe": archive.read("Fluke8845A.exe"),
-                    "Fluke8845A-Web.dist/Fluke8845A-Web.exe": archive.read(
-                        "Fluke8845A-Web.dist/Fluke8845A-Web.exe"
-                    ),
-                },
-                expected_candidate_build_name=candidate_name,
-            )
-            report = json.loads(archive.read(MOCK_E2E_REPORT).decode("utf-8-sig"))
-            validate_mock_e2e_report(report, exe_hash)
-    except (OSError, RuntimeError, BadZipFile, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        BadZipFile,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
         print(f"Unable to create or validate portable release: {exc}", file=sys.stderr)
         return 2
 
-    verify_extracted_portable_release(archive_path, exe_hash)
     print(f"Created and verified {archive_path} ({len(names)} files; EXE SHA256 {exe_hash})")
     return 0
 

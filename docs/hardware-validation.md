@@ -6,7 +6,11 @@
 
 本说明只记录已取得证据的范围。不会发布工作站标识、串口日志、原始真机测量数据或仪器序列号。
 
+pytest、Web 前端测试和 Mock 首次启动不设 60 秒上限；GitHub Actions 保留 10/20 分钟作业级看门狗。真实仪器的电压/电流记录验证单次最长 60 秒。下方历史记录中的 60 秒限制描述当时旧工作流的软件步骤。
+
 ### 已验证的源码与软件包快照
+
+- 2026-10-21 本机并排构建 `Fluke8845A_v1.0.7_20261021_wheel_zoom`，基于 `main` 的 `5743795`（v1.0.7）及当时未提交工作树；构建环境为 Windows 11 x64、CPython 3.12.10、Nuitka 4.1.1、pyqtgraph 0.14.0。完整 pytest 分片为 1,059 项通过、1 项跳过；Web 前端测试 220 项通过。冻结构建的 Mock 启动、串口枚举和六模式 GUI 冒烟检查通过；每个模拟模式均保存 9/9 条有效样本并核验四个实验文件。桌面 EXE SHA-256：`ED814A9ADB821F02456FAC0F6D9934BF47A2CFF682420A7750393D6CF334C19A`；便携 ZIP 共 291 个文件，SHA-256：`DCA4B3027B150F03466BEAD5A315AFA2B355CF39D161D29775A6D21D9ACF16FD`；源码 ZIP 共 152 个文件，SHA-256：`36F35A57854B681A28BDB2E2C1A9138F923C6E4B5B9F45DDE265265E6E948ED4`。本机产物位于 `dist/Fluke8845A_v1.0.7_20261021_wheel_zoom*`，没有提交或上传；模拟与打包检查不代表真机验证。
 
 - 2026-10-15 软件提交 [`e00a6c43af1d4d96ba12bd394439df97a26fcbb7`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/e00a6c43af1d4d96ba12bd394439df97a26fcbb7) 的 [GitHub Actions 运行 38682350598](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38682350598) 全部成功，包含 Python 3.11/3.12 测试、解压源码 ZIP 后 Mock 首次启动及发布步骤；每项测试和冒烟步骤限制为 60 秒。对应 [Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-e00a6c43af1d) 已上传源码 ZIP 和 `SHA256SUMS.txt`；ZIP SHA-256：`12cdb7aa1a508caa35e351fcde35abd2c90652a46edfa96aa0b811c8a598ff8f`。GHCR OCI 包标签 `main-build-e00a6c43af1d` 已发布，Packages API 确认该版本存在。
 - 在 Windows 本机使用该软件提交对应的源码树运行完整 pytest：280 项通过，用时 13.47 秒；`python -m fluke8845a --mock --smoke` 正常退出。这些是 Mock/软件验证，不代表真机验证。
@@ -27,11 +31,14 @@
 
 ### 真机验证与发布限制
 
+以下 2026-10-15 真机条目是历史记录摘要。其引用的 `build/` 原始报告和 CSV 当前不在此 Git checkout 中，因此不能从当前工作树独立复核原始响应、逐点数据或文件哈希；它们也不证明当前源码版本通过了这些验证。本轮没有连接或操作真实仪器。
+
 - 2026-10-15 对 COM3 的前两次状态核对使用 115200、8N1、无流控、CRLF；`*IDN?` 识别为 8845A，`ROUT:TERM?` 为 `FRON`，但 `SENS:FUNC?` 返回 `"CURR:AC"`，与用户报告的面板 DCI 不一致，因此当时未发送 `READ?`。随后基于用户已确认的 5 mA 直流电流源串联接线（前面板 mA/400 mA 与 LO），软件配置 DCI、固定 10 mA 量程、1 NPLC；配置回读为 `"CURR"` 和 `FRON` 后执行一次 `READ?`。原始响应、SI 数值及仪器/PC 时间戳保存在本机忽略目录 `build/hardware-dci-single-20261015T000725759351Z.json`，未发布原始测量值；整个探测约 0.8 秒，断开时通过 `SYST:LOC` 交还本地控制。这是一条真实 DCI 样本，不构成精度验证；电流源仅确认设定为标称 5 mA，未独立校准。
 - 随后于同日使用真实采集 worker 和实时记录器完成约 9 秒 DCI 连续采集：COM3、固定 10 mA 量程、1 NPLC、目标间隔 0.2 秒；40/40 点有效，无通信异常，首末点经过时间 7.969 秒，平均采样间隔约 0.204 秒（约 4.89 Hz）。读数约为 4.816–4.992 mA，平均约 4.889 mA。原始逐点 CSV 及运行日志保存在本机忽略目录 `build/hardware-dci-continuous/20261015_081257_880446_DCI_5mA_8-second_probe_001257/`，未发布。此记录验证了短时 DCI 连续采集与逐点保存，不构成准确度验证；电流源仅确认设定为标称 5 mA，未独立校准。
 - 2026-10-15对READ?响应超时修复进行了短时真机验证：COM3、115200 baud、8N1、无流控、CRLF；用户确认面板为DCI、前面板mA/400 mA与LO端接入标称5 mA直流电流源。固定10 mA量程、1 NPLC读数为4.9576 mA，读取耗时0.141 s。随后以100 NPLC单点验证自动延长的READ?等待上限：主机超时7 s，样本有效，原始响应`+4.89782800E-03` A，读取耗时2.172 s；成功后恢复1 NPLC并发送`SYST:LOC`。高NPLC验证进程共3.235 s。两份报告仅保存在忽略目录`build/hardware-validation/dci_timeout_fix_20261015_085307.json`和`build/hardware-validation/dci_timeout_fix_20261015_085348.json`，未发布。两次单点均不构成准确度验证；电流源仅设为标称5 mA，未经独立校准。
+- 新增的 COMPUTER 空闲连接检查每10秒查询 `*IDN?`；目前仅有假串口软件测试证据，尚未在真实仪表闲置后拔除串口线的场景验证。该项不代表硬件断线检测已验收。
 - 其余五种模式的真机逐项通信、接线和读数验证，以及测量准确度验证仍未完成。Mock 结果不能替代这些验证。
-- 当前公开 Release 仅含源码 ZIP。Windows 便携程序尚未发布；Qt/PySide LGPL 替换与重新链接验证、完整第三方声明核对，以及 Microsoft Visual C++ 运行库的再分发来源/条款审查仍未关闭。相关审查记录见 [Windows 便携包许可证审查](licenses/windows-portable-review-2026-10-15.md)。
+- 当前公开 Release 仅含源码 ZIP。Windows 便携程序尚未发布；Qt/PySide LGPL 替换与重新链接验证、完整第三方声明核对，以及 Microsoft Visual C++ 运行库的再分发来源/条款审查仍未关闭。相关审查记录见 [Windows 便携包许可证审查](licenses/windows-portable-review-2026-10-20.md)。
 - 本项目不宣称已经校准、通过安全认证、完成六种模式真机验收，或证明当前构建可在真机上连续稳定运行数小时/数天。
 
 连接仪表前，请核对仪表模式、输入端子、接线、串口参数和适用的安全注意事项。详细操作见[使用指南](user-guide.md)；软件不能替代仪器手册或安全测量规范。
@@ -40,7 +47,11 @@
 
 This record reports only evidence that was obtained. It does not publish workstation identifiers, serial logs, raw hardware measurements, or the instrument serial number.
 
+Software pytest, Web frontend, and Mock startup checks have no 60-second cap; GitHub Actions retains 10/20-minute job-level watchdogs. Each real-instrument voltage/current logging verification run is limited to 60 seconds.
+
 ### Verified source and package snapshots
+
+- On 2026-10-21, a local side-by-side build named `Fluke8845A_v1.0.7_20261021_wheel_zoom` was created from `main` at `5743795` (v1.0.7) plus the then-uncommitted worktree, using Windows 11 x64, CPython 3.12.10, Nuitka 4.1.1, and pyqtgraph 0.14.0. The complete pytest shards passed 1,059 tests with 1 skipped; all 220 Web frontend tests passed. Frozen Mock startup, serial-port enumeration, and six-mode GUI smoke checks passed; each simulated mode saved 9/9 valid samples and verified four experiment files. Desktop EXE SHA-256: `ED814A9ADB821F02456FAC0F6D9934BF47A2CFF682420A7750393D6CF334C19A`; the 291-file portable ZIP SHA-256 is `DCA4B3027B150F03466BEAD5A315AFA2B355CF39D161D29775A6D21D9ACF16FD`; the 152-file source ZIP SHA-256 is `36F35A57854B681A28BDB2E2C1A9138F923C6E4B5B9F45DDE265265E6E948ED4`. The local artifacts are in `dist/Fluke8845A_v1.0.7_20261021_wheel_zoom*`; they were not committed or uploaded. These software and Mock checks do not constitute hardware verification.
 
 - The 2026-10-15 software commit, [`e00a6c43af1d4d96ba12bd394439df97a26fcbb7`](https://github.com/CHICKENSOOUP/fluke8845a-lab/commit/e00a6c43af1d4d96ba12bd394439df97a26fcbb7), passed all checks in [GitHub Actions run 38682350598](https://github.com/CHICKENSOOUP/fluke8845a-lab/actions/runs/38682350598), including Python 3.11/3.12 tests, first Mock launch from an extracted source ZIP, and publication; each test and smoke step is capped at 60 seconds. Its [Release](https://github.com/CHICKENSOOUP/fluke8845a-lab/releases/tag/main-build-e00a6c43af1d) contains the source ZIP and `SHA256SUMS.txt`; the ZIP SHA-256 is `12cdb7aa1a508caa35e351fcde35abd2c90652a46edfa96aa0b811c8a598ff8f`. The GHCR OCI package tag `main-build-e00a6c43af1d` is published and its version is present in the Packages API.
 - On Windows, the complete pytest suite for the source tree at this software commit passed locally: 280 tests in 13.47 seconds. `python -m fluke8845a --mock --smoke` also exited successfully. These are Mock/software checks, not hardware validation.
@@ -57,11 +68,14 @@ This record reports only evidence that was obtained. It does not publish worksta
 
 ### Hardware validation and release limits
 
+The 2026-10-15 hardware entries below are historical summaries. Their referenced raw reports and CSV files under `build/` are absent from this Git checkout, so the original responses, point-by-point data, and file hashes cannot be independently checked from the current working tree. They do not establish that the current source revision passed those checks. No real instrument was connected or operated in this turn.
+
 - The first two brief COM3 status probes on 2026-10-15 used 115200 baud, 8N1, no flow control, and CRLF. `*IDN?` identified an 8845A and `ROUT:TERM?` returned `FRON`, but `SENS:FUNC?` returned `"CURR:AC"`, inconsistent with the user's report that the panel showed DC current, so no `READ?` was sent at that stage. Using the user's previously confirmed 5 mA DC source in series with the front-panel mA/400 mA and LO terminals, the software then configured DCI at a fixed 10 mA range and 1 NPLC. Readback returned `"CURR"` and `FRON`, after which one `READ?` was taken. The raw response, SI value, and instrument/host timestamps are retained locally in the ignored `build/hardware-dci-single-20261015T000725759351Z.json`; raw measurement data is not published. The probe took about 0.8 seconds, and disconnect used `SYST:LOC` to return control to the front panel. This is one real DCI sample, not an accuracy validation; the source was set to a nominal 5 mA and was not independently calibrated.
 - Later that day, the real acquisition worker and live recorder completed an approximately 9-second DCI run: COM3, fixed 10 mA range, 1 NPLC, and a 0.2-second target interval. All 40 of 40 readings were valid with no communication errors; elapsed time from first to last sample was 7.969 seconds and average interval was about 0.204 seconds (about 4.89 Hz). Readings ranged from about 4.816 to 4.992 mA, with a mean of about 4.889 mA. The point-by-point CSV and run log are retained locally in the ignored `build/hardware-dci-continuous/20261015_081257_880446_DCI_5mA_8-second_probe_001257/` directory and are not published. This verifies short DCI continuous acquisition and incremental saving, not measurement accuracy; the source was set to a nominal 5 mA and was not independently calibrated.
 - On 2026-10-15, the SCPI response-timeout fix received a brief hardware check on COM3 at 115200 baud, 8N1, no flow control, and CRLF. The user confirmed DCI on the front panel with the nominal 5 mA DC source connected in series to the front-panel mA/400 mA and LO terminals. At a fixed 10 mA range and 1 NPLC, one reading was 4.9576 mA with a 0.141 s read duration. A follow-up single reading at 100 NPLC exercised the adaptive `READ?` response window: the host timeout was 7 s, the reading was valid at raw `+4.89782800E-03` A with a 2.172 s read duration, and the software restored 1 NPLC before sending `SYST:LOC`. The high-NPLC process took 3.235 s. The two reports remain only in ignored local files `build/hardware-validation/dci_timeout_fix_20261015_085307.json` and `build/hardware-validation/dci_timeout_fix_20261015_085348.json`; they are not published. These two points do not validate accuracy; the source was set to a nominal 5 mA and was not independently calibrated.
+- The new 10-second idle connection check in COMPUTER mode uses `*IDN?`. It has only been exercised with fake-serial software tests; unplugging the serial cable from a real idle meter has not been verified. Hardware disconnect detection is therefore not yet accepted.
 - Equivalent hardware communication, wiring, and reading checks for the other five modes, and measurement-accuracy validation, remain incomplete. Mock results do not replace those checks.
-- The current public Release contains only the source ZIP. A Windows portable application has not been released. Qt/PySide LGPL replacement and relinking verification, full third-party attribution review, and review of Microsoft Visual C++ runtime redistribution sources and terms remain open. See the [Windows portable package license review](licenses/windows-portable-review-2026-10-15.md).
+- The current public Release contains only the source ZIP. A Windows portable application has not been released. Qt/PySide LGPL replacement and relinking verification, full third-party attribution review, and review of Microsoft Visual C++ runtime redistribution sources and terms remain open. See the [Windows portable package license review](licenses/windows-portable-review-2026-10-20.md).
 - The project does not claim calibration, safety certification, six-mode hardware acceptance, or hours-to-days stability of the current build on a real meter.
 
 Before connecting the meter, verify its mode, input terminals, wiring, serial settings, and applicable safety precautions. See the [user guide](user-guide.md). The software is not a substitute for the instrument manual or safe measurement practice.

@@ -1,8 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
@@ -14,6 +15,196 @@ function expectedLocalDateTime(value) {
   const pad = (part) => String(part).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function inspectChromiumDom(browser, html) {
+  assert.equal(typeof WebSocket, "function", "Node provides WebSocket for the local Chromium DevTools connection");
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "fluke8845a-layout-"));
+  let child;
+  let childError;
+  let childClosed = false;
+  let socket;
+  let result;
+  let primaryError;
+
+  try {
+    child = spawn(browser, [
+      "--headless=new",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--no-sandbox",
+      "--remote-debugging-port=0",
+      `--user-data-dir=${profile}`,
+      "--remote-allow-origins=*",
+      "about:blank",
+    ], { detached: process.platform !== "win32", stdio: "ignore", windowsHide: true });
+    child.on("error", (error) => { childError = error; });
+    child.on("close", () => { childClosed = true; });
+
+    const activePortFile = path.join(profile, "DevToolsActivePort");
+    let activePort = "";
+    const startupDeadline = Date.now() + 15000;
+    while (Date.now() < startupDeadline && !activePort) {
+      if (childError) throw childError;
+      try { activePort = fs.readFileSync(activePortFile, "utf8"); } catch {}
+      if (!activePort) await wait(100);
+    }
+    assert.ok(activePort, `Chromium starts its isolated DevTools endpoint (launcher exit code: ${child.exitCode})`);
+
+    const port = Number(activePort.split(/\r?\n/)[0]);
+    let page;
+    const targetDeadline = Date.now() + 5000;
+    while (Date.now() < targetDeadline && !page) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1000) });
+        const targets = await response.json();
+        page = targets.find((target) => target.type === "page");
+      } catch {}
+      if (!page) await wait(100);
+    }
+    assert.ok(page, "Chromium exposes a page target through DevTools");
+
+    socket = new WebSocket(page.webSocketDebuggerUrl);
+    const socketOpen = new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+    const browserLaunchFailure = new Promise((_, reject) => {
+      if (childError) reject(childError);
+      else child.once("error", reject);
+    });
+    await Promise.race([
+      socketOpen,
+      browserLaunchFailure,
+      wait(5000).then(() => { throw new Error("Chromium DevTools WebSocket did not open within five seconds"); }),
+    ]);
+
+    let nextId = 0;
+    const pending = new Map();
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (!pending.has(message.id)) return;
+      const request = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) request.reject(new Error(JSON.stringify(message.error)));
+      else request.resolve(message.result);
+    });
+    const command = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      let timer;
+      pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      socket.send(JSON.stringify({ id, method, params }));
+      timer = setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        reject(new Error(`Chromium DevTools timed out during ${method}`));
+      }, 5000);
+    });
+    const evaluate = async (expression) => {
+      const response = await command("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+      if (response.exceptionDetails) throw new Error(response.exceptionDetails.text || "Chromium evaluation failed");
+      return response.result.value;
+    };
+
+    await command("Runtime.enable");
+    await evaluate(`document.open();document.write(${JSON.stringify(html)});document.close();`);
+    let resultText = "pending";
+    const resultDeadline = Date.now() + 10000;
+    while (Date.now() < resultDeadline && resultText === "pending") {
+      await wait(100);
+      resultText = await evaluate('document.querySelector("#result")?.textContent || ""');
+    }
+    assert.notEqual(resultText, "pending", "Chromium finishes measuring the requested viewport geometry");
+    result = JSON.parse(resultText);
+  } catch (error) {
+    primaryError = error;
+  }
+
+  const cleanupErrors = [];
+  if (socket && socket.readyState < WebSocket.CLOSING) {
+    try {
+      socket.close();
+      await Promise.race([new Promise((resolve) => socket.addEventListener("close", resolve, { once: true })), wait(500)]);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+
+  if (child) {
+    if (process.platform === "win32") {
+      const escapedBrowserPath = path.resolve(browser).replace(/'/g, "''");
+      const escapedProfile = profile.replace(/'/g, "''");
+      const escapedBrowser = path.basename(browser).replace(/'/g, "''");
+
+      const profileRootPids = () => {
+        const query = `$ErrorActionPreference = 'Stop'; $profile = '${escapedProfile}'; $exe = '${escapedBrowserPath}'; $name = '${escapedBrowser}'; $quotedArg = '--user-data-dir="' + $profile + '"'; $plainArg = '--user-data-dir=' + $profile; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq $name -and $_.ExecutablePath -ieq $exe -and $_.CommandLine -and ($_.CommandLine.Contains($quotedArg) -or $_.CommandLine.Contains($plainArg + ' ') -or $_.CommandLine.EndsWith($plainArg)) -and $_.CommandLine -notmatch '--type=' } | ForEach-Object { $_.ProcessId }`;
+        const encodedQuery = Buffer.from(query, "utf16le").toString("base64");
+        const queried = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodedQuery], { encoding: "utf8", timeout: 5000, windowsHide: true });
+        if (queried.error) throw queried.error;
+        if (queried.status !== 0) throw new Error(`Could not enumerate isolated Chromium processes: ${queried.stderr || queried.status}`);
+        return (queried.stdout || "").split(/\r?\n/).map((line) => Number(line.trim())).filter((pid) => Number.isInteger(pid) && pid > 0);
+      };
+
+      try {
+        for (const pid of profileRootPids()) {
+          const killed = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8", timeout: 5000, windowsHide: true });
+          if (killed.error && killed.error.code !== "ETIMEDOUT") throw killed.error;
+        }
+        const remainingPids = profileRootPids();
+        if (remainingPids.length) throw new Error(`Isolated Chromium process cleanup left PIDs: ${remainingPids.join(", ")}`);
+        if (!childClosed) child.kill();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    } else {
+      if (Number.isInteger(child.pid)) {
+        try { process.kill(-child.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") cleanupErrors.push(error); }
+        await Promise.race([new Promise((resolve) => child.once("close", resolve)), wait(1500)]);
+        try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") cleanupErrors.push(error); }
+      }
+    }
+    if (!childClosed) await Promise.race([new Promise((resolve) => child.once("close", resolve)), wait(2000)]);
+    if (!childClosed) {
+      try { child.kill("SIGKILL"); } catch (error) { cleanupErrors.push(error); }
+      await Promise.race([new Promise((resolve) => child.once("close", resolve)), wait(1000)]);
+      if (!childClosed) cleanupErrors.push(new Error("Chromium launcher did not close after forced termination"));
+    }
+  }
+
+  try {
+    const tempRoot = path.resolve(os.tmpdir());
+    const resolvedProfile = path.resolve(profile);
+    const relativeProfile = path.relative(tempRoot, resolvedProfile);
+    assert.ok(relativeProfile.startsWith("fluke8845a-layout-") && !relativeProfile.includes(path.sep), "Chromium profile is a direct child of the OS temp directory");
+    for (let attempt = 0; fs.existsSync(resolvedProfile) && attempt < 25; attempt += 1) {
+      try { fs.rmSync(resolvedProfile, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(resolvedProfile)) await wait(100);
+    }
+    assert.equal(fs.existsSync(resolvedProfile), false, "isolated Chromium profile is removed after the geometry check");
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+
+  if (primaryError) {
+    if (cleanupErrors.length) primaryError.message += ` (cleanup also failed: ${cleanupErrors.map((error) => error.message).join("; ")})`;
+    throw primaryError;
+  }
+  if (cleanupErrors.length) throw new AggregateError(cleanupErrors, "Chromium geometry probe cleanup failed");
+  return result;
+}
+
+test("Chromium geometry probe reports launch failures and removes its isolated profile", async () => {
+  const profileNamesBefore = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("fluke8845a-layout-")));
+  const missingBrowser = path.join(os.tmpdir(), `missing-fluke-browser-${process.pid}-${Date.now()}.exe`);
+  await assert.rejects(inspectChromiumDom(missingBrowser, ""), /ENOENT/);
+  const leakedProfiles = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("fluke8845a-layout-") && !profileNamesBefore.has(name));
+  assert.deepEqual(leakedProfiles, []);
+});
 
 test("desktop and web explain that elapsed time includes pauses and freezes while paused", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
@@ -28,6 +219,13 @@ test("narrow-screen touch targets and small viewport rules stay accessible", () 
   assert.ok(narrow, "mobile layout exists");
   assert.match(narrow[1], /\.option-check, \.confirm-row\s*\{[^}]*min-height:\s*44px/);
   assert.match(narrow[1], /\.chart-actions \.toggle-label\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/);
+  assert.match(narrow[1], /button\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/);
+  assert.match(narrow[1], /\.text-button[^,{]*,\s*\.critical-error[^,{]*,\s*\.file-button[^,{]*[\s\S]*?min-height:\s*44px/);
+  assert.match(narrow[1], /\.text-button[^}]*min-width:\s*44px/);
+  assert.match(narrow[1], /\.accessible-data-table summary[^}]*min-height:\s*44px/);
+  assert.match(narrow[1], /\.serial-advanced summary[^}]*min-height:\s*44px/);
+  assert.match(narrow[1], /\.log-panel summary[^}]*min-height:\s*44px/);
+  assert.match(css, /\.chart-toolbar\s*\{[^}]*flex:\s*0 0 auto/);
   assert.match(css, /@media \(max-width: 350px\)/);
   assert.match(css, /body\s*\{[^}]*min-width:\s*280px/);
 });
@@ -65,10 +263,47 @@ test("each Web summary statistic shows its sample count beside the value and uni
 
 test("primary status metrics follow connection, acquisition, reading, samples, and interval order", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  const ids = ["connectionBadge", "runStatus", "readingMode", "readingValue", "sampleCount", "actualRate"];
+  const ids = ["connectionBadge", "connectionSummary", "runStatus", "readingMode", "readingValue", "sampleCount", "actualRate"];
   const positions = ids.map((id) => html.indexOf(`id=\"${id}\"`));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
+});
+
+test("Web chart keeps the loaded history filename visible and labels the live source", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.imported = [{ id: 1, x: 0, y: 1.25, status: "ok", unit: "V", mode: "DCV" }];
+  api.app.importedFileName = "step-response.csv";
+  api.drawChart();
+
+  assert.match(element(elements, "dataSourceStatus").textContent, /step-response\.csv/);
+  assert.match(element(elements, "plotRange").textContent, /step-response\.csv/);
+
+  api.app.imported = null;
+  api.app.importedFileName = "";
+  api.drawChart();
+  assert.equal(element(elements, "dataSourceStatus").textContent, "实时数据");
+});
+
+test("disabled Web controls explain Local mode and active acquisition locks", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.updateStateDisplay(connectedState({
+    simulation: false, control_mode: "local", status: "LOCAL本地操作",
+    active_settings: { mode: "DCV", nplc: 1 },
+  }));
+
+  for (const id of ["mode", "nplc", "bandwidth", "applySpeed", "applySettings", "zero", "diagnose"]) {
+    assert.equal(element(elements, id).disabled, true, `${id} is disabled in Local`);
+    assert.match(element(elements, id).title, /Local/);
+  }
+
+  api.updateStateDisplay(connectedState({
+    status: "连续采集中", active_settings: { mode: "DCV", nplc: 1 },
+  }));
+  assert.equal(element(elements, "disconnect").disabled, true);
+  assert.match(element(elements, "disconnect").title, /采集中/);
 });
 
 test("mode settings bind only controls supported by the selected mode", () => {
@@ -110,6 +345,52 @@ test("Web chart and settings keep empty space compact and auxiliary copy readabl
   assert.match(css, /\.connection-stages li[^\n]*font-size:\s*12px/);
   assert.match(css, /\.plot-empty > span:not\(\.empty-icon\)[^\n]*font-size:\s*12px/);
   assert.match(css, /--muted[^;]*#(?:[5-7][0-9a-f]{5})/i);
+});
+
+test("wide Web empty plot shortens the chart and keeps its actions visible", async (t) => {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.EDGE_BIN,
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  ].filter(Boolean);
+  const browser = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!browser) return t.skip("Chromium is not installed; wide empty-plot geometry cannot be measured here");
+
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  const source = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8")
+    .replace('<link rel="stylesheet" href="/app.css">', `<style>${css}</style>`)
+    .replace(/\s*<script[^>]*>[\s\S]*?<\/script>|\s*<script[^>]*><\/script>/g, "")
+    .replace(/\s*<script[^>]*src="[^"]*"[^>]*><\/script>/g, "");
+  const probe = `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script>
+    const frame = document.createElement("iframe");
+    frame.style.cssText = "display:block;border:0;width:1440px;height:900px";
+    frame.srcdoc = ${JSON.stringify(source)};
+    document.body.appendChild(frame);
+    frame.addEventListener("load", () => requestAnimationFrame(() => {
+      const doc = frame.contentDocument;
+      const area = doc.querySelector("#measurementArea");
+      const chart = doc.querySelector(".chart-panel");
+      const fullHeight = chart.getBoundingClientRect().height;
+      area.classList.add("chart-empty");
+      requestAnimationFrame(() => {
+        const actions = ["emptyOpenSettings", "emptyConnectMock"].map((id) => {
+          const node = doc.getElementById(id);
+          const rect = node.getBoundingClientRect();
+          return getComputedStyle(node).display !== "none" && rect.width > 0 && rect.height > 0;
+        });
+        document.getElementById("result").textContent = JSON.stringify({
+          fullHeight,
+          emptyHeight: chart.getBoundingClientRect().height,
+          actions,
+        });
+      });
+    }));
+  </script>`;
+  const metrics = await inspectChromiumDom(browser, probe);
+  assert.ok(metrics.emptyHeight >= 220 && metrics.emptyHeight <= 320, `wide empty chart is compact: ${JSON.stringify(metrics)}`);
+  assert.ok(metrics.emptyHeight < metrics.fullHeight * 0.6, `wide empty chart is shorter than the data layout: ${JSON.stringify(metrics)}`);
+  assert.deepEqual(metrics.actions, [true, true], "settings and Mock connection remain available in the empty chart");
 });
 
 test("Web disconnect exposes reconnect while preserving last serial settings", async () => {
@@ -202,6 +483,31 @@ test("settings compare active readback with every currently selected setting", (
   assert.match(comparison, /不同/);
 });
 
+test("ACV and ACI settings comparison marks analog filtering not applicable", async (t) => {
+  for (const [value, label, unit] of [["ACV", "交流电压", "V"], ["ACI", "交流电流", "A"]]) {
+    await t.test(value, () => {
+      const { api, elements } = createFrontend();
+      const mode = {
+        ...dcv, value, label, unit, nplc: [], bandwidths: [3, 20, 200],
+        analog_filter: false, digital_filter: false,
+      };
+      api.app.modes.set(value, mode);
+      api.app.selectedMode = value;
+      element(elements, "mode").value = value;
+      api.updateStateDisplay(connectedState({ active_settings: {
+        mode: value, autorange: true, range_si: null, ac_bandwidth_hz: 20,
+        analog_filter: false, autozero: true,
+      } }));
+
+      const comparison = element(elements, "settingsComparison").innerHTML;
+      const analogRow = comparison.match(/<span>模拟滤波<\/span>(.*?)<span>自动零点<\/span>/);
+      assert.ok(analogRow, "analog filter comparison row is present");
+      assert.match(analogRow[1], /<span>不适用<\/span><span class="">不适用<\/span>/);
+      assert.doesNotMatch(analogRow[1], /<span>关<\/span>/);
+    });
+  }
+});
+
 test("DCV settings expose the documented high input impedance option", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", { ...dcv, input_impedance_auto: true });
@@ -228,7 +534,7 @@ test("Web keeps DCV high input impedance selection separate across mode changes"
   assert.match(element(elements, "modeOptions").innerHTML, /id="inputImpedanceAuto" type="checkbox" checked/);
 });
 
-test("Web NPLC controls use the backend's per-mode digital-filter policy", () => {
+test("Web does not block NPLC choices from obsolete digital-filter guard metadata", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   api.app.selectedMode = "DCV";
@@ -248,11 +554,11 @@ test("Web NPLC controls use the backend's per-mode digital-filter policy", () =>
     },
   }));
 
-  assert.deepEqual(nplc.options.map((option) => option.disabled), [false, true, true]);
-  assert.equal(nplc.title, sharedReason);
+  assert.deepEqual(nplc.options.map((option) => option.disabled), [false, false, false]);
+  assert.ok(!nplc.title);
 });
 
-test("mode changes apply the NPLC guard to the newly rendered controls immediately", () => {
+test("mode changes keep NPLC choices enabled without firmware guard metadata", () => {
   const { api, elements } = createFrontend();
   api.app.state = connectedState({
     simulation: false,
@@ -281,7 +587,7 @@ test("mode changes apply the NPLC guard to the newly rendered controls immediate
 
   assert.deepEqual(
     element(elements, "nplc").options.map((option) => option.disabled),
-    [false, false, false, true, true],
+    [false, false, false, false, false],
   );
 });
 
@@ -298,6 +604,23 @@ test("disabled digital filter reports no difference when both active and pending
   const digitalRow = comparison.match(/<span>数字滤波<\/span>(.*?)<span>自动零点<\/span>/);
   assert.ok(digitalRow, "digital filter has a comparison row when the mode supports it");
   assert.match(digitalRow[1], /<span>关<\/span><span class="">关<\/span>/);
+  assert.doesNotMatch(digitalRow[1], /不同/);
+});
+
+test("Web reports digital filtering as unsupported on verified pre-2.0 OutG SW", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  element(elements, "mode").value = "DCV";
+  api.updateStateDisplay(connectedState({ simulation: false, active_settings: {
+    mode: "DCV", autorange: true, range_si: null, nplc: 10,
+    analog_filter: false, digital_filter: false, digital_filter_state: "unsupported", autozero: true,
+  } }));
+
+  const comparison = element(elements, "settingsComparison").innerHTML;
+  const digitalRow = comparison.match(/<span>数字滤波<\/span>(.*?)<span>自动零点<\/span>/);
+  assert.ok(digitalRow);
+  assert.match(digitalRow[1], /<span>OutG SW 版本不支持<\/span><span class="">OutG SW 版本不支持<\/span>/);
   assert.doesNotMatch(digitalRow[1], /不同/);
 });
 
@@ -411,61 +734,61 @@ test("resistance plot labels use the dynamically scaled vertical-axis unit", () 
   ];
   api.drawChart();
   const labels = element(elements, "plot").canvasContext.calls.map(([kind, label]) => kind === "text" ? label : "").join(" ");
-  assert.match(labels, /电阻 \(MΩ\)/);
-  assert.match(labels, /29\./);
+  assert.match(labels, /电阻 \(kΩ\)/);
+  assert.match(labels, /2997/);
 });
 
 test("manual panel firmware changes save source time and can be cleared", async () => {
   const { api, elements, context, storage } = createFrontend();
-  api.app.activeDeviceSerial = "9383035";
-  api.app.state = connectedState({ simulation: false, device: { serial_number: "9383035" } });
+  api.app.activeDeviceSerial = "TEST8845A001";
+  api.app.state = connectedState({ simulation: false, device: { serial_number: "TEST8845A001" } });
   element(elements, "outguardSoftware").value = "2.10.882.24";
   element(elements, "inguardSoftware").value = "ad300210";
   mockSuccessfulCommand(context);
   await api.saveManualSoftware();
-  let saved = JSON.parse(storage.get("8845a-front-panel-software"))["9383035"];
+  let saved = JSON.parse(storage.get("8845a-front-panel-software"))["TEST8845A001"];
   assert.equal(saved.source, "仪表面板人工核对");
   assert.ok(Number.isFinite(Date.parse(saved.updated_at)));
   assert.match(element(elements, "manualSoftwareInfo").textContent, /更新时间/);
   await api.clearManualSoftware();
-  assert.equal(JSON.parse(storage.get("8845a-front-panel-software"))["9383035"], undefined);
+  assert.equal(JSON.parse(storage.get("8845a-front-panel-software"))["TEST8845A001"], undefined);
   assert.match(element(elements, "manualSoftwareInfo").textContent, /尚无记录/);
 });
 
-test("automatic IDN firmware parsing is shown separately from manual OutG and InG records", () => {
+test("IDN version candidates are explicitly unverified and separate from manual OutG and InG records", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   assert.match(html, /id="idnFirmwareInfo"/);
   const { api, elements, storage } = createFrontend();
-  storage.set("8845a-front-panel-software", JSON.stringify({ "9383035": {
+  storage.set("8845a-front-panel-software", JSON.stringify({ "TEST8845A001": {
     outguard_sw: "2.10.882.24", inguard_sw: "ad300210", source: "仪表面板人工核对",
   } }));
   api.updateStateDisplay(connectedState({ simulation: false, device: {
-    idn: "FLUKE,8845A,9383035,2.0.1", serial_number: "9383035",
-    firmware: "2.0.1", idn_revision: "2.0.1",
+    idn: "FLUKE,8845A,TEST8845A001,2.0.1", serial_number: "TEST8845A001",
+    idn_version_candidate: "2.0.1", idn_revision: "2.0.1",
   } }));
 
   const automatic = element(elements, "idnFirmwareInfo").textContent;
   const manual = element(elements, "manualSoftwareInfo").textContent;
-  assert.match(automatic, /\*IDN\?.*2\.0\.1.*解析/);
+  assert.match(automatic, /IDN\?.*候选.*2\.0\.1.*未验证.*OutG SW/);
   assert.match(manual, /仪表面板人工核对/);
   assert.match(element(elements, "outguardSoftware").value, /2\.10\.882\.24/);
   assert.match(element(elements, "inguardSoftware").value, /ad300210/);
-  assert.doesNotMatch(automatic, /OutG|InG|ad300210|2\.10\.882\.24/);
+  assert.doesNotMatch(automatic, /InG|ad300210|2\.10\.882\.24/);
 
   api.updateStateDisplay(connectedState({ simulation: false, device: {
-    idn: "FLUKE,8845A,9383035,02/14/08-08:54", serial_number: "9383035",
-    firmware: null, idn_revision: "02/14/08-08:54",
+    idn: "FLUKE,8845A,TEST8845A001,02/14/08-08:54", serial_number: "TEST8845A001",
+    idn_version_candidate: null, idn_revision: "02/14/08-08:54",
   } }));
-  assert.match(element(elements, "idnFirmwareInfo").textContent, /\*IDN\?.*无法解析.*02\/14\/08-08:54/);
+  assert.match(element(elements, "idnFirmwareInfo").textContent, /修订字段.*02\/14\/08-08:54.*不将.*作为.*固件/);
   assert.match(element(elements, "manualSoftwareInfo").textContent, /仪表面板人工核对/);
 });
 
 test("clearing manual panel software asks for confirmation before sending or erasing", async () => {
   const { api, elements, context, storage } = createFrontend();
   const profile = { outguard_sw: "2.10.882.24", inguard_sw: "ad300210", source: "仪表面板人工核对", updated_at: new Date().toISOString() };
-  storage.set("8845a-front-panel-software", JSON.stringify({ "9383035": profile }));
-  api.app.activeDeviceSerial = "9383035";
-  api.app.state = connectedState({ simulation: false, device: { serial_number: "9383035" } });
+  storage.set("8845a-front-panel-software", JSON.stringify({ "TEST8845A001": profile }));
+  api.app.activeDeviceSerial = "TEST8845A001";
+  api.app.state = connectedState({ simulation: false, device: { serial_number: "TEST8845A001" } });
   element(elements, "outguardSoftware").value = "2.10.882.24";
   context.window.confirm = () => false;
   let commands = 0;
@@ -474,7 +797,7 @@ test("clearing manual panel software asks for confirmation before sending or era
   await api.clearManualSoftware();
 
   assert.equal(commands, 0);
-  assert.equal(JSON.parse(storage.get("8845a-front-panel-software"))["9383035"].outguard_sw, "2.10.882.24");
+  assert.equal(JSON.parse(storage.get("8845a-front-panel-software"))["TEST8845A001"].outguard_sw, "2.10.882.24");
   assert.equal(element(elements, "outguardSoftware").value, "2.10.882.24");
 });
 
@@ -484,8 +807,8 @@ test("saving a new manual software profile preserves all existing device records
     outguard_sw: `2.${index}`, inguard_sw: "", source: "仪表面板人工核对", updated_at: new Date().toISOString(),
   }]));
   storage.set("8845a-front-panel-software", JSON.stringify(profiles));
-  api.app.activeDeviceSerial = "9383035";
-  api.app.state = connectedState({ simulation: false, device: { serial_number: "9383035" } });
+  api.app.activeDeviceSerial = "TEST8845A001";
+  api.app.state = connectedState({ simulation: false, device: { serial_number: "TEST8845A001" } });
   element(elements, "outguardSoftware").value = "2.10.882.24";
   mockSuccessfulCommand(context);
 
@@ -494,7 +817,7 @@ test("saving a new manual software profile preserves all existing device records
   const saved = JSON.parse(storage.get("8845a-front-panel-software"));
   assert.equal(Object.keys(saved).length, 106);
   assert.equal(saved["serial-104"].outguard_sw, "2.104");
-  assert.equal(saved["9383035"].outguard_sw, "2.10.882.24");
+  assert.equal(saved["TEST8845A001"].outguard_sw, "2.10.882.24");
 });
 
 test("sample rows retain and expose per-reading instrument range", () => {
@@ -598,9 +921,10 @@ class FakeElement {
   toBlob(callback) { callback(null); }
 }
 
-function createFrontend({ preferences = null, stubChart = true } = {}) {
+function createFrontend({ preferences = null, stubChart = true, storage: providedStorage = null, lockManager: providedLockManager = null, missingElementIds = [] } = {}) {
   const elements = new Map();
-  const storage = new Map();
+  const missing = new Set(missingElementIds);
+  const storage = providedStorage || new Map();
   const animationFrames = [];
   const historyWorkerSource = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/history_worker.js"), "utf8");
   class InlineHistoryWorker {
@@ -618,16 +942,30 @@ function createFrontend({ preferences = null, stubChart = true } = {}) {
     terminate() { this.terminated = true; }
   }
   if (preferences !== null) storage.set("8845a-web-preferences", JSON.stringify(preferences));
+  const lockManager = providedLockManager || {
+    request: async (_name, _options, callback) => callback({ name: _name }),
+  };
   const clipboard = { text: "", async writeText(text) { this.text = text; } };
   const document = {
+    listeners: new Map(),
     getElementById(id) {
+      if (missing.has(id)) return null;
       if (!elements.has(id)) elements.set(id, new FakeElement(id));
       return elements.get(id);
     },
     querySelector() { return new FakeElement(); },
     createDocumentFragment() { return new FakeElement("fragment"); },
     createElement(tag) { return new FakeElement(tag); },
-    addEventListener() {},
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    },
+    async dispatch(type, event = {}) {
+      const dispatched = { target: this, ...event };
+      await Promise.all((this.listeners.get(type) || []).map((listener) => listener(dispatched)));
+      return dispatched;
+    },
   };
   const context = vm.createContext({
     document,
@@ -637,7 +975,7 @@ function createFrontend({ preferences = null, stubChart = true } = {}) {
       setItem: (key, value) => storage.set(key, String(value)),
       removeItem: (key) => storage.delete(key),
     },
-    navigator: { clipboard },
+    navigator: { clipboard, locks: lockManager },
     fetch: async () => { throw new Error("offline"); },
     URLSearchParams,
     setTimeout: () => 1,
@@ -650,7 +988,7 @@ function createFrontend({ preferences = null, stubChart = true } = {}) {
   });
   const source = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8")
     .replace(/\ninitialize\(\);\s*$/, "");
-  vm.runInContext(`${source}\n;globalThis.__frontend = { app, ui, command, updateStateDisplay, pollState, scanPorts, startPayload, startContinuous, startSingle, populateModeOptions, bindControls, chooseDuplicateNameAction, connectReal, connectMock, drawChart, buildPixelPointIndex, nearestPoint, appendSampleRows, saveManualSoftware, clearManualSoftware, renderSettingsComparison, refreshExperimentFiles: typeof refreshExperimentFiles === "function" ? refreshExperimentFiles : null, downloadLatestCsv: typeof downloadLatestCsv === "function" ? downloadLatestCsv : null, scheduleChartRedraw: typeof scheduleChartRedraw === "function" ? scheduleChartRedraw : null, downsampleForRender: typeof downsampleForRender === "function" ? downsampleForRender : null, classifyLog: typeof classifyLog === "function" ? classifyLog : null, filterLogRows: typeof filterLogRows === "function" ? filterLogRows : null, formatLogsText: typeof formatLogsText === "function" ? formatLogsText : null, loadHistory, loadHistoryEvents: typeof loadHistoryEvents === "function" ? loadHistoryEvents : null, restorePreferences, updateStats, renderEvents, focusEvent, updateAccessiblePointTable: typeof updateAccessiblePointTable === "function" ? updateAccessiblePointTable : null, clearPreferences: typeof clearPreferences === "function" ? clearPreferences : null, localExperimentName: typeof localExperimentName === "function" ? localExperimentName : null, copyAccessiblePointTable: typeof copyAccessiblePointTable === "function" ? copyAccessiblePointTable : null, updateEmptyPlotState: typeof updateEmptyPlotState === "function" ? updateEmptyPlotState : null, createPlotExportCanvas: typeof createPlotExportCanvas === "function" ? createPlotExportCanvas : null, copyExperimentPath: typeof copyExperimentPath === "function" ? copyExperimentPath : null, experimentNameError: typeof experimentNameError === "function" ? experimentNameError : null };`, context);
+  vm.runInContext(`${source}\n;globalThis.__frontend = { app, ui, command, handleCommandRecoveryStorage, acknowledgeUncertainCommands, restoreUnresolvedCommands, updateStateDisplay, pollState, scanPorts, startPayload, startContinuous, startSingle, populateModeOptions, bindControls, chooseDuplicateNameAction, connectReal, connectMock, drawChart, buildPixelPointIndex, nearestPoint, appendSampleRows, saveManualSoftware, clearManualSoftware, renderSettingsComparison, refreshChartOverview, clearChartOverview, chartPointsForPlot, refreshExperimentFiles: typeof refreshExperimentFiles === "function" ? refreshExperimentFiles : null, downloadLatestCsv: typeof downloadLatestCsv === "function" ? downloadLatestCsv : null, scheduleChartRedraw: typeof scheduleChartRedraw === "function" ? scheduleChartRedraw : null, downsampleForRender: typeof downsampleForRender === "function" ? downsampleForRender : null, classifyLog: typeof classifyLog === "function" ? classifyLog : null, filterLogRows: typeof filterLogRows === "function" ? filterLogRows : null, formatLogsText: typeof formatLogsText === "function" ? formatLogsText : null, loadHistory, requestChartRange, loadHistoryEvents: typeof loadHistoryEvents === "function" ? loadHistoryEvents : null, restorePreferences, updateStats, renderEvents, focusEvent, updateAccessiblePointTable: typeof updateAccessiblePointTable === "function" ? updateAccessiblePointTable : null, clearPreferences: typeof clearPreferences === "function" ? clearPreferences : null, localExperimentName: typeof localExperimentName === "function" ? localExperimentName : null, copyAccessiblePointTable: typeof copyAccessiblePointTable === "function" ? copyAccessiblePointTable : null, updateEmptyPlotState: typeof updateEmptyPlotState === "function" ? updateEmptyPlotState : null, createPlotExportCanvas: typeof createPlotExportCanvas === "function" ? createPlotExportCanvas : null, copyExperimentPath: typeof copyExperimentPath === "function" ? copyExperimentPath : null, experimentNameError: typeof experimentNameError === "function" ? experimentNameError : null };`, context);
   if (stubChart) vm.runInContext("drawChart = () => {}; updateStats = () => {};", context);
   return { api: context.__frontend, elements, context, storage, clipboard, animationFrames };
 }
@@ -658,6 +996,10 @@ function createFrontend({ preferences = null, stubChart = true } = {}) {
 function element(elements, id) {
   if (!elements.has(id)) elements.set(id, new FakeElement(id));
   return elements.get(id);
+}
+
+function flushAnimationFrames(animationFrames) {
+  for (const callback of animationFrames.splice(0)) callback();
 }
 
 const dcv = {
@@ -680,6 +1022,19 @@ test("state polling renders a mode without shadowing the activeMode lookup", () 
   api.app.selectedMode = "DCV";
   assert.doesNotThrow(() => api.updateStateDisplay(connectedState()));
   assert.equal(element(elements, "readingMode").textContent, "直流电压");
+});
+
+test("DCV state polling tolerates the absent AC bandwidth control", async () => {
+  const { api, elements, context } = createFrontend({ missingElementIds: ["bandwidth"] });
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.populateModeOptions(dcv);
+  context.fetch = async () => ({ ok: true, json: async () => connectedState({ connected: false }) });
+
+  await api.pollState();
+
+  assert.equal(element(elements, "serviceStatus").textContent, "Web 服务在线");
+  assert.notEqual(element(elements, "serviceStatus").textContent.includes("Web 服务中断"), true);
 });
 
 test("service polling failure is separate from the last instrument and acquisition status", async () => {
@@ -727,6 +1082,26 @@ test("state polling skips a new request while the previous request is still in f
     json: async () => connectedState({ generation: 1, sample_buffer_start: 1, samples: [], logs: [], log_seq: 0, events: [] }),
   });
   await afterCompletion;
+});
+
+test("state polling batches full chart redraw into one animation frame", async () => {
+  const { api, context, animationFrames } = createFrontend({ stubChart: false });
+  vm.runInContext("globalThis.chartDrawCalls = 0; drawChart = () => { globalThis.chartDrawCalls += 1; };", context);
+  context.fetch = async () => ({
+    ok: true,
+    json: async () => connectedState({
+      generation: 1, sample_buffer_start: 1, samples: [], logs: [], log_seq: 0, events: [],
+    }),
+  });
+
+  await api.pollState();
+
+  assert.equal(context.chartDrawCalls, 0, "polling does not redraw synchronously");
+  assert.equal(animationFrames.length, 1, "polling queues one chart redraw frame");
+  assert.equal(api.app.chartFramePending, true);
+  animationFrames.shift()();
+  assert.equal(context.chartDrawCalls, 1);
+  assert.equal(api.app.chartFramePending, false);
 });
 
 test("state polling can retry after a request throws", async () => {
@@ -782,6 +1157,7 @@ test("connected Mock scenario cannot be edited without reconnecting", () => {
 
   assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), false);
   assert.equal(element(elements, "mockScenario").disabled, true);
+  assert.match(element(elements, "mockScenario").title, /断开.*重新连接/);
 });
 
 test("Mock scenario is selectable before connection and is sent with the request", async () => {
@@ -838,7 +1214,7 @@ test("physical mode, fixed-range, and terminal readback changes clear wiring con
     simulation: false,
     control_mode: "computer",
     connection_text: "8845A 已连接",
-    device: { serial_number: "9383035" },
+    device: { serial_number: "TEST8845A001" },
     configuration: { input_terminals: terminal },
     active_settings: { mode, autorange: false, range_si: range },
     generation: 1,
@@ -944,7 +1320,7 @@ test("successful disconnect clears wiring confirmation", async () => {
   assert.equal(element(elements, "safetyConfirm").checked, false);
 });
 
-test("settings dialog has section navigation, a pinned action footer, and a balanced right stack", () => {
+test("settings dialog keeps its sections balanced in a responsive two-column layout", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
   for (const section of ["sectionSerial", "sectionMeasurement", "sectionExperiment", "sectionAnalysis", "sectionDiagnostics"]) {
@@ -952,13 +1328,107 @@ test("settings dialog has section navigation, a pinned action footer, and a bala
     assert.match(html, new RegExp(`id="${section}"`));
   }
   assert.match(html, /class="dialog-nav"[^>]*aria-label="设置章节"/);
-  assert.match(html, /class="settings-side-stack"/);
+  assert.match(html, /<div class="settings-column settings-column-left">[\s\S]*<section id="sectionSerial" class="panel instrument-panel">[\s\S]*<section id="sectionExperiment" class="panel experiment-panel">/);
+  assert.match(html, /<div class="settings-column settings-column-right">[\s\S]*<section id="sectionMeasurement" class="panel measurement-panel">[\s\S]*id="mode"[\s\S]*<section id="sectionAnalysis" class="analysis-panel">/);
+  assert.match(html, /<section id="sectionMeasurement" class="panel measurement-panel">[\s\S]*id="mode"/);
+  assert.doesNotMatch(html, /settings-side-stack/);
+  assert.match(html, /<div class="settings-grid">[\s\S]*<div class="settings-column settings-column-left">[\s\S]*<div class="settings-column settings-column-right">[\s\S]*<details id="sectionDiagnostics"/);
   assert.match(html, /class="dialog-footer"[\s\S]*id="applySettings"[\s\S]*id="applySpeed"[\s\S]*id="closeSettings"/);
   assert.match(css, /\.dialog-footer\s*\{[^}]*flex:\s*0 0 auto/);
   assert.match(css, /\.settings-scroll\s*\{[^}]*flex:\s*1 1 auto/);
-  assert.match(css, /\.settings-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,1\.1fr\)\s+minmax\(0,\.9fr\)/);
+  assert.match(css, /\.settings-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,1fr\)\)/);
+  assert.match(css, /\.settings-column\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column[^}]*gap:\s*13px/);
+  assert.match(css, /\.log-panel\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/);
+  assert.match(css, /\.settings-grid\s*\{\s*grid-template-columns:\s*1fr;\s*grid-template-areas:\s*"serial"\s*"measurement"\s*"experiment"\s*"analysis"\s*"diagnostics"/);
+  assert.match(css, /\.settings-column-left\s*,\s*\.settings-column-right\s*\{\s*display:\s*contents/);
+  assert.match(css, /\.instrument-panel\s*\{\s*grid-area:\s*serial/);
+  assert.match(css, /\.measurement-panel\s*\{\s*grid-area:\s*measurement/);
+  assert.match(css, /\.experiment-panel\s*\{\s*grid-area:\s*experiment/);
+  assert.match(css, /\.analysis-panel\s*\{\s*grid-area:\s*analysis/);
+  assert.match(css, /\.log-panel\s*\{\s*grid-area:\s*diagnostics/);
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
   assert.equal(new Set(ids).size, ids.length, "page element IDs remain unique after moving footer actions");
+});
+
+test("settings cards stack independently in desktop columns and reflow at 820 px in Chromium", async (t) => {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.EDGE_BIN,
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  ].filter(Boolean);
+  const browser = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!browser) return t.skip("Chromium is not installed; settings-card geometry cannot be measured here");
+
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  const source = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8")
+    .replace('<link rel="stylesheet" href="/app.css">', `<style>${css}</style>`)
+    .replace(/\s*<script[^>]*>[\s\S]*?<\/script>|\s*<script[^>]*><\/script>/g, "")
+    .replace(/\s*<script[^>]*src="[^"]*"[^>]*><\/script>/g, "");
+  const probe = `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script>
+    const source = ${JSON.stringify(source)};
+    const widths = [1440, 1000, 821, 820];
+    const frames = widths.map((width) => {
+      const frame = document.createElement("iframe");
+      frame.style.cssText = "display:block;border:0;width:" + width + "px;height:1000px";
+      frame.srcdoc = source;
+      document.body.appendChild(frame);
+      return { width, frame };
+    });
+    Promise.all(frames.map(({ width, frame }) => new Promise((resolve) => frame.addEventListener("load", () => {
+      const doc = frame.contentDocument;
+      const dialog = doc.querySelector("#settingsDialog");
+      dialog.showModal();
+      const columnLeft = doc.querySelector(".settings-column-left");
+      const columnRight = doc.querySelector(".settings-column-right");
+      if (!columnLeft || !columnRight) {
+        resolve({ width, error: "settings cards are not grouped into independent desktop columns" });
+        return;
+      }
+      const rect = (id) => {
+        const value = doc.querySelector("#" + id).getBoundingClientRect();
+        return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
+      };
+      const grid = doc.querySelector(".settings-grid");
+      const scroll = doc.querySelector(".settings-scroll");
+      resolve({
+        width,
+        columns: getComputedStyle(grid).gridTemplateColumns.trim().split(/\\s+/).length,
+        gridRect: (() => { const r = grid.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; })(),
+        sections: Object.fromEntries(["sectionSerial", "sectionMeasurement", "sectionExperiment", "sectionAnalysis", "sectionDiagnostics"].map((id) => [id, rect(id)])),
+        desktopColumns: [columnLeft, columnRight].map((column) => {
+          const r = column.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+        }),
+        scroll: { height: scroll.clientHeight, scrollHeight: scroll.scrollHeight, width: scroll.clientWidth, scrollWidth: scroll.scrollWidth },
+        dialog: rect("settingsDialog"),
+      });
+    })))).then((metrics) => { document.getElementById("result").textContent = JSON.stringify(metrics); });
+  </script>`;
+  const metrics = await inspectChromiumDom(browser, probe);
+  assert.equal(metrics.length, 4);
+  for (const layout of metrics) {
+    assert.equal(layout.error, undefined, `${layout.width}px settings layout: ${layout.error || ""}`);
+    const { sectionSerial, sectionMeasurement, sectionExperiment, sectionAnalysis, sectionDiagnostics } = layout.sections;
+    if (layout.width > 820) {
+      assert.equal(layout.columns, 2, `${layout.width}px keeps two settings columns`);
+      assert.ok(Math.abs(layout.desktopColumns[0].left - sectionSerial.left) <= 1);
+      assert.ok(Math.abs(layout.desktopColumns[0].left - sectionExperiment.left) <= 1);
+      assert.ok(Math.abs(layout.desktopColumns[1].left - sectionMeasurement.left) <= 1);
+      assert.ok(Math.abs(layout.desktopColumns[1].left - sectionAnalysis.left) <= 1);
+      assert.ok(Math.abs((sectionSerial.bottom + 13) - sectionExperiment.top) <= 1, `${layout.width}px serial and experiment cards have only the intended column gap`);
+      assert.ok(Math.abs((sectionMeasurement.bottom + 13) - sectionAnalysis.top) <= 1, `${layout.width}px measurement and analysis cards have only the intended column gap`);
+      assert.ok(layout.desktopColumns[0].right < layout.desktopColumns[1].left);
+      assert.ok(sectionDiagnostics.top >= Math.max(layout.desktopColumns[0].bottom, layout.desktopColumns[1].bottom) + 12);
+    } else {
+      assert.equal(layout.columns, 1, `${layout.width}px switches to one column at the breakpoint`);
+      const ordered = [sectionSerial, sectionMeasurement, sectionExperiment, sectionAnalysis, sectionDiagnostics];
+      assert.ok(ordered.every((section, index) => index === 0 || section.top > ordered[index - 1].top));
+      assert.ok(ordered.every((section) => Math.abs(section.left - sectionSerial.left) <= 1));
+    }
+    assert.ok(layout.scroll.scrollHeight > layout.scroll.height, `${layout.width}px settings remain vertically scrollable`);
+    assert.ok(layout.scroll.scrollWidth <= layout.scroll.width, `${layout.width}px settings do not overflow horizontally`);
+    assert.ok(layout.dialog.right <= layout.width + 1, `${layout.width}px dialog stays inside the viewport`);
+  }
 });
 
 test("empty plot gives the next useful action and uses a compact empty layout", () => {
@@ -1035,18 +1505,76 @@ test("failed acquisition preflight prevents start submission", async () => {
   assert.match(element(elements, "toast").textContent, /保存目录不可写/);
 });
 
-test("duplicate experiment dialog offers create-copy, rename, and cancel without overwriting", async () => {
+test("duplicate experiment dialog offers backed-up overwrite, create-copy, rename, and cancel", async () => {
   const { api, elements } = createFrontend();
   api.bindControls();
   const dialogHtml = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  assert.match(dialogHtml, /id="duplicateRunDialog"[\s\S]*已有数据不会被覆盖[\s\S]*id="duplicateCreateCopy"[\s\S]*id="duplicateRename"[\s\S]*id="duplicateCancel"/);
+  assert.match(dialogHtml, /id="duplicateRunDialog"[\s\S]*duplicateOverwrite[\s\S]*先备份[\s\S]*id="duplicateCreateCopy"[\s\S]*id="duplicateRename"[\s\S]*id="duplicateCancel"/);
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
   assert.match(html, /choice === "rename"[\s\S]*experimentName"\)\.focus\(\)[\s\S]*experimentName"\)\.select\(\)/);
-  for (const [buttonId, expected] of [["duplicateCreateCopy", "create-copy"], ["duplicateRename", "rename"], ["duplicateCancel", "cancel"]]) {
+  for (const [buttonId, expected] of [["duplicateOverwrite", "overwrite"], ["duplicateCreateCopy", "create-copy"], ["duplicateRename", "rename"], ["duplicateCancel", "cancel"]]) {
+    assert.ok(element(elements, buttonId).listeners.get("click")?.length, `${buttonId} must be connected to the duplicate-choice dialog`);
     const choicePromise = api.chooseDuplicateNameAction();
     await element(elements, buttonId).dispatch("click");
     assert.equal(await choicePromise, expected);
   }
+});
+
+test("confirmed duplicate experiment choice is sent with the start request", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.populateModeOptions(dcv);
+  element(elements, "experimentName").value = "重复实验";
+  api.bindControls();
+  const requests = [];
+  context.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    return { ok: true, json: async () => request.action === "preflight"
+      ? { success: true, checks: ["已检查"], duplicate_name: true, duplicate_path: "D:/runs/confirmed" }
+      : { success: true, message: "已启动" } };
+  };
+
+  const startPromise = api.startContinuous();
+  for (let attempt = 0; attempt < 10 && !element(elements, "duplicateRunDialog").showModalCalled; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(element(elements, "duplicateRunDialog").showModalCalled, true);
+  await element(elements, "duplicateCreateCopy").dispatch("click");
+  await startPromise;
+
+  const start = requests.find((request) => request.action === "start");
+  assert.equal(start?.payload?.duplicate_name_action, "create-copy");
+});
+
+test("confirmed backed-up overwrite choice is sent with the start request", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.populateModeOptions(dcv);
+  element(elements, "experimentName").value = "重复实验";
+  api.bindControls();
+  const requests = [];
+  context.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    return { ok: true, json: async () => request.action === "preflight"
+      ? { success: true, checks: ["已检查"], duplicate_name: true, duplicate_path: "D:/runs/confirmed" }
+      : { success: true, message: "已启动" } };
+  };
+
+  const startPromise = api.startContinuous();
+  for (let attempt = 0; attempt < 10 && !element(elements, "duplicateRunDialog").showModalCalled; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(element(elements, "duplicateRunDialog").showModalCalled, true);
+  await element(elements, "duplicateOverwrite").dispatch("click");
+  await startPromise;
+
+  const start = requests.find((request) => request.action === "start");
+  assert.equal(start?.payload?.duplicate_name_action, "overwrite");
+  assert.equal(start?.payload?.expected_duplicate_path, "D:/runs/confirmed");
 });
 
 test("mode options explain only the measurement parameters supported by the active mode", () => {
@@ -1069,12 +1597,19 @@ test("mode options explain only the measurement parameters supported by the acti
 
 test("mode setup shows terminal diagram and current-range restrictions", () => {
   const { api, elements } = createFrontend();
-  const dci = { ...dcv, value: "DCI", label: "直流电流", quantity: "current", unit: "A", ranges: [.01, .1, .4, 1, 3, 10], nplc: [1], bandwidths: [], analog_filter: true };
+  const dci = { ...dcv, value: "DCI", label: "直流电流", quantity: "current", unit: "A", ranges: [.01, .1, .4, 1, 3, 10], nplc: [1], bandwidths: [], analog_filter: true, safety_limits: "8845A：100 µA–10 A；400 mA 连续；440 mA 和 11 A 输入保险丝限制。" };
   api.populateModeOptions(dci);
   assert.match(element(elements, "terminalDiagram").innerHTML, /mA \/ 400 mA/);
   assert.match(element(elements, "terminalDiagram").innerHTML, /10 A/);
+  assert.equal(element(elements, "modeSafetyLimits").textContent, dci.safety_limits);
+  assert.equal(element(elements, "modeSafetyLimits").classList.contains("hidden"), false);
   assert.match(element(elements, "rangeLimitHint").textContent, /OutG SW ≥ 2\.0/);
   assert.match(element(elements, "modeOptions").innerHTML, /NPLC 越高.*自动零点/);
+
+  const res4 = { ...dcv, value: "RES4", label: "四线电阻", quantity: "resistance", unit: "Ohm", ranges: [100, 1e3, 1e6, 1e8], nplc: [1], bandwidths: [], safety_limits: "8845A：100 Ω–100 MΩ。" };
+  api.populateModeOptions(res4);
+  assert.match(element(elements, "terminalDiagram").innerHTML, /SENSE HI/);
+  assert.equal(element(elements, "modeSafetyLimits").textContent, res4.safety_limits);
 });
 
 test("current-range guidance follows selected range, cached firmware source, and terminal readback", () => {
@@ -1087,18 +1622,20 @@ test("current-range guidance follows selected range, cached firmware source, and
   element(elements, "autorange").checked = false;
   element(elements, "range").value = "0.4";
   api.updateStateDisplay(connectedState({ simulation: false, device: {
-    serial_number: "9383035", range_firmware: "1.9.0.0", range_firmware_source: "*IDN?",
+    serial_number: "TEST8845A001", range_firmware: "1.9.0.0", range_firmware_source: "面板核对的 OutG SW",
+    idn_version_candidate: "2.10.882.24",
   }, configuration: { input_terminals: "FRONT" }, active_settings: {
     mode: "DCI", autorange: false, range_si: .4,
   } }));
   const oldFirmware = element(elements, "rangeLimitHint").textContent;
-  assert.match(oldFirmware, /400 mA.*1\.9\.0\.0.*\*IDN\?.*低于.*2\.0/);
+  assert.match(oldFirmware, /400 mA.*1\.9\.0\.0.*面板核对的 OutG SW.*低于.*2\.0/);
+  assert.doesNotMatch(oldFirmware, /2\.10\.882\.24/);
   assert.match(oldFirmware, /FRONT.*回读/);
   assert.match(oldFirmware, /下一步.*核对.*仪表面板.*OutG SW/);
 
   element(elements, "range").value = "1";
   api.updateStateDisplay(connectedState({ simulation: false, device: {
-    serial_number: "9383035", range_firmware: "2.10.882.24", range_firmware_source: "面板核对的 OutG SW",
+    serial_number: "TEST8845A001", range_firmware: "2.10.882.24", range_firmware_source: "面板核对的 OutG SW",
   }, configuration: { input_terminals: "REAR" }, active_settings: {
     mode: "DCI", autorange: false, range_si: 1,
   } }));
@@ -1109,7 +1646,7 @@ test("current-range guidance follows selected range, cached firmware source, and
 
   element(elements, "autorange").checked = true;
   api.updateStateDisplay(connectedState({ simulation: false, device: {
-    serial_number: "9383035", range_firmware: null, range_firmware_source: "未知",
+    serial_number: "TEST8845A001", range_firmware: null, range_firmware_source: "未知",
   }, configuration: {}, active_settings: { mode: "DCI", autorange: true } }));
   const unknownReadback = element(elements, "rangeLimitHint").textContent;
   assert.match(unknownReadback, /端子.*未回读|未回读.*端子/);
@@ -1160,6 +1697,7 @@ test("Computer and Local help is visible and Local status does not claim a devic
   api.updateStateDisplay(connectedState({ simulation: false, control_mode: "local" }));
 
   assert.match(element(elements, "controlModeHelp").textContent, /Computer.*Local.*采集.*ZERO.*诊断/);
+  assert.match(element(elements, "controlModeHelp").textContent, /SYST:LOC.*SCPI.*回读.*核对仪表面板/);
   assert.match(element(elements, "controlModeStatus").textContent, /Local.*SCPI.*(无法|不能).*回读.*面板/);
 });
 
@@ -1219,6 +1757,29 @@ test("settings labels remain readable and secondary text meets contrast target",
   const placeholderColor = placeholderRule?.[1].match(/color:\s*(#[\da-fA-F]{6})/);
   assert.ok(placeholderColor);
   assert.ok(contrast(placeholderColor[1], "#fffefa") >= 4.5, "input hint contrast must be at least 4.5:1");
+
+  const readableTextRule = (selector, background, description) => {
+    const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rule = css.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`));
+    assert.ok(rule, `${description} style exists`);
+    const color = rule[1].match(/color:\s*(#[\da-fA-F]{6})/);
+    assert.ok(color, `${description} has an explicit foreground color`);
+    assert.ok(contrast(color[1], background) >= 4.5, `${description} contrast must be at least 4.5:1`);
+    return rule[1];
+  };
+  const shortcutRule = readableTextRule(".application-shortcut-help", "#252d31", "acquisition shortcut help");
+  assert.match(shortcutRule, /font-size:\s*12px/);
+  readableTextRule(".version-label", "#30383c", "top-bar version label");
+  readableTextRule("#chartGestureHint", "#f1efe6", "plot gesture hint");
+  readableTextRule(".stat-card .stat-count", "#f5f5ee", "statistic sample count");
+
+  const chartSource = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
+  const chartScaleLabels = chartSource.slice(chartSource.indexOf('ctx.fillStyle = "#faf9f2"'), chartSource.indexOf("const plottedMode = app.modes.get(rows[0]?.mode || app.selectedMode)"));
+  assert.match(chartScaleLabels, /ctx\.font = "12px Segoe UI, Microsoft YaHei UI, sans-serif"/);
+  assert.doesNotMatch(chartScaleLabels, /ctx\.font = "11px/);
+  const narrowMockMarker = css.match(/\.scenario-badge::before\s*\{([^}]*)\}/);
+  assert.ok(narrowMockMarker);
+  assert.match(narrowMockMarker[1], /font-size:\s*12px/);
 });
 
 test("release resource validator accepts current source and rejects stale sampling copy", () => {
@@ -1251,6 +1812,25 @@ test("the top bar identifies Mock data and keeps the selected scenario visible a
   api.updateStateDisplay(connectedState({ simulation: false, mock_scenario: null, connection_text: "真实 8845A 已连接" }));
   assert.equal(element(elements, "scenarioBadge").classList.contains("hidden"), true);
   assert.match(element(elements, "connectionBadge").querySelector("span").textContent, /8845A/);
+});
+
+test("measurement status keeps Real or Mock and the full scenario name visible on narrow screens", () => {
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ mock_scenario: "阶跃响应与恢复" }));
+  assert.equal(element(elements, "connectionSummary").textContent, "模拟器");
+  assert.equal(element(elements, "scenarioSummary").textContent, "模拟场景：阶跃响应与恢复");
+
+  api.updateStateDisplay(connectedState({
+    simulation: false, control_mode: "computer", mock_scenario: null,
+    connection_text: "真实 Fluke 8845A 已连接",
+  }));
+  assert.equal(element(elements, "connectionSummary").textContent, "真实仪器 · Computer");
+  assert.equal(element(elements, "scenarioSummary").classList.contains("hidden"), true);
+
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  const narrow = css.match(/@media \(max-width: 380px\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(narrow);
+  assert.doesNotMatch(narrow[1], /\.connection-summary|\.scenario-summary[^}]*display:\s*none/);
 });
 
 test("connection phase text is taken from instrument-worker progress and remains separate from service status", () => {
@@ -1352,6 +1932,220 @@ test("long Web commands show the concrete work and expected result without inven
   await pending;
 });
 
+test("started Web commands are polled to completion instead of being reported as failures", async () => {
+  const { api, elements, context } = createFrontend();
+  const requests = [];
+  context.setTimeout = (callback, delay) => delay === 400 ? globalThis.setTimeout(callback, 0) : 1;
+  context.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (url === "/api/command") {
+      return {
+        status: 202,
+        json: async () => ({ success: false, pending: true, operation_id: "a".repeat(32), message: "仍在处理" }),
+      };
+    }
+    assert.equal(url, `/api/command-status?id=${"a".repeat(32)}`);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => requests.filter((request) => request.url.startsWith("/api/command-status")).length === 1
+        ? { pending: true }
+        : { pending: false, result: { success: true, message: "完成" } },
+    };
+  };
+
+  const result = await api.command("zero");
+
+  assert.equal(result.success, true);
+  assert.equal(requests.filter((request) => request.url === "/api/command").length, 1);
+  assert.equal(requests.filter((request) => request.url.startsWith("/api/command-status")).length, 2);
+  assert.match(element(elements, "toast").textContent, /完成/);
+  assert.equal(element(elements, "zero").disabled, false);
+});
+
+test("uncertain Web commands stay locked until the user acknowledges a manual state check", async () => {
+  const { api, elements, context } = createFrontend();
+  context.fetch = async () => { throw new Error("offline"); };
+  let confirmed = false;
+  context.window.confirm = () => confirmed;
+
+  const result = await api.command("diagnose");
+
+  assert.equal(result.uncertain, true);
+  assert.equal(api.app.pendingCommands.has("diagnose"), true);
+  assert.equal(element(elements, "diagnose").disabled, true);
+  assert.equal(element(elements, "acknowledgeUncertainCommand").classList.contains("hidden"), false);
+  assert.match(element(elements, "commandStatus").textContent, /结果未确认.*核对仪器状态/);
+  assert.equal(api.acknowledgeUncertainCommands(), false);
+  assert.equal(api.app.pendingCommands.has("diagnose"), true);
+
+  confirmed = true;
+  assert.equal(api.acknowledgeUncertainCommands(), true);
+  assert.equal(api.app.pendingCommands.has("diagnose"), false);
+  assert.equal(element(elements, "diagnose").disabled, false);
+  assert.equal(element(elements, "acknowledgeUncertainCommand").classList.contains("hidden"), true);
+});
+
+test("status polling backs off and exposes recovery after repeated local-service failures", async () => {
+  const { api, elements, context } = createFrontend();
+  const requests = [];
+  context.setTimeout = (callback, delay) => globalThis.setTimeout(callback, 0);
+  context.fetch = async (url) => {
+    requests.push(url);
+    if (url === "/api/command") {
+      return {
+        status: 202,
+        json: async () => ({ success: false, pending: true, operation_id: "b".repeat(32), message: "仍在处理" }),
+      };
+    }
+    throw new Error("offline");
+  };
+
+  const result = await api.command("zero");
+
+  assert.equal(result.uncertain, true);
+  assert.equal(requests.filter((url) => url.startsWith("/api/command-status")).length, 3);
+  assert.equal(api.app.pendingCommands.has("zero"), true);
+  assert.equal(element(elements, "acknowledgeUncertainCommand").classList.contains("hidden"), false);
+  assert.match(element(elements, "commandStatus").textContent, /连续 3 次无法查询状态/);
+});
+
+test("command recovery is persisted before POST and tracks the server operation id", async () => {
+  const storage = new Map();
+  const { api, context } = createFrontend({ storage });
+  context.setTimeout = (callback) => globalThis.setTimeout(callback, 0);
+  const operationId = "c".repeat(32);
+  context.fetch = async (url) => {
+    const record = JSON.parse(storage.get("8845a-unresolved-command:zero") || "null");
+    if (url === "/api/command") {
+      assert.equal(record.action, "zero");
+      assert.equal(record.state, "sending");
+      return {
+        status: 202,
+        json: async () => ({ success: false, pending: true, operation_id: operationId, message: "仍在处理" }),
+      };
+    }
+    assert.equal(record.operation_id, operationId);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ pending: false, result: { success: true, message: "完成" } }),
+    };
+  };
+
+  const result = await api.command("zero");
+
+  assert.equal(result.success, true);
+  assert.equal(storage.has("8845a-unresolved-command:zero"), false);
+});
+
+test("a pending server operation is restored and queried after a page reload", async () => {
+  const storage = new Map([[
+    "8845a-unresolved-command:stop",
+    JSON.stringify({ action: "stop", state: "pending", operation_id: "d".repeat(32), started_at: 1 }),
+  ]]);
+  const { api, context } = createFrontend({ storage });
+  context.setTimeout = (callback) => globalThis.setTimeout(callback, 0);
+  let statusQueries = 0;
+  context.fetch = async (url) => {
+    assert.equal(url, `/api/command-status?id=${"d".repeat(32)}`);
+    statusQueries += 1;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ pending: false, result: { success: true, message: "已停止" } }),
+    };
+  };
+
+  await api.restoreUnresolvedCommands();
+
+  assert.equal(statusQueries, 1);
+  assert.equal(api.app.pendingCommands.has("stop"), false);
+  assert.equal(storage.has("8845a-unresolved-command:stop"), false);
+});
+
+test("command recovery storage changes keep other tabs synchronized", () => {
+  const { api, elements } = createFrontend();
+  const record = { action: "zero", state: "uncertain", message: "请核对仪器状态" };
+
+  api.handleCommandRecoveryStorage({
+    key: "8845a-unresolved-command:zero", newValue: JSON.stringify(record),
+  });
+
+  assert.equal(api.app.pendingCommands.has("zero"), true);
+  assert.equal(element(elements, "zero").disabled, true);
+  assert.match(element(elements, "commandStatus").textContent, /请核对仪器状态/);
+
+  api.handleCommandRecoveryStorage({ key: "8845a-unresolved-command:zero", newValue: null });
+  assert.equal(api.app.pendingCommands.has("zero"), false);
+  assert.equal(element(elements, "zero").disabled, false);
+});
+
+test("legacy shared recovery records migrate to per-action keys", async () => {
+  const storage = new Map([[
+    "8845a-unresolved-command",
+    JSON.stringify([{ action: "zero", state: "uncertain", message: "需人工核对" }]),
+  ]]);
+  const { api } = createFrontend({ storage });
+
+  await api.restoreUnresolvedCommands();
+
+  assert.equal(storage.has("8845a-unresolved-command"), false);
+  assert.equal(JSON.parse(storage.get("8845a-unresolved-command:zero")).action, "zero");
+  assert.equal(api.app.pendingCommands.has("zero"), true);
+});
+
+test("two Web tabs serialize the same action and keep independent unresolved records", async () => {
+  const storage = new Map();
+  const heldLocks = new Set();
+  const sharedLocks = {
+    request: async (name, options, callback) => {
+      if (options.ifAvailable && heldLocks.has(name)) return callback(null);
+      heldLocks.add(name);
+      try { return await callback({ name }); }
+      finally { heldLocks.delete(name); }
+    },
+  };
+  const firstTab = createFrontend({ storage, lockManager: sharedLocks });
+  const secondTab = createFrontend({ storage, lockManager: sharedLocks });
+  let finishFirst;
+  let firstPosts = 0;
+  let secondPosts = 0;
+  firstTab.context.fetch = async (url) => {
+    if (url === "/api/command") {
+      firstPosts += 1;
+      return new Promise((resolve) => { finishFirst = resolve; });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+  secondTab.context.fetch = async (url) => {
+    if (url === "/api/command") secondPosts += 1;
+    throw new Error("offline");
+  };
+
+  const running = firstTab.api.command("zero");
+  await Promise.resolve();
+  const duplicate = await secondTab.api.command("zero");
+  assert.equal(duplicate.success, false);
+  assert.equal(secondPosts, 0, "the second tab must not POST the locked action");
+  finishFirst({ status: 200, json: async () => ({ success: true, message: "完成" }) });
+  await running;
+
+  firstTab.context.fetch = async () => { throw new Error("offline"); };
+  const uncertain = await firstTab.api.command("zero");
+  assert.equal(uncertain.uncertain, true);
+  assert.ok(storage.has("8845a-unresolved-command:zero"));
+  const staleTabDuplicate = await secondTab.api.command("zero");
+  assert.equal(staleTabDuplicate.success, false);
+  assert.equal(secondPosts, 0, "a stale tab must respect a persisted unresolved action");
+
+  const otherAction = await secondTab.api.command("diagnose");
+  assert.equal(otherAction.uncertain, true);
+  assert.equal(secondPosts, 1);
+  assert.ok(storage.has("8845a-unresolved-command:zero"));
+  assert.ok(storage.has("8845a-unresolved-command:diagnose"));
+});
+
 test("critical acquisition errors stay visible independently of the latest reading", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
@@ -1364,16 +2158,17 @@ test("critical acquisition errors stay visible independently of the latest readi
   assert.match(element(elements, "criticalError").textContent, /串口响应超时/);
 });
 
-test("acquisition feedback distinguishes retryable READ timeouts from fatal SCPI response timeouts", () => {
+test("READ and SCPI response timeouts both require stopping and manual recovery", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   api.app.latestInvalidPoint = { id: 5, status: "timeout", error: "READ? 响应超时" };
-  api.updateStateDisplay(connectedState({ status: "采集中", experiment_dir: "D:/runs/read-timeout", last_experiment_dir: "D:/runs/read-timeout", last_error: "READ? 响应超时", stats: {
+  api.updateStateDisplay(connectedState({ simulation: false, status: "采集中", experiment_dir: "D:/runs/read-timeout", last_experiment_dir: "D:/runs/read-timeout", last_error: "READ? 响应超时", stats: {
     attempt_count: 5, valid_count: 3, abnormal_count: 2,
   } }));
   const readTimeout = element(elements, "acquisitionFeedback").textContent;
-  assert.match(readTimeout, /普通 READ.*下一采样周期.*重试/);
-  assert.match(readTimeout, /连续\s*3\s*次/);
+  assert.match(readTimeout, /READ 超时.*立即停止采集.*关闭连接/);
+  assert.match(readTimeout, /不会自动重试或重连/);
+  assert.match(readTimeout, /手动重新连接.*新实验/);
   assert.match(readTimeout, /尝试\s*5.*有效\s*3.*异常\s*2/);
 
   api.app.latestInvalidPoint = null;
@@ -1391,7 +2186,26 @@ test("acquisition feedback distinguishes retryable READ timeouts from fatal SCPI
   assert.match(scpiTimeout, /重新连接.*新建实验/);
 });
 
-test("completed READ timeout does not recommend reconnect after acquisition has recovered", () => {
+test("Mock timeout feedback does not claim a real serial disconnect", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.latestInvalidPoint = { id: 2, status: "timeout", error: "READ? 模拟超时" };
+  api.updateStateDisplay(connectedState({
+    simulation: true,
+    status: "采集中",
+    experiment_dir: "D:/runs/mock-timeout",
+    last_experiment_dir: "D:/runs/mock-timeout",
+    stats: { attempt_count: 2, valid_count: 1, abnormal_count: 1 },
+  }));
+
+  const feedback = element(elements, "acquisitionFeedback").textContent;
+  assert.match(feedback, /MOCK.*模拟/);
+  assert.match(feedback, /连续\s*3\s*次.*超时.*停止/);
+  assert.match(feedback, /不涉及真实串口/);
+  assert.doesNotMatch(feedback, /关闭连接|手动重新连接/);
+});
+
+test("completed READ timeout keeps manual recovery guidance even when state says ended", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   api.app.latestInvalidPoint = { id: 5, status: "timeout", error: "READ? 响应超时" };
@@ -1402,8 +2216,8 @@ test("completed READ timeout does not recommend reconnect after acquisition has 
   }));
 
   const feedback = element(elements, "acquisitionFeedback").textContent;
-  assert.match(feedback, /实验已结束/);
-  assert.doesNotMatch(feedback, /通讯恢复后重新连接/);
+  assert.match(feedback, /READ 超时.*立即停止采集.*关闭连接/);
+  assert.match(feedback, /手动重新连接.*新实验/);
 });
 
 test("non-communication acquisition errors do not trigger reconnect instructions", () => {
@@ -1447,8 +2261,55 @@ test("connection loss feedback says acquisition stopped and will not reconnect a
 
   const feedback = element(elements, "acquisitionFeedback").textContent;
   assert.match(feedback, /采集已停止/);
-  assert.match(feedback, /不会自动重连/);
+  assert.match(feedback, /不会自动重试或重连/);
   assert.match(feedback, /已保存尝试\s*4.*有效\s*3.*异常\s*1/);
+});
+
+test("Worker串口通信异常状态 receives immediate-stop recovery guidance", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.updateStateDisplay(connectedState({
+    connected: false,
+    simulation: false,
+    status: "串口通信异常，连接已关闭；请重新连接后开始新实验/分段",
+    connection_text: "COM3 连接已关闭",
+    experiment_dir: "",
+    last_experiment_dir: "D:/runs/communication-error",
+    last_error: "串口通信异常",
+    stats: { attempt_count: 4, valid_count: 3, abnormal_count: 1 },
+  }));
+
+  const feedback = element(elements, "acquisitionFeedback").textContent;
+  assert.match(feedback, /串口通信异常.*立即停止采集.*关闭连接/);
+  assert.match(feedback, /手动重新连接.*新实验/);
+  assert.match(feedback, /已保存尝试\s*4.*有效\s*3.*异常\s*1/);
+});
+
+test("READ timeouts and serial communication failures stop immediately and require a new segment", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.latestInvalidPoint = { id: 7, status: "timeout", error: "READ? 响应超时" };
+  api.updateStateDisplay(connectedState({
+    connected: true, simulation: false, status: "采集中", experiment_dir: "D:/runs/timeout",
+    last_experiment_dir: "D:/runs/timeout", stats: { attempt_count: 7, valid_count: 6, abnormal_count: 1 },
+  }));
+
+  const feedback = element(elements, "acquisitionFeedback").textContent;
+  assert.match(feedback, /立即停止采集.*保存.*关闭连接/);
+  assert.match(feedback, /不会自动重试或重连/);
+  assert.match(feedback, /人工确认.*重新连接.*新实验|人工确认.*新实验.*分段/);
+  assert.doesNotMatch(feedback, /连续\s*3\s*次|下一采样周期重试/);
+
+  api.app.latestInvalidPoint = { id: 8, status: "error", error: "串口通信失败" };
+  api.updateStateDisplay(connectedState({
+    connected: true, simulation: false, status: "采集中", experiment_dir: "D:/runs/timeout",
+    last_experiment_dir: "D:/runs/timeout", latest: { sample_index: 8, status: "error" },
+    stats: { attempt_count: 8, valid_count: 6, abnormal_count: 2 },
+  }));
+  const communicationFeedback = element(elements, "acquisitionFeedback").textContent;
+  assert.match(communicationFeedback, /串口通信异常.*立即停止采集.*关闭连接/);
+  assert.match(communicationFeedback, /不会自动重试或重连/);
+  assert.doesNotMatch(communicationFeedback, /连续\s*3\s*次|下一采样周期重试/);
 });
 
 test("latest successful sample prevents stale last_error from being treated as a current timeout", () => {
@@ -1467,7 +2328,7 @@ test("latest successful sample prevents stale last_error from being treated as a
   assert.doesNotMatch(feedback, /普通 READ 超时会在下一采样周期重试/);
 });
 
-test("critical error banner clears when a newer successful sample recovers from the timeout", () => {
+test("recent invalid sample remains visible with recovery status after a newer valid reading", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   api.app.latestInvalidPoint = { id: 5, status: "timeout", error: "READ? 响应超时" };
@@ -1478,11 +2339,11 @@ test("critical error banner clears when a newer successful sample recovers from 
     stats: { attempt_count: 6, valid_count: 5, abnormal_count: 1 },
   }));
 
-  assert.equal(element(elements, "criticalError").classList.contains("hidden"), true);
-  assert.doesNotMatch(element(elements, "criticalError").textContent, /READ\? 响应超时/);
+  assert.equal(element(elements, "criticalError").classList.contains("hidden"), false);
+  assert.match(element(elements, "criticalError").textContent, /最近无效样本 #5.*READ\? 响应超时.*后续有效读数已恢复/);
 });
 
-test("long acquisition recovery guidance wraps and remains visible in Chromium", (t) => {
+test("long acquisition recovery guidance wraps and remains visible in Chromium", async (t) => {
   const candidates = [
     process.env.CHROME_BIN,
     process.env.EDGE_BIN,
@@ -1512,23 +2373,12 @@ test("long acquisition recovery guidance wraps and remains visible in Chromium",
       });
     });
   </script>`;
-  const tempHtml = path.join(require("node:os").tmpdir(), `8845a-feedback-${process.pid}-${Date.now()}.html`);
-  fs.writeFileSync(tempHtml, probe, "utf8");
-  try {
-    const result = spawnSync(browser, ["--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--no-sandbox", "--dump-dom", tempHtml], { encoding: "utf8", timeout: 7000, windowsHide: true });
-    assert.equal(result.error, undefined, result.error?.message);
-    assert.equal(result.status, 0, result.stderr);
-    const match = result.stdout.match(/<pre id="result">(\{[\s\S]*?\})<\/pre>/);
-    assert.ok(match, "Chromium returns recovery-message layout metrics");
-    const metrics = JSON.parse(match[1]);
-    assert.equal(metrics.whiteSpace, "normal");
-    assert.notEqual(metrics.overflow, "hidden");
-    assert.notEqual(metrics.textOverflow, "ellipsis");
-    assert.ok(metrics.height > (parseFloat(metrics.lineHeight) || 14) * 1.5);
-    assert.equal(metrics.scrollHeight, metrics.clientHeight);
-  } finally {
-    fs.rmSync(tempHtml, { force: true });
-  }
+  const metrics = await inspectChromiumDom(browser, probe);
+  assert.equal(metrics.whiteSpace, "normal");
+  assert.notEqual(metrics.overflow, "hidden");
+  assert.notEqual(metrics.textOverflow, "ellipsis");
+  assert.ok(metrics.height > (parseFloat(metrics.lineHeight) || 14) * 1.5);
+  assert.equal(metrics.scrollHeight, metrics.clientHeight);
 });
 
 test("critical acquisition error opens the settings dialog at filtered error logs", async () => {
@@ -1566,6 +2416,137 @@ test("post-ZERO configuration readback remains visible and is not labeled a zero
   api.updateStateDisplay(connectedState({ zero_result: readback }));
   assert.equal(element(elements, "zeroResult").textContent, readback);
   assert.equal(element(elements, "zeroResult").classList.contains("hidden"), false);
+});
+
+test("ZERO confirmation shows the last auto-range snapshot and warns that it can change", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState({ simulation: false, active_settings: {
+    mode: "DCV", autorange: true, range_si: null, range_readback_si: 10,
+    nplc: 1, analog_filter: false, autozero: true,
+  } });
+  let confirmation = "";
+  context.window.confirm = (message) => { confirmation = message; return false; };
+  api.bindControls();
+
+  await element(elements, "zero").dispatch("click");
+
+  assert.match(confirmation, /自动量程/);
+  assert.match(confirmation, /当前实际量程回读 10 V/);
+  assert.match(confirmation, /可能随输入变化/);
+});
+
+test("ACV and ACI ZERO confirmations mark analog filtering as not applicable", async (t) => {
+  for (const [value, label, unit] of [["ACV", "交流电压", "V"], ["ACI", "交流电流", "A"]]) {
+    await t.test(value, async () => {
+      const { api, elements, context } = createFrontend();
+      const mode = { ...dcv, value, label, unit, nplc: [], bandwidths: [3, 20, 200], analog_filter: false };
+      api.app.modes.set(value, mode);
+      api.app.selectedMode = value;
+      api.app.state = connectedState({ simulation: false, active_settings: {
+        mode: value, autorange: true, range_si: null, range_readback_si: null,
+        nplc: null, ac_bandwidth_hz: 20, analog_filter: false, autozero: true,
+      } });
+      let confirmation = "";
+      context.window.confirm = (message) => { confirmation = message; return false; };
+      api.bindControls();
+
+      await element(elements, "zero").dispatch("click");
+
+      assert.match(confirmation, /模拟滤波：不适用/);
+      assert.doesNotMatch(confirmation, /模拟滤波：关/);
+    });
+  }
+});
+
+test("Web ZERO replaces old feedback with pending and current router rejection feedback", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState({ zero_result: "previous successful ZERO feedback", active_settings: {
+    mode: "DCV", autorange: true, nplc: 1, analog_filter: false, autozero: true,
+  } });
+  api.updateStateDisplay(api.app.state);
+  context.window.confirm = () => true;
+  let resolveFetch;
+  let markFetchStarted;
+  const fetchStarted = new Promise((resolve) => { markFetchStarted = resolve; });
+  context.fetch = () => {
+    markFetchStarted();
+    return new Promise((resolve) => { resolveFetch = resolve; });
+  };
+  api.bindControls();
+
+  const click = element(elements, "zero").dispatch("click");
+  await fetchStarted;
+  assert.equal(element(elements, "zeroResult").textContent, "ZERO执行中；等待本次操作反馈。");
+  api.updateStateDisplay(connectedState({ zero_result: "previous successful ZERO feedback" }));
+  assert.equal(element(elements, "zeroResult").textContent, "ZERO执行中；等待本次操作反馈。");
+
+  const rejectedFeedback = "ZERO未执行：请停止采集后再执行 ZERO";
+  resolveFetch({
+    status: 400,
+    json: async () => ({
+      success: false,
+      message: "请停止采集后再执行 ZERO",
+      zero_result: rejectedFeedback,
+    }),
+  });
+  await click;
+
+  assert.equal(element(elements, "zeroResult").textContent, rejectedFeedback);
+  assert.equal(element(elements, "zeroResult").classList.contains("hidden"), false);
+  assert.doesNotMatch(element(elements, "zeroResult").textContent, /previous successful/);
+});
+
+test("Web ZERO labels a blocked same-tab command as not sent", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState({ active_settings: {
+    mode: "DCV", autorange: true, nplc: 1, analog_filter: false, autozero: true,
+  } });
+  context.window.confirm = () => true;
+  api.app.pendingCommands.add("zero");
+  api.bindControls();
+
+  await element(elements, "zero").dispatch("click");
+
+  assert.equal(
+    element(elements, "zeroResult").textContent,
+    "ZERO未发送：此操作正在执行，请等待完成；本次命令未发送",
+  );
+});
+
+test("statistics context names the live cache and excludes chart zoom from the scope", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState();
+  api.app.points = [
+    { id: 1, x: 0, y: 1, status: "ok", unit: "V" },
+    { id: 2, x: 1, y: 3, status: "ok", unit: "V" },
+  ];
+
+  api.updateStats();
+
+  assert.match(element(elements, "analysisContext").textContent, /当前实时缓存/);
+  assert.match(element(elements, "analysisContext").textContent, /图表缩放和平移不影响统计范围/);
+  assert.doesNotMatch(element(elements, "analysisContext").textContent, /当前显示数据点/);
+});
+
+test("ZERO stays disabled until the selected mode has confirmed configuration readback", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+
+  api.updateStateDisplay(connectedState({ active_settings: {} }));
+  assert.equal(element(elements, "zero").disabled, true);
+  assert.match(element(elements, "zero").title, /先读取或应用当前模式配置/);
+
+  api.updateStateDisplay(connectedState({ active_settings: { mode: "DCV", nplc: 1 } }));
+  assert.equal(element(elements, "zero").disabled, false);
 });
 
 test("the event action is disabled until an experiment is active and explains why", () => {
@@ -1643,14 +2624,113 @@ test("failed readings leave a visible gap instead of joining surrounding samples
   assert.equal(curve.path.filter(([kind]) => kind === "M").length, 2);
 });
 
-test("history import rejects mixed modes and files with no valid readings", async () => {
+test("history chart honors the worker break_before marker even when sample IDs are adjacent", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.imported = [
+    { id: 1, x: 0, y: 1, status: "ok", unit: "V", mode: "DCV", break_before: false },
+    { id: 2, x: 1, y: 2, status: "ok", unit: "V", mode: "DCV", break_before: true },
+  ];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+
+  const curve = element(elements, "plot").canvasContext.strokes.find((stroke) => stroke.color === "#138b92");
+  assert.equal(curve.path.filter(([kind]) => kind === "M").length, 2);
+});
+
+test("late chart overview from a prior experiment cannot repopulate or unlock the new request", async () => {
+  const { api, context } = createFrontend();
+  const requests = [];
+  context.fetch = (url) => new Promise((resolve) => requests.push({ url: String(url), resolve }));
+  api.app.generation = 1;
+  api.app.state = { generation: 1, experiment_dir: "old-run", last_experiment_dir: "old-run" };
+
+  const oldRequest = api.refreshChartOverview();
+  api.app.generation = 2;
+  api.app.state = { generation: 2, experiment_dir: "new-run", last_experiment_dir: "new-run" };
+  api.clearChartOverview();
+  const newRequest = api.refreshChartOverview();
+  const newRequestStarted = requests.length === 2;
+
+  requests[0].resolve({
+    ok: true,
+    json: async () => ({
+      status: "ready", job_id: "old-job", revision: 1,
+      rows: [{ id: 100, x: 600, y: 30, mode: "RES2", unit: "Ω" }],
+    }),
+  });
+  await oldRequest;
+  const newRequestStillInFlight = api.app.chartOverviewInFlight;
+  if (requests[1]) {
+    requests[1].resolve({
+      ok: true,
+      json: async () => ({
+        status: "ready", job_id: "new-job", revision: 1,
+        rows: [{ id: 1, x: 0, y: 2, mode: "DCV", unit: "V" }],
+      }),
+    });
+  }
+  await newRequest;
+
+  assert.equal(newRequestStarted, true);
+  assert.equal(newRequestStillInFlight, true);
+  assert.equal(api.app.chartOverviewJobId, "new-job");
+  assert.deepEqual(api.app.chartOverview.map(({ id, mode, unit }) => ({ id, mode, unit })), [
+    { id: 1, mode: "DCV", unit: "V" },
+  ]);
+  assert.equal(api.app.chartOverviewInFlight, false);
+});
+
+test("failed chart range requests clear their state so the same view can retry", async () => {
+  const { api, context } = createFrontend();
+  api.app.chartOverviewJobId = "chart-job-1";
+  let rangeCalls = 0;
+  context.fetch = async (url) => {
+    if (String(url).includes("/api/chart/range/cancel?")) {
+      return { ok: true, status: 200, json: async () => ({ status: "expired" }) };
+    }
+    rangeCalls += 1;
+    if (rangeCalls === 1) return { ok: false, status: 429, json: async () => ({ error: "busy" }) };
+    return { ok: true, status: 200, json: async () => ({ status: "ready", rows: [] }) };
+  };
+
+  assert.equal(await api.requestChartRange(0, 10, 100), false);
+  assert.equal(api.app.chartRangeRequest, null);
+  assert.equal(await api.requestChartRange(0, 10, 100), true);
+  assert.equal(rangeCalls, 2);
+});
+
+test("changing views cancels a submitted first chart range request before its response", async () => {
+  const { api, context } = createFrontend();
+  api.app.chartOverviewJobId = "chart-job-1";
+  const calls = [];
+  let resolveFirstRequest;
+  context.fetch = (url) => {
+    calls.push(String(url));
+    if (String(url).includes("/api/chart/range/cancel?")) {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: "cancelled" }) });
+    }
+    if (!resolveFirstRequest) return new Promise((resolve) => { resolveFirstRequest = resolve; });
+    return Promise.resolve({ ok: true, status: 200, json: async () => ({ status: "ready", rows: [] }) });
+  };
+
+  const firstRequest = api.requestChartRange(0, 10, 100);
+  assert.equal(typeof resolveFirstRequest, "function");
+  assert.equal(await api.requestChartRange(20, 30, 100), true);
+  assert.ok(calls.some((url) => url.includes("/api/chart/range/cancel?")), calls.join("\n"));
+  resolveFirstRequest({ ok: true, status: 200, json: async () => ({ status: "running", rows: [] }) });
+  assert.equal(await firstRequest, false);
+});
+
+test("history import warns and refuses mixed modes, and explains files with no valid readings", async () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   api.app.modes.set("DCI", { ...dcv, value: "DCI", label: "直流电流", unit: "A" });
   const file = (text) => ({ name: "measurements.csv", size: text.length, text: async () => text });
 
   await api.loadHistory(file("elapsed_s,value_si,unit_si,mode,status\n0,1,V,DCV,ok\n1,2,A,DCI,ok\n"));
-  assert.match(element(elements, "toast").textContent, /混合.*(模式|单位)|模式.*混合/);
+  assert.match(element(elements, "toast").textContent, /^警告：.*混合.*(模式|单位).*未加载/);
+  assert.equal(element(elements, "toast").classList.contains("warning"), true);
   assert.equal(api.app.imported, null);
 
   await api.loadHistory(file("elapsed_s,value_si,unit_si,mode,status\n0,,V,DCV,timeout\n1,,V,DCV,timeout\n"));
@@ -1689,8 +2769,12 @@ test("replacing a pending history import terminates it and ignores late worker r
   const { api, elements, context } = createFrontend();
   api.app.modes.set("DCV", dcv);
   class DeferredWorker {
-    constructor(url) { this.url = url; DeferredWorker.instances.push(this); }
-    postMessage(message) { this.message = message; }
+    constructor(url) { this.url = url; this.messages = []; DeferredWorker.instances.push(this); }
+    postMessage(message) {
+      this.message = message;
+      this.messages.push(message);
+      if (message?.type === "cancel") queueMicrotask(() => this.onmessage?.({ data: { ok: false, cancelled: true, error: "导入已取消" } }));
+    }
     terminate() { this.terminated = true; }
   }
   DeferredWorker.instances = [];
@@ -1711,25 +2795,38 @@ test("replacing a pending history import terminates it and ignores late worker r
   assert.equal(element(elements, "historyFile").value, "");
 });
 
-test("selecting an oversized history file cancels an older pending import", async () => {
+test("history import accepts a 1 GiB file and cancels the previous job through its worker protocol", async () => {
   const { api, elements, context } = createFrontend();
   api.app.modes.set("DCV", dcv);
   class DeferredWorker {
-    constructor(url) { this.url = url; DeferredWorker.instances.push(this); }
-    postMessage(message) { this.message = message; }
+    constructor(url) { this.url = url; this.messages = []; DeferredWorker.instances.push(this); }
+    postMessage(message) {
+      this.message = message;
+      this.messages.push(message);
+      if (message?.type === "cancel") queueMicrotask(() => this.onmessage?.({ data: { ok: false, cancelled: true, error: "导入已取消" } }));
+    }
     terminate() { this.terminated = true; }
   }
   DeferredWorker.instances = [];
   context.Worker = DeferredWorker;
   const first = api.loadHistory({ name: "first.csv", size: 20 });
-  await api.loadHistory({ name: "too-large.csv", size: 51 * 1024 * 1024 });
-  const firstWorker = DeferredWorker.instances[0];
+  const oneGiB = { name: "one-gib.csv", size: 1024 ** 3 };
+  const second = api.loadHistory(oneGiB);
+  const [firstWorker, secondWorker] = DeferredWorker.instances;
   await first;
 
   assert.equal(firstWorker.terminated, true);
-  assert.match(element(elements, "toast").textContent, /超过 50 MB/);
+  assert.equal(firstWorker.message.type, "cancel");
+  assert.equal(firstWorker.message.jobId, firstWorker.messages[0].jobId);
+  assert.equal(secondWorker.message.file, oneGiB);
+  assert.equal(secondWorker.message.reportProgress, true);
+  assert.equal(secondWorker.message.pixelWidth, 800);
+  secondWorker.onmessage({ data: { ok: true, rows: [], modeValue: "DCV", unit: "V", experimentId: "large-run", stats: null } });
+  await second;
+  assert.doesNotMatch(element(elements, "toast").textContent, /超过 50 MB/);
+  assert.equal(api.app.importedFileName, "one-gib.csv");
   firstWorker.onmessage({ data: { ok: true, rows: [{ x: 0, y: 1, status: "ok", mode: "DCV", unit: "V", raw: "1", id: 1 }], modeValue: "DCV", unit: "V", experimentId: "stale-run" } });
-  assert.equal(api.app.imported, null);
+  assert.deepEqual(Array.from(api.app.imported), []);
 });
 
 test("history import explains its required columns and rejects unsupported or mismatched mode units", async () => {
@@ -2032,6 +3129,370 @@ test("chart supports keyboard zoom and pan while keeping the view near measured 
   assert.notDeepEqual(Array.from(api.app.xView), before);
 });
 
+test("Web application shortcuts invoke acquisition actions and leave editable fields alone", async () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const { api, elements, context } = createFrontend();
+  api.bindControls();
+  const clicked = [];
+  const actionIds = ["start", "pause", "resume", "stop", "openSettings", "markEvent"];
+  for (const id of actionIds) element(elements, id).click = () => clicked.push(id);
+  element(elements, "resume").classList.add("hidden");
+
+  const shortcuts = [
+    ["r", "start"], ["p", "pause"], ["s", "stop"], [",", "openSettings"], ["Enter", "markEvent"],
+  ];
+  for (const [key, actionId] of shortcuts) {
+    let prevented = false;
+    await context.document.dispatch("keydown", {
+      target: { tagName: "BODY" }, key, ctrlKey: true, altKey: true,
+      preventDefault() { prevented = true; },
+    });
+    assert.deepEqual(clicked, [actionId], `${key} invokes its matching action`);
+    assert.equal(prevented, true, `${key} does not trigger browser handling`);
+    clicked.length = 0;
+  }
+
+  element(elements, "resume").classList.remove("hidden");
+  await context.document.dispatch("keydown", {
+    target: { tagName: "BODY" }, key: "p", ctrlKey: true, altKey: true,
+    preventDefault() {},
+  });
+  assert.deepEqual(clicked, ["resume"], "Ctrl+Alt+P resumes when the resume action is visible");
+  clicked.length = 0;
+
+  for (const target of [
+    { tagName: "INPUT" }, { tagName: "TEXTAREA" }, { tagName: "SELECT" }, { tagName: "DIV", isContentEditable: true },
+  ]) {
+    let prevented = false;
+    await context.document.dispatch("keydown", {
+      target, key: "r", ctrlKey: true, altKey: true,
+      preventDefault() { prevented = true; },
+    });
+    assert.deepEqual(clicked, [], "typing targets do not start acquisition");
+    assert.equal(prevented, false, "typing targets retain their keyboard behavior");
+  }
+
+  for (const event of [
+    { key: "r", ctrlKey: true },
+    { key: "p", ctrlKey: true },
+    { key: "s", ctrlKey: true, shiftKey: true },
+    { key: "r", ctrlKey: true, altKey: true, repeat: true },
+    { key: "r", ctrlKey: true, altKey: true, isComposing: true },
+  ]) {
+    let prevented = false;
+    await context.document.dispatch("keydown", {
+      target: { tagName: "BODY" }, ...event,
+      preventDefault() { prevented = true; },
+    });
+    assert.deepEqual(clicked, [], "browser-native, repeated, and IME-composition keys are ignored");
+    assert.equal(prevented, false);
+  }
+
+  assert.match(html, /id="applicationShortcutHelp"[^>]*>[\s\S]*?Ctrl\+Alt\+R[\s\S]*?Ctrl\+Alt\+Enter/);
+  assert.match(html, /id="openSettings"[^>]*aria-keyshortcuts="Control\+Alt\+Comma"/);
+  assert.match(html, /id="start"[^>]*aria-keyshortcuts="Control\+Alt\+R"/);
+  assert.match(html, /id="pause"[^>]*aria-keyshortcuts="Control\+Alt\+P"/);
+  assert.match(html, /id="resume"[^>]*aria-keyshortcuts="Control\+Alt\+P"/);
+  assert.match(html, /id="stop"[^>]*aria-keyshortcuts="Control\+Alt\+S"/);
+  assert.match(html, /id="markEvent"[^>]*aria-keyshortcuts="Control\+Alt\+Enter"/);
+});
+
+test("keyboard Y-axis zoom goes below the previous fixed floor at large readings", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = Array.from({ length: 3 }, (_, index) => ({
+    id: index + 1, x: index, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2",
+  }));
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+
+  for (let index = 0; index < 450; index += 1) {
+    await canvas.dispatch("keydown", { key: "+", preventDefault() {} });
+  }
+
+  const span = api.app.yView[1] - api.app.yView[0];
+  assert.ok(Number.isFinite(span) && span > 0, `keyboard zoom must preserve a finite positive range, got ${span}`);
+  assert.ok(span < 1e-30, `keyboard zoom should continue below the previous 1e-24 SI floor, got ${span} Ω`);
+});
+
+test("keyboard Y-axis zoom-out keeps the view finite near the numeric range limit", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [{ id: 1, x: 0, y: 0.1, status: "ok", unit: "V", mode: "DCV" }];
+  api.drawChart();
+  api.app.yView = [-7.5e307, 7.5e307];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+
+  await element(elements, "plot").dispatch("keydown", { key: "-", preventDefault() {} });
+
+  const range = api.app.yView;
+  const span = range[1] - range[0];
+  assert.ok(range.every(Number.isFinite), `zoom-out endpoints must remain finite, got ${range}`);
+  assert.ok(Number.isFinite(span) && span > 0, `zoom-out span must remain finite and positive, got ${span}`);
+  assert.ok(span > 1.5e308, `zoom-out should widen the initial 1.5e308 span without overflowing, got ${span}`);
+});
+
+test("one large Y-axis wheel input can expand beyond the former million-fold span cap", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V", mode: "DCV" }];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const initialSpan = api.app.chartScale.yMax - api.app.chartScale.yMin;
+
+  await element(elements, "plot").dispatch("wheel", {
+    clientX: 400, clientY: 200, deltaY: 2400, preventDefault() {},
+  });
+
+  const range = api.app.yView;
+  const span = range[1] - range[0];
+  assert.ok(range.every(Number.isFinite), `expanded Y endpoints must stay finite, got ${range}`);
+  assert.ok(Number.isFinite(span) && span > initialSpan * 1e7,
+    `one large wheel input should exceed the former 1e6 span cap, initial=${initialSpan}, actual=${span}`);
+});
+
+test("Y-axis wheel remains finite and centered at the largest representable span", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V", mode: "DCV" }];
+  api.app.yView = [-Number.MAX_VALUE / 2, Number.MAX_VALUE / 2];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const initialScale = api.app.chartScale;
+  const centerY = (initialScale.top + initialScale.bottom) / 2;
+
+  await element(elements, "plot").dispatch("wheel", {
+    clientX: 400, clientY: centerY, deltaY: 120, preventDefault() {},
+  });
+
+  const range = api.app.yView;
+  const span = range[1] - range[0];
+  assert.ok(range.every(Number.isFinite), `Y endpoints must stay finite, got ${range}`);
+  assert.ok(Number.isFinite(span) && span > 0, `Y span must stay finite and positive, got ${span}`);
+  assert.ok(Math.abs((range[0] + range[1]) / 2) < 1e292, `the centered zoom anchor must not drift, got ${range}`);
+});
+
+test("Y-axis zoom-in stays finite when recovering from the full representable span", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [{ id: 1, x: 0, y: 0.1, status: "ok", unit: "V", mode: "DCV" }];
+  api.app.yView = [-Number.MAX_VALUE, Number.MAX_VALUE];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+
+  await element(elements, "plot").dispatch("wheel", {
+    clientX: 400, clientY: 200, deltaY: -120, preventDefault() {},
+  });
+
+  const range = api.app.yView;
+  const span = range[1] - range[0];
+  assert.ok(range.every(Number.isFinite), `zoom-in endpoints must stay finite, got ${range}`);
+  assert.ok(Number.isFinite(span) && span > 0, `zoom-in span must stay finite and positive, got ${span}`);
+});
+
+test("manual Y-axis span applies the requested displayed-unit range around the current center", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = Array.from({ length: 3 }, (_, index) => ({
+    id: index + 1, x: index, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2",
+  }));
+  const rawPointsBefore = api.app.points.map((point) => ({ ...point }));
+  element(elements, "autoFollow").checked = true;
+  api.drawChart();
+  const before = api.app.chartScale;
+  const center = (before.yMin + before.yMax) / 2;
+  const pageMarkup = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  assert.match(pageMarkup, /id="yAxisSpan"[^>]*title="[^"]*1e-12 MΩ[^"]*"/);
+  assert.match(pageMarkup, /id="yAxisSpan"[^>]*title="[^"]*最小跨度受计算机浮点精度限制[^"]*"/);
+  assert.match(pageMarkup, /id="yAxisSpan"[^>]*title="[^"]*不会提升仪表分辨率[^"]*"/);
+  assert.match(pageMarkup, /id="yAxisSpan"[^>]*title="[^"]*不修改原始读数[^"]*"/);
+
+  element(elements, "yAxisSpan").value = "0.000001";
+  await element(elements, "applyYAxisSpan").dispatch("click");
+
+  const range = api.app.yView;
+  assert.ok(Array.isArray(range), "applying a custom Y span creates a manual view");
+  assert.equal(element(elements, "yAxisSpanUnit").textContent, "Ω");
+  assert.equal(element(elements, "autoFollow").checked, false);
+  assert.ok(Math.abs((range[1] - range[0]) - 1) < 1e-5, `expected a 1 Ω range from 0.000001 MΩ, got ${range[1] - range[0]} Ω`);
+  assert.ok(Math.abs((range[0] + range[1]) / 2 - center) < 1e-7, "manual range stays centered on the current view");
+  assert.deepEqual(api.app.points, rawPointsBefore, "changing the axis view leaves raw samples unchanged");
+});
+
+test("manual Y-axis span keeps the displayed unit stable while the input is focused", async () => {
+  const { api, context, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  api.drawChart();
+
+  const input = element(elements, "yAxisSpan");
+  input.value = "0.000001";
+  context.document.activeElement = input;
+  await input.dispatch("focus");
+  api.app.points = [{ id: 1, x: 0, y: 30_000, status: "ok", unit: "Ohm", mode: "RES2" }];
+  api.drawChart();
+
+  assert.equal(element(elements, "yAxisSpanUnit").textContent, "MΩ", "the unit label stays paired with the number being edited");
+  await element(elements, "applyYAxisSpan").dispatch("click");
+  assert.ok(Math.abs((api.app.yView[1] - api.app.yView[0]) - 1) < 1e-6, "the input is converted using the unit shown when editing began");
+});
+
+test("manual Y-axis span rejects zero and negative ranges without changing the view", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V", mode: "DCV" }];
+  api.drawChart();
+  const before = [...api.app.yView || [api.app.chartScale.yMin, api.app.chartScale.yMax]];
+
+  for (const invalidSpan of ["0", "-1"]) {
+    element(elements, "yAxisSpan").value = invalidSpan;
+    await element(elements, "applyYAxisSpan").dispatch("click");
+    assert.deepEqual(api.app.yView || [api.app.chartScale.yMin, api.app.chartScale.yMax], before);
+    assert.match(element(elements, "toast").textContent, /大于 0/);
+  }
+});
+
+test("manual Y-axis span can go below the former 1e-100 SI floor around a high-magnitude reading", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  api.drawChart();
+
+  element(elements, "yAxisSpan").value = "1e-206";
+  await element(elements, "applyYAxisSpan").dispatch("click");
+
+  const span = api.app.yView[1] - api.app.yView[0];
+  assert.ok(Number.isFinite(span) && Math.abs(span / 1e-200 - 1) < 1e-12, `expected a 1e-200 Ω span, got ${span} Ω`);
+  assert.equal(api.app.chartScale.yOrigin, 30e6, "the plot keeps a stable absolute reference separate from its offset coordinates");
+  assert.ok(api.app.chartScale.yMin < 0 && api.app.chartScale.yMax > 0, "the view is centered on the sample's offset from the origin");
+  assert.equal(api.app.points[0].y, 30e6, "raw readings remain unchanged");
+  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text]) => String(text).includes("刻度相对 30 MΩ")), "very fine ticks identify their absolute reference");
+  assert.doesNotMatch(element(elements, "toast").textContent, /纵轴显示下限/);
+});
+
+test("Y-axis units follow the visible zoom span and retain the absolute reference", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  api.app.yOrigin = 30e6;
+  api.app.yView = [-0.05, 0.05];
+  api.drawChart();
+
+  assert.equal(api.app.chartScale.axisUnit, "mΩ");
+  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text]) => text === "电阻 (mΩ)"));
+  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text]) => String(text).includes("刻度相对 30 MΩ")));
+  assert.equal(element(elements, "yAxisSpanUnit").textContent, "mΩ");
+  assert.ok(Math.abs(Number(element(elements, "yAxisSpan").value) - 100) < 1e-8);
+  assert.equal(api.app.points[0].y, 30e6, "axis scaling is display-only and preserves the raw reading");
+});
+
+test("subnormal Y-axis spans keep distinct, same-scale tick labels", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.points = [{ id: 1, x: 0, y: 0, status: "ok", unit: "V", mode: "DCV" }];
+  api.drawChart();
+
+  element(elements, "yAxisSpan").value = "1e-314";
+  await element(elements, "applyYAxisSpan").dispatch("click");
+
+  const scale = api.app.chartScale;
+  const span = scale.yMax - scale.yMin;
+  const labels = element(elements, "plot").canvasContext.calls
+    .map(([, text]) => String(text))
+    .filter((text) => /e-3\d{2}$/.test(text));
+  assert.ok(span > 0 && span < 2e-323, `expected a representable subnormal span, got ${span} V`);
+  assert.ok(new Set(labels).size >= 2, `expected distinct tiny tick labels, got ${labels.join(", ")}`);
+  assert.ok(labels.every((label) => Math.abs(Number(label) * scale.axisFactor) <= span), `ticks should stay in the same scale as the axis span ${span}: ${labels}`);
+});
+
+test("deep zoom on a high resistance reading keeps its unit, input, and ticks representable", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+  const sampleY = api.app.chartScale.yToPixel(30e6);
+
+  for (let index = 0; index < 900; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: sampleY, deltaY: -120, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const scale = api.app.chartScale;
+  const span = scale.yMax - scale.yMin;
+  const labels = canvas.canvasContext.calls.map(([, text]) => String(text)).filter((text) => /e-3\d{2}$/.test(text));
+  assert.ok(span > 0 && span < 2e-323, `expected wheel zoom near floating-point resolution, got ${span} Ω`);
+  assert.equal(element(elements, "yAxisSpanUnit").textContent, "pΩ", "the field uses an engineering prefix without altering raw SI data");
+  assert.ok(Number(element(elements, "yAxisSpan").value) > 0, "the current span remains visible in the editable field");
+  assert.ok(new Set(labels).size >= 2, `expected distinct tiny Ω tick labels, got ${labels.join(", ")}`);
+});
+
+test("manual fine span rebases a view centered near zero from a 30 MΩ first sample", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  api.drawChart();
+  api.app.yView = [-30e6 - 1, -30e6 + 1];
+  api.drawChart();
+
+  element(elements, "yAxisSpan").value = "1e-100";
+  await element(elements, "applyYAxisSpan").dispatch("click");
+
+  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  assert.equal(api.app.chartScale.yOrigin, 0, "the plot origin follows the absolute view center near zero");
+  assert.ok(Math.abs(span / 1e-100 - 1) < 1e-12, `expected 1e-100 Ω around absolute zero, got ${span} Ω`);
+  assert.equal(api.app.points[0].y, 30e6, "rebasing never changes the raw measurement");
+});
+
+test("fine-scale Y-axis cursor, baseline, and raw sample share the same origin offset", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.selectedMode = "RES2";
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  api.app.baseline = 30e6;
+  api.drawChart();
+  element(elements, "yAxisSpan").value = "1e-30";
+  await element(elements, "applyYAxisSpan").dispatch("click");
+
+  const scale = api.app.chartScale;
+  assert.equal(scale.yOrigin, 30e6, "chartScale exposes the stable absolute-to-offset origin");
+  assert.ok(Math.abs(scale.yToPixel(30e6) - (scale.top + scale.bottom) / 2) < 1e-8, "the raw reading maps through its origin offset");
+  const baselineStroke = element(elements, "plot").canvasContext.strokes.find((stroke) => stroke.color === "#c7842f");
+  assert.ok(baselineStroke && Math.abs(baselineStroke.path[0][2] - (scale.top + scale.bottom) / 2) < 1e-8, "the absolute baseline is translated into the same offset view");
+  api.app.cursor = { x: (scale.left + scale.right) / 2, y: (scale.top + scale.bottom) / 2 };
+  api.drawChart();
+  assert.ok(element(elements, "plotOverlay").canvasContext.calls.some(([, text]) => String(text).includes("30 MΩ")), "the inverse cursor mapping restores the absolute reading");
+  assert.equal(api.app.points[0].y, 30e6, "drawing and cursor inspection do not rewrite the raw point");
+});
+
+test("manual Y-axis span near zero is independent of a distant outlier", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [
+    { id: 1, x: 0, y: 0, status: "ok", unit: "V", mode: "DCV" },
+    { id: 2, x: 1, y: 1e12, status: "ok", unit: "V", mode: "DCV" },
+  ];
+  api.app.yView = [-1e12, 1e12];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+
+  element(elements, "yAxisSpan").value = "1e-15";
+  await element(elements, "applyYAxisSpan").dispatch("click");
+
+  const span = api.app.yView[1] - api.app.yView[0];
+  assert.ok(Math.abs(span - 1e-12) < 1e-18, `expected a 1 pV span around zero, got ${span} V`);
+});
+
 test("chart axis title includes the measurement quantity and SI unit", () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
@@ -2042,7 +3503,46 @@ test("chart axis title includes the measurement quantity and SI unit", () => {
   api.drawChart();
 
   assert.ok(element(elements, "plot").canvasContext.calls.some(([, text]) => text === "电阻 (MΩ)"));
-  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text, , , font]) => text !== "电阻 (MΩ)" && /11px/.test(font || "")), "axis labels use a readable 11px canvas font");
+  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text, , , font]) => text !== "电阻 (MΩ)" && /12px/.test(font || "")), "axis labels use a readable 12px canvas font");
+});
+
+test("narrow Y-axis ranges keep enough tick precision for large readings", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = [
+    { id: 1, x: 0, y: 29_999_999.8, status: "ok", unit: "Ohm", mode: "RES2" },
+    { id: 2, x: 1, y: 30_000_000.2, status: "ok", unit: "Ohm", mode: "RES2" },
+  ];
+  api.app.yView = [-0.5, 0.5];
+  element(elements, "autoFollow").checked = false;
+
+  api.drawChart();
+
+  const labels = element(elements, "plot").canvasContext.calls
+    .map(([, text]) => String(text))
+    .filter((text) => /^[-+]?\d+(?:\.\d+)?$/.test(text));
+  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text]) => String(text).includes("刻度相对 30 MΩ")));
+  assert.ok(labels.some((label) => Number(label) < 1), `expected relative sub-ohm tick labels, got ${labels.join(", ")}`);
+});
+
+test("deep Y-axis zoom keeps adjacent high-magnitude tick labels distinct as relative offsets", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  const minimumSpan = 30e6 * Number.EPSILON;
+  api.app.yView = [-minimumSpan / 2, minimumSpan / 2];
+  element(elements, "autoFollow").checked = false;
+
+  api.drawChart();
+
+  const labels = element(elements, "plot").canvasContext.calls
+    .map(([, text]) => String(text))
+    .filter((text) => /^[-+]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/.test(text));
+  const widestLabel = Math.max(0, ...labels.map((label) => label.length * 6));
+  assert.ok(element(elements, "plot").canvasContext.calls.some(([, text]) => String(text).includes("刻度相对 30 MΩ")), "relative ticks identify the absolute origin");
+  assert.ok(new Set(labels).size > 1, `adjacent Y ticks must be distinct, got ${labels.join(", ")}`);
+  assert.equal(api.app.chartScale.axisUnit, "nΩ");
+  assert.ok(api.app.chartScale.left >= widestLabel + 9, "long precise labels remain inside the canvas");
 });
 
 test("large history is downsampled for drawing while preserving an isolated peak", () => {
@@ -2262,6 +3762,33 @@ test("multiple pointer redraw requests collapse into one animation frame", () =>
   assert.ok(api.app.chartScale);
 });
 
+test("rapid wheel events preserve every zoom step and render once per animation frame", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = Array.from({ length: 101 }, (_, index) => ({ id: index + 1, x: index, y: index, status: "ok", unit: "V" }));
+  const canvas = element(elements, "plot");
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const initialSpan = api.app.chartScale.xMax - api.app.chartScale.xMin;
+  let plotRenders = 0;
+  canvas.canvasContext.clearRect = () => { plotRenders += 1; };
+
+  for (let index = 0; index < 4; index += 1) {
+    await canvas.dispatch("wheel", {
+      clientX: 400, clientY: 200, deltaY: 120, shiftKey: true, preventDefault() {},
+    });
+  }
+
+  assert.equal(animationFrames.length, 1, "the burst schedules only one chart redraw");
+  assert.equal(plotRenders, 0, "wheel handlers do not synchronously redraw the chart");
+  animationFrames.shift()();
+  assert.equal(plotRenders, 1, "the animation frame renders the chart once");
+  const zoomedSpan = api.app.xView[1] - api.app.xView[0];
+  const expectedSpan = initialSpan * Math.exp(4 * 0.9);
+  assert.ok(Math.abs(zoomedSpan / expectedSpan - 1) < 1e-10,
+    `all four zoom increments are retained; expected ${expectedSpan}, got ${zoomedSpan}`);
+});
+
 test("two touch pointers pinch-zoom both chart axes while one pointer remains available for pan", async () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("DCV", dcv);
@@ -2314,7 +3841,7 @@ test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence"
   const expectedMapping = [[false, true], [true, false], [true, true], [false, true], [false, true]];
   assert.deepEqual(JSON.parse(desktopMapping.stdout), expectedMapping, "this is the desktop _wheel_zoom_axes mapping");
 
-  const { api, elements } = createFrontend({ stubChart: false });
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
   api.app.points = Array.from({ length: 11 }, (_, index) => ({ id: index + 1, x: index, y: index + 10, status: "ok", unit: "V" }));
   element(elements, "autoFollow").checked = false;
   api.drawChart();
@@ -2322,10 +3849,12 @@ test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence"
   const bounds = () => ({
     x: [...(api.app.xView || [api.app.chartScale.xMin, api.app.chartScale.xMax])],
     y: [...(api.app.yView || [api.app.chartScale.yMin, api.app.chartScale.yMax])],
+    yOrigin: api.app.chartScale.yOrigin,
   });
   const zoom = async (modifiers) => {
     const before = bounds();
     await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {}, ...modifiers });
+    flushAnimationFrames(animationFrames);
     const after = bounds();
     return { before, after };
   };
@@ -2334,13 +3863,18 @@ test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence"
   assert.deepEqual(plain.after.x, plain.before.x);
   assert.ok(plain.after.y[1] - plain.after.y[0] < plain.before.y[1] - plain.before.y[0]);
   const gui = fs.readFileSync(path.join(ROOT, "src/fluke8845a/gui.py"), "utf8");
-  assert.match(gui, /factor = math\.exp\(-float\(delta\) \/ 120\.0 \* 0\.18\)/);
+  assert.match(gui, /zoom_sensitivity = 0\.18 if modifiers & Qt\.KeyboardModifier\.AltModifier else 0\.9/);
+  assert.match(gui, /factor = math\.exp\(-float\(delta\) \/ 120\.0 \* zoom_sensitivity\)/);
   const webFactor = (plain.after.y[1] - plain.after.y[0]) / (plain.before.y[1] - plain.before.y[0]);
-  assert.ok(Math.abs(webFactor - Math.exp(-0.18)) < 1e-12, "one upward wheel notch uses the desktop zoom factor");
+  assert.ok(Math.abs(webFactor - Math.exp(-0.9)) < 1e-12, "one upward wheel notch uses the desktop zoom factor");
 
   const shift = await zoom({ shiftKey: true });
   assert.ok(shift.after.x[1] - shift.after.x[0] < shift.before.x[1] - shift.before.x[0]);
   assert.deepEqual(shift.after.y, shift.before.y);
+
+  const alt = await zoom({ altKey: true });
+  const altFactor = (alt.after.y[1] - alt.after.y[0]) / (alt.before.y[1] - alt.before.y[0]);
+  assert.ok(Math.abs(altFactor - Math.exp(-0.18)) < 1e-12, "Alt keeps the finer zero-anchored wheel step");
 
   const ctrl = await zoom({ ctrlKey: true });
   assert.ok(ctrl.after.x[1] - ctrl.after.x[0] < ctrl.before.x[1] - ctrl.before.x[0]);
@@ -2349,18 +3883,168 @@ test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence"
   const altOverrides = await zoom({ altKey: true, ctrlKey: true, shiftKey: true });
   assert.deepEqual(altOverrides.after.x, altOverrides.before.x);
   assert.ok(altOverrides.after.y[1] - altOverrides.after.y[0] < altOverrides.before.y[1] - altOverrides.before.y[0]);
-  const zeroBefore = (0 - altOverrides.before.y[0]) / (altOverrides.before.y[1] - altOverrides.before.y[0]);
-  const zeroAfter = (0 - altOverrides.after.y[0]) / (altOverrides.after.y[1] - altOverrides.after.y[0]);
-  assert.ok(Math.abs(zeroAfter - zeroBefore) < 1e-12, "Alt keeps zero at the same vertical screen position while zooming");
+  const zeroBefore = (-(altOverrides.before.yOrigin || 0) - altOverrides.before.y[0]) / (altOverrides.before.y[1] - altOverrides.before.y[0]);
+  const zeroAfter = (-(altOverrides.after.yOrigin || 0) - altOverrides.after.y[0]) / (altOverrides.after.y[1] - altOverrides.after.y[0]);
+  assert.ok(Math.abs(zeroAfter - zeroBefore) < 1e-12, `Alt keeps zero at the same vertical screen position while zooming (${zeroBefore} → ${zeroAfter}, origins ${altOverrides.before.yOrigin} → ${altOverrides.after.yOrigin})`);
+});
+
+test("a short run of wheel steps can shrink the Y span by at least six orders of magnitude", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const initialSpan = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  const canvas = element(elements, "plot");
+
+  for (let index = 0; index < 16; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  assert.ok(span > 0 && Number.isFinite(span), `Y span must stay finite and positive, got ${span} Ω`);
+  assert.ok(span < initialSpan * 1e-6, `16 upward notches should shrink the view at least 1,000,000×; ${initialSpan} → ${span} Ω`);
+});
+
+test("Y-axis wheel zoom reaches a few floating-point steps without collapsing at large readings", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = Array.from({ length: 3 }, (_, index) => ({
+    id: index + 1, x: index, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2",
+  }));
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+
+  for (let index = 0; index < 240; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  assert.ok(span < 1e-8, `expected Y span below 10 nΩ, got ${span} Ω`);
+  assert.ok(span > 0 && Number.isFinite(span), `Y span must remain finite and nonzero, got ${span}`);
+});
+
+test("Y-axis wheel can zoom below the former 1e-100 SI floor near a 30 MΩ sample", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+  const sampleY = api.app.chartScale.yToPixel(30e6);
+
+  api.app.yView = [-5e-91, 5e-91];
+  api.drawChart();
+
+  for (let index = 0; index < 200; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: sampleY, deltaY: -120, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  assert.ok(Number.isFinite(span) && span > 0, `Y span must remain finite and nonzero, got ${span} Ω`);
+  assert.ok(span < 1e-100, `expected wheel zoom to pass the former 1e-100 Ω floor, got ${span} Ω`);
+  assert.ok(api.app.chartScale.yMin < 0 && api.app.chartScale.yMax > 0, "the sample remains centered in its offset coordinates");
+});
+
+test("Y-axis wheel zoom at milliamp readings is not clamped to the one-amp precision floor", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCI", { value: "DCI", label: "直流电流", quantity: "current", unit: "A", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = Array.from({ length: 3 }, (_, index) => ({
+    id: index + 1, x: index, y: 5e-3, status: "ok", unit: "A", mode: "DCI",
+  }));
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+
+  for (let index = 0; index < 240; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  assert.ok(Number.isFinite(span) && span > 0, `Y span must remain finite and nonzero, got ${span} A`);
+  assert.ok(span < 1e-17, `expected milliamp readings to zoom below the old absolute floor, got ${span} A`);
+});
+
+test("Alt-wheel can zoom near zero despite a distant high-magnitude outlier", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.points = [
+    { id: 1, x: 0, y: 0, status: "ok", unit: "V", mode: "DCV" },
+    { id: 2, x: 1, y: 1e-8, status: "ok", unit: "V", mode: "DCV" },
+    { id: 3, x: 2, y: 1e12, status: "ok", unit: "V", mode: "DCV" },
+  ];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+
+  for (let index = 0; index < 240; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, altKey: true, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
+  assert.ok(api.app.chartScale.yMin <= 0 && api.app.chartScale.yMax >= 0, "Alt-wheel keeps zero inside the visible Y range");
+  assert.ok(api.app.chartScale.yMin <= 1e-8 && api.app.chartScale.yMax >= 1e-8, "the nearby low reading remains inside the zoomed Y range");
+  assert.ok(Number.isFinite(span) && span > 0, `Y span must remain finite and nonzero, got ${span} V`);
+  assert.ok(span < 1e-5, `expected Alt-wheel to zoom below the outlier-based floor, got ${span} V`);
+});
+
+test("Alt-wheel rebases a 30 MΩ plot before zooming around absolute zero", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+
+  for (let index = 0; index < 600; index += 1) {
+    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, altKey: true, preventDefault() {} });
+  }
+
+  flushAnimationFrames(animationFrames);
+  const scale = api.app.chartScale;
+  const span = scale.yMax - scale.yMin;
+  assert.equal(scale.yOrigin, 0, "Alt-wheel zero is the new coordinate origin");
+  assert.ok(Number.isFinite(span) && span > 0, `Alt-wheel span must remain finite and positive, got ${span} Ω`);
+  assert.ok(span < 1e-30, `expected Alt-wheel to zoom below the previous 1e-24 Ω floor around zero, got ${span} Ω`);
+  assert.equal(api.app.points[0].y, 30e6, "the sample remains in its original absolute units");
+});
+
+test("touch pinch can narrow the Y axis to a few floating-point steps at large readings", async () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
+  api.app.points = Array.from({ length: 3 }, (_, index) => ({
+    id: index + 1, x: index, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2",
+  }));
+  api.app.yView = [-1e-4, 1e-4];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+  const canvas = element(elements, "plot");
+
+  await canvas.dispatch("pointerdown", { pointerId: 1, pointerType: "touch", clientX: 150, clientY: 180 });
+  await canvas.dispatch("pointerdown", { pointerId: 2, pointerType: "touch", clientX: 250, clientY: 180 });
+  await canvas.dispatch("pointermove", { pointerId: 2, pointerType: "touch", clientX: 100_250, clientY: 180, preventDefault() {} });
+  await canvas.dispatch("pointermove", { pointerId: 2, pointerType: "touch", clientX: 1_000_150, clientY: 180, preventDefault() {} });
+  await canvas.dispatch("pointermove", { pointerId: 2, pointerType: "touch", clientX: 10_000_150, clientY: 180, preventDefault() {} });
+
+  const span = api.app.yView[1] - api.app.yView[0];
+  assert.ok(span < 1e-8, `expected pinch Y span below 10 nΩ, got ${span} Ω`);
+  assert.ok(span > 0 && Number.isFinite(span), `Y span must remain finite and nonzero, got ${span}`);
 });
 
 test("manual zoom of either axis turns off auto-follow and updates the visible status", async () => {
-  const { api, elements } = createFrontend({ stubChart: false });
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
   api.app.points = Array.from({ length: 21 }, (_, index) => ({ id: index + 1, x: index, y: index + 1, status: "ok", unit: "V" }));
   element(elements, "autoFollow").checked = true;
   api.drawChart();
 
   await element(elements, "plot").dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {} });
+  flushAnimationFrames(animationFrames);
 
   assert.equal(element(elements, "autoFollow").checked, false);
   assert.match(element(elements, "viewModeStatus").textContent, /自动跟随已关闭/);
@@ -2369,7 +4053,7 @@ test("manual zoom of either axis turns off auto-follow and updates the visible s
 });
 
 test("Shift-wheel time-axis zoom turns off auto-follow and preserves the reading axis", async () => {
-  const { api, elements } = createFrontend({ stubChart: false });
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
   api.app.points = Array.from({ length: 101 }, (_, index) => ({ id: index + 1, x: index, y: index + 1, status: "ok", unit: "V" }));
   element(elements, "autoFollow").checked = true;
   api.drawChart();
@@ -2379,6 +4063,7 @@ test("Shift-wheel time-axis zoom turns off auto-follow and preserves the reading
   await element(elements, "plot").dispatch("wheel", {
     clientX: 400, clientY: 200, deltaY: -120, shiftKey: true, preventDefault() {},
   });
+  flushAnimationFrames(animationFrames);
 
   assert.ok(api.app.xView[1] - api.app.xView[0] < initialXSpan);
   assert.equal(api.app.yView, null);
@@ -2420,7 +4105,7 @@ test("manual pointer panning turns off auto-follow and updates the visible statu
   assert.match(element(elements, "viewModeStatus").textContent, /自动跟随已关闭/);
 });
 
-test("full Web layout fits 280–351 px viewports and honors the 350 px boundary in Chromium", (t) => {
+test("full Web layout fits 280–351 px viewports and honors the 350 px boundary in Chromium", async (t) => {
   const candidates = [
     process.env.CHROME_BIN,
     process.env.EDGE_BIN,
@@ -2449,6 +4134,9 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
     Promise.all(frames.map(({frame}) => new Promise((resolve) => frame.addEventListener("load", () => {
       const doc = frame.contentDocument;
       const viewport = frame.contentWindow.innerWidth;
+      const scenarioBadge = doc.querySelector("#scenarioBadge");
+      scenarioBadge.classList.remove("hidden");
+      scenarioBadge.textContent = "模拟模式 · 温漂与阶跃";
       const measured = [".topbar", ".workspace", ".measurement-area", ".readout-panel", ".chart-panel", ".plot-wrap", ".chart-context", ".chart-context-actions", "#pointCursor", "#chartGestureHint", ".chart-actions .toggle-label"]
         .map((selector) => { const node = doc.querySelector(selector); const rect = node.getBoundingClientRect(); return [selector, rect.left, rect.right]; });
       const overflowing = [...doc.body.querySelectorAll("*")].map((node) => {
@@ -2456,34 +4144,64 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
         return [node.id || node.className || node.tagName, rect.left, rect.right, node.scrollWidth, node.clientWidth];
       }).filter(([, left, right]) => left < -1 || right > doc.documentElement.clientWidth + 1).slice(0, 12);
       const targetRect = doc.querySelector(".chart-actions .toggle-label").getBoundingClientRect();
+      const readTouchTargets = () => [...doc.querySelectorAll("button, .file-button, .dialog-nav a, details > summary, .option-check, .confirm-row, .toggle-label")]
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          return getComputedStyle(node).display !== "none" && rect.width > 0 && rect.height > 0;
+        })
+        .map((node) => { const rect = node.getBoundingClientRect(); return [node.id || node.className || node.parentElement.id || "summary", rect.width, rect.height]; });
+      doc.querySelector("#settingsDialog").showModal();
+      const criticalError = doc.querySelector("#criticalError");
+      criticalError.classList.remove("hidden");
+      criticalError.textContent = "测试错误提示";
+      const settingsDialog = doc.querySelector("#settingsDialog");
+      const settingsRect = settingsDialog.getBoundingClientRect();
+      const settingsScrollRect = settingsDialog.querySelector(".settings-scroll").getBoundingClientRect();
+      const settingsFooterRect = settingsDialog.querySelector(".dialog-footer").getBoundingClientRect();
+      const settingsTouchTargets = readTouchTargets();
+      settingsDialog.close();
+      const filesDialog = doc.querySelector("#filesDialog");
+      filesDialog.showModal();
+      const filesRect = filesDialog.getBoundingClientRect();
+      const filesListRect = filesDialog.querySelector("#filesList").getBoundingClientRect();
+      const filesFooterRect = filesDialog.querySelector(".files-dialog-footer").getBoundingClientRect();
+      const filesTouchTargets = readTouchTargets();
       resolve({ viewport, bodyMinWidth: getComputedStyle(doc.body).minWidth, bodyClient: doc.body.clientWidth, bodyScroll: doc.body.scrollWidth,
         documentClient: doc.documentElement.clientWidth, documentScroll: doc.documentElement.scrollWidth,
-        touchTarget: [targetRect.width, targetRect.height], measured, overflowing });
+        touchTarget: [targetRect.width, targetRect.height], touchTargets: [...settingsTouchTargets, ...filesTouchTargets],
+        dialogs: [
+          { id: "settingsDialog", left: settingsRect.left, right: settingsRect.right, top: settingsRect.top, bottom: settingsRect.bottom,
+            scrollLeft: settingsScrollRect.left, scrollRight: settingsScrollRect.right, footerLeft: settingsFooterRect.left, footerRight: settingsFooterRect.right },
+          { id: "filesDialog", left: filesRect.left, right: filesRect.right, top: filesRect.top, bottom: filesRect.bottom,
+            contentLeft: filesListRect.left, contentRight: filesListRect.right, footerLeft: filesFooterRect.left, footerRight: filesFooterRect.right },
+        ], measured, overflowing });
     })))).then((metrics) => { document.getElementById("result").textContent = JSON.stringify(metrics); });
   </script>`;
-  const tempHtml = path.join(require("node:os").tmpdir(), `8845a-layout-${process.pid}-${Date.now()}.html`);
-  fs.writeFileSync(tempHtml, probe, "utf8");
-  try {
-    const result = spawnSync(browser, ["--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--no-sandbox", "--dump-dom", tempHtml], { encoding: "utf8", timeout: 7000, windowsHide: true });
-    assert.equal(result.error, undefined, result.error?.message);
-    assert.equal(result.status, 0, result.stderr);
-    const match = result.stdout.match(/<pre id="result">(\[[\s\S]*?\])<\/pre>/);
-    assert.ok(match, "Chromium returns measured layout geometry");
-    const metrics = JSON.parse(match[1]);
-    assert.equal(metrics.length, 4);
-    for (const layout of metrics) {
-      assert.equal(layout.bodyScroll, layout.bodyClient, `${layout.viewport}px body has no horizontal overflow: ${JSON.stringify(layout)}`);
-      assert.equal(layout.documentScroll, layout.documentClient, `${layout.viewport}px document has no horizontal overflow`);
-      assert.ok(layout.documentClient <= layout.viewport, `${layout.viewport}px document client area stays within the viewport`);
-      assert.equal(layout.bodyMinWidth, layout.viewport <= 350 ? "0px" : "280px", `${layout.viewport}px min-width breakpoint is applied at the intended boundary`);
-      assert.ok(layout.touchTarget[0] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px wide`);
-      assert.ok(layout.touchTarget[1] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px tall`);
-      for (const [selector, left, right] of layout.measured) {
-        assert.ok(left >= -1 && right <= layout.documentClient + 1, `${selector} stays within ${layout.viewport}px viewport: ${left}..${right}`);
-      }
+  const metrics = await inspectChromiumDom(browser, probe);
+  assert.equal(metrics.length, 4);
+  for (const layout of metrics) {
+    assert.equal(layout.bodyScroll, layout.bodyClient, `${layout.viewport}px body has no horizontal overflow: ${JSON.stringify(layout)}`);
+    assert.equal(layout.documentScroll, layout.documentClient, `${layout.viewport}px document has no horizontal overflow`);
+    assert.ok(layout.documentClient <= layout.viewport, `${layout.viewport}px document client area stays within the viewport`);
+    assert.deepEqual(layout.overflowing, [], `${layout.viewport}px visible content does not cross the viewport edge`);
+    assert.equal(layout.bodyMinWidth, layout.viewport <= 350 ? "0px" : "280px", `${layout.viewport}px min-width breakpoint is applied at the intended boundary`);
+    assert.ok(layout.touchTarget[0] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px wide`);
+    assert.ok(layout.touchTarget[1] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px tall`);
+    for (const [selector, width, height] of layout.touchTargets) {
+      assert.ok(width >= 44, `${layout.viewport}px ${selector} target is at least 44 CSS px wide, got ${width}`);
+      assert.ok(height >= 44, `${layout.viewport}px ${selector} target is at least 44 CSS px tall, got ${height}`);
     }
-  } finally {
-    fs.rmSync(tempHtml, { force: true });
+    for (const dialog of layout.dialogs) {
+      assert.ok(dialog.left >= -1 && dialog.right <= layout.documentClient + 1, `${layout.viewport}px ${dialog.id} fits the viewport`);
+      assert.ok(dialog.top >= -1 && dialog.bottom <= 900 + 1, `${layout.viewport}px ${dialog.id} fits the probe height`);
+      const left = dialog.scrollLeft ?? dialog.contentLeft;
+      const right = dialog.scrollRight ?? dialog.contentRight;
+      assert.ok(left >= dialog.left - 1 && right <= dialog.right + 1, `${layout.viewport}px ${dialog.id} content fits its dialog`);
+      assert.ok(dialog.footerLeft >= dialog.left - 1 && dialog.footerRight <= dialog.right + 1, `${layout.viewport}px ${dialog.id} footer fits its dialog`);
+    }
+    for (const [selector, left, right] of layout.measured) {
+      assert.ok(left >= -1 && right <= layout.documentClient + 1, `${selector} stays within ${layout.viewport}px viewport: ${left}..${right}`);
+    }
   }
 });
 
@@ -2509,8 +4227,8 @@ test("web chart guidance explains axis follow behavior and highlights return to 
   assert.match(html, /回到实时窗口/);
 });
 
-test("diagnostic logs can be filtered by source and exported as plain text", () => {
-  const { api } = createFrontend();
+test("diagnostic logs can be filtered and the export button downloads only the selected source", async () => {
+  const { api, elements, context } = createFrontend();
   const rows = [
     { time: "2026-10-15T12:00:00+08:00", text: "! SCPI response timeout" },
     { time: "2026-10-15T12:00:01+08:00", text: "> SENS:FUNC?" },
@@ -2525,6 +4243,37 @@ test("diagnostic logs can be filtered by source and exported as plain text", () 
   const output = api.formatLogsText(api.filterLogRows(rows, "scpi"));
   assert.match(output, /\[SCPI\] > SENS:FUNC\?/);
   assert.doesNotMatch(output, /timeout|COM3|开始实验/);
+
+  let exportedBlob;
+  let revokedUrl;
+  let downloadedLink;
+  context.Blob = class {
+    constructor(parts, options) { this.parts = parts; this.type = options.type; }
+    async text() { return this.parts.join(""); }
+  };
+  context.URL = {
+    createObjectURL(blob) { exportedBlob = blob; return "blob:test-logs"; },
+    revokeObjectURL(url) { revokedUrl = url; },
+  };
+  const createElement = context.document.createElement.bind(context.document);
+  context.document.createElement = (tag) => {
+    const created = createElement(tag);
+    if (tag === "a") created.click = () => { downloadedLink = { href: created.href, download: created.download }; };
+    return created;
+  };
+  api.bindControls();
+  api.app.logRows = rows;
+  element(elements, "logFilter").value = "scpi";
+  await element(elements, "logFilter").dispatch("change");
+  await element(elements, "exportLogs").dispatch("click");
+
+  assert.equal(exportedBlob.type, "text/plain;charset=utf-8");
+  assert.match(await exportedBlob.text(), /\[SCPI\] > SENS:FUNC\?/);
+  assert.doesNotMatch(await exportedBlob.text(), /timeout|COM3|开始实验/);
+  assert.equal(downloadedLink.href, "blob:test-logs");
+  assert.match(downloadedLink.download, /^8845A_scpi_logs_.*\.txt$/);
+  assert.equal(revokedUrl, "blob:test-logs");
+  assert.match(element(elements, "toast").textContent, /已导出 1 条日志/);
 });
 
 test("CSV download state distinguishes a live snapshot from a completed experiment", () => {
