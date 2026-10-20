@@ -1993,6 +1993,7 @@ def test_150_percent_dpi_short_window_keeps_chart_panels_inside_and_readable(tmp
         "QT_QPA_PLATFORM": "offscreen",
         "QT_SCALE_FACTOR": "1.5",
         "FLUKE8845A_CONFIG_DIR": str(tmp_path / "short-high-dpi-config"),
+        "PYTHONIOENCODING": "utf-8",
     })
     probe = textwrap.dedent(
         """
@@ -2136,6 +2137,7 @@ def test_150_percent_dpi_short_window_keeps_chart_panels_inside_and_readable(tmp
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
         check=False,
     )
