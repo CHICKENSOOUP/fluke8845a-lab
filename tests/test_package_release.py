@@ -279,6 +279,22 @@ def test_source_archive_file_collection_rejects_symbolic_links(tmp_path, monkeyp
         files_for_archive(source_root)
 
 
+def test_source_archive_excludes_generated_egg_info_metadata(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    package = source_root / "src" / "fluke8845a"
+    metadata = source_root / "src" / "fluke8845a_lab.egg-info"
+    package.mkdir(parents=True)
+    metadata.mkdir(parents=True)
+    source_file = package / "__init__.py"
+    metadata_file = metadata / "PKG-INFO"
+    source_file.write_text('__version__ = "1.1.0"\n', encoding="utf-8")
+    metadata_file.write_text("generated install metadata", encoding="utf-8")
+    monkeypatch.setattr(package_source, "INCLUDED_ROOT_FILES", ())
+    monkeypatch.setattr(package_source, "INCLUDED_TREES", ("src",))
+
+    assert files_for_archive(source_root) == [source_file]
+
+
 def test_source_archive_manifest_includes_archive_path_guard():
     assert "scripts/archive_paths.py" in REQUIRED_ARCHIVE_PATHS
     assert "scripts/run_tests_sharded.py" in REQUIRED_ARCHIVE_PATHS

@@ -283,6 +283,27 @@ def test_git_snapshot_marks_ignored_source_archive_file_as_dirty(tmp_path):
     assert provenance.capture_git_state(tmp_path)["worktree_dirty"] is True
 
 
+def test_git_snapshot_ignores_generated_egg_info_metadata(tmp_path):
+    provenance = _provenance_module()
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    (tmp_path / ".gitignore").write_text("*.egg-info/\n", encoding="utf-8")
+    package = tmp_path / "src" / "fluke8845a"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__version__ = 'test'\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore", "src"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "initial"], check=True)
+    metadata = tmp_path / "src" / "fluke8845a_lab.egg-info"
+    metadata.mkdir()
+    (metadata / "PKG-INFO").write_text("generated install metadata", encoding="utf-8")
+
+    assert subprocess.check_output(
+        ["git", "-C", str(tmp_path), "status", "--porcelain=v1", "--untracked-files=all"], text=True
+    ).strip() == ""
+    assert provenance.capture_git_state(tmp_path)["worktree_dirty"] is False
+
+
 def test_provenance_creation_rejects_source_changes_after_build_start(tmp_path):
     provenance = _provenance_module()
     (tmp_path / "README.md").write_text("before build", encoding="utf-8")

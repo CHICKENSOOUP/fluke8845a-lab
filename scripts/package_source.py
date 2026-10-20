@@ -106,6 +106,14 @@ EXCLUDED_PATH_PARTS = {
     "output",
     "Fluke8845A_Agent_Reference_Pack",
 }
+
+
+def _contains_excluded_archive_part(parts) -> bool:
+    """Recognize excluded directories, including generated setuptools metadata."""
+    return any(
+        part in EXCLUDED_PATH_PARTS or part.casefold().endswith(".egg-info")
+        for part in parts
+    )
 NUMERIC_INSTRUMENT_SERIAL_PATTERNS = (
     re.compile(r"FLUKE\s*,\s*8845A\s*,\s*\d{6,}\s*,", re.IGNORECASE),
     re.compile(
@@ -191,7 +199,7 @@ def files_for_archive(root: Path = ROOT) -> list[Path]:
             continue
         for path in tree.rglob("*"):
             relative_parts = path.relative_to(root).parts
-            if any(part in EXCLUDED_PATH_PARTS for part in relative_parts):
+            if _contains_excluded_archive_part(relative_parts):
                 continue
             ensure_path_within(path, root)
             if not path.is_file():
@@ -250,7 +258,7 @@ def create_archive(destination: Path, *, provenance_path: Path) -> int:
             )
             unsafe = [
                 name for name in names
-                if any(part in EXCLUDED_PATH_PARTS for part in Path(name).parts)
+                if _contains_excluded_archive_part(Path(name).parts)
             ]
             if unsafe:
                 raise RuntimeError(f"Source archive contains excluded paths: {', '.join(sorted(unsafe))}")
