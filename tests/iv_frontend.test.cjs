@@ -12,3 +12,10 @@ test('signed log preserves zero and direction', () => {
   assert.equal(symlog(0, 1), 0);
   assert.equal(symlog(-10, 1), -symlog(10, 1));
 });
+
+test('current display switches units at 0.5 mA without changing raw amperes', () => {
+  const {currentUnit} = require('../src/fluke8845a/web/iv_math.js');
+  assert.deepEqual(currentUnit([]), {label:'µA', factor:1e6});
+  assert.deepEqual(currentUnit([-0.000499]), {label:'µA', factor:1e6});
+  assert.deepEqual(currentUnit([-0.0005]), {label:'mA', factor:1e3});
+});

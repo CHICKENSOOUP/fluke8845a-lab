@@ -3,6 +3,9 @@ import pytest
 from fluke8845a.webservice import WebCommandRouter, WebStateStore
 from fluke8845a.state import AcquisitionState
 from fluke8845a.worker import MeasurementWorker
+from fluke8845a.mock import MockScenario
+from fluke8845a.modes import Mode
+from fluke8845a.scpi import ModeSettings
 
 
 def test_voltage_boundary_is_recorded_and_exposed():
@@ -39,3 +42,17 @@ def test_iv_acquisition_rejects_runtime_parameter_changes(action):
     router = WebCommandRouter(worker, WebStateStore())
     with pytest.raises(ValueError, match='采集中'):
         router._execute(action, {})
+
+
+def test_iv_mock_timeout_stops_at_first_failure_and_preserves_record(tmp_path):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCI)
+    worker.connect_mock(settings, MockScenario(name='timeout', timeout_at_sample=1, read_latency_s=0))
+    worker._iv_mode = True
+    worker.start_experiment(settings, 'iv', str(tmp_path), 1, False)
+    recorder = worker._recorder
+    assert recorder is not None
+    worker._take_sample()
+    assert worker.state == AcquisitionState.STOPPED
+    assert 'timeout' in (recorder.directory / 'measurements.csv').read_text(encoding='utf-8-sig')
+    worker.shutdown()

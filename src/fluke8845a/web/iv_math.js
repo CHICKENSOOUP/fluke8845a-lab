@@ -8,7 +8,8 @@
   }
   function symlog(v, threshold) { return Math.sign(v)*Math.log1p(Math.abs(v)/threshold); }
   function windowSamples(samples, now, seconds) { return samples.filter(s=>s.t>=now-seconds && s.t<=now && typeof s.value==='number' && Number.isFinite(s.value)); }
-  const api={stats,symlog,windowSamples};
+  function currentUnit(values) { return values.some(v=>Math.abs(v)>=0.0005) ? {label:'mA',factor:1e3} : {label:'µA',factor:1e6}; }
+  const api={stats,symlog,windowSamples,currentUnit};
   if (typeof module !== 'undefined') module.exports=api;
   root.IVMath=api;
 })(globalThis);
