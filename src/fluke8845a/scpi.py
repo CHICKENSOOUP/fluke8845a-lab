@@ -646,15 +646,20 @@ class Serial8845A:
         self._active_settings: ModeSettings | None = None
         self.outguard_version = ""
         self.inguard_version = ""
+        self.firmware_source = "panel"
 
     def set_firmware_versions(self, outguard_version: str = "", inguard_version: str = "") -> None:
         """Store software revisions manually read from this meter's front panel."""
         self.outguard_version = str(outguard_version or "").strip()
         self.inguard_version = str(inguard_version or "").strip()
+        self.firmware_source = "panel"
 
     @property
     def range_firmware(self) -> tuple[str, str]:
-        return select_range_firmware(self.outguard_version)
+        version, source = select_range_firmware(self.outguard_version)
+        if version and self.firmware_source == "user_default":
+            source = "用户指定默认值，未经仪器核验"
+        return version, source
 
     @property
     def connected(self) -> bool:

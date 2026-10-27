@@ -1154,7 +1154,7 @@ class WebCommandRouter(QObject):
             "idn_version_candidate": info.idn_version_candidate or None,
             "idn_revision": info.idn_revision,
             "front_panel_software": {
-                "outguard_sw": outguard or None,
+                "outguard_sw": (outguard or None) if getattr(instrument, "firmware_source", "panel") != "user_default" else None,
                 "inguard_sw": inguard or None,
             },
             "range_firmware": range_firmware or None,
@@ -1431,12 +1431,19 @@ class WebCommandRouter(QObject):
                 raise ValueError("请先连接真实的 Fluke 8845A，再记录面板软件版本")
             outguard = self._version_text(payload.get("outguard_sw", ""), "OutG SW")
             inguard = self._version_text(payload.get("inguard_sw", ""), "InG SW")
-            worker.set_firmware_versions(outguard, inguard)
+            source = payload.get("source", "panel")
+            if source not in {"panel", "user_default"}:
+                raise ValueError("未知的软件版本来源")
+            if source == "user_default" and (outguard != "2.10.882.24" or inguard):
+                raise ValueError("用户指定默认值只适用于 OutG SW 2.10.882.24")
+            worker.set_firmware_versions(outguard, inguard, source)
             error = check_worker_error("记录面板软件版本失败")
             if error:
                 return error
             self.store.update(device=self._current_device_state())
-            return {"success": True, "message": "已记录面板核对的软件版本；这些版本不是通过SCPI读取"}
+            message = ("已记录用户指定默认值，未经仪器核验" if source == "user_default"
+                       else "已记录面板核对的软件版本；这些版本不是通过SCPI读取")
+            return {"success": True, "message": message}
 
         if action == "shutdown":
             worker.shutdown()
