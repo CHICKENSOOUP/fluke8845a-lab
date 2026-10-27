@@ -798,7 +798,6 @@ class WebStateStore:
             "last_experiment_dir": "",
             "save_result": None,
             "last_error": "",
-            "iv_voltage_boundary": None,
             "diagnostic": "",
             "speed_result": None,
             "speed_seq": 0,
@@ -839,7 +838,6 @@ class WebStateStore:
                 actual_hz=0.0,
                 stats={},
                 last_error="",
-                iv_voltage_boundary=None,
                 save_result=None,
             )
 
@@ -1154,7 +1152,7 @@ class WebCommandRouter(QObject):
             "idn_version_candidate": info.idn_version_candidate or None,
             "idn_revision": info.idn_revision,
             "front_panel_software": {
-                "outguard_sw": (outguard or None) if getattr(instrument, "firmware_source", "panel") != "user_default" else None,
+                "outguard_sw": outguard or None,
                 "inguard_sw": inguard or None,
             },
             "range_firmware": range_firmware or None,
@@ -1322,22 +1320,6 @@ class WebCommandRouter(QObject):
                 return {"success": False, "message": state["last_error"] or default}
             return None
 
-        if action == "iv_voltage":
-            if worker.state != AcquisitionState.RUNNING:
-                raise ValueError("请先开始电流采集")
-            voltage = _finite_number(payload.get("voltage_v"), "电压")
-            event = worker.mark_event(f"IV 电压确认: {voltage:.17g} V")
-            error = check_worker_error("电压确认记录失败")
-            if error:
-                return error
-            if not isinstance(event, dict):
-                raise ValueError("电压确认记录失败")
-            boundary = {"voltage_v": voltage, "sample_index": int(event["sample_index"]),
-                        "elapsed_s": float(event["elapsed_s"]),
-                        "generation": self.store.snapshot()["generation"]}
-            self.store.update(iv_voltage_boundary=boundary)
-            return {"success": True, **boundary, "boundary": boundary}
-
         if action == "connect_real":
             if worker.instrument is not None and worker.instrument.connected:
                 raise ValueError("已连接，请先断开当前仪器")
@@ -1431,19 +1413,12 @@ class WebCommandRouter(QObject):
                 raise ValueError("请先连接真实的 Fluke 8845A，再记录面板软件版本")
             outguard = self._version_text(payload.get("outguard_sw", ""), "OutG SW")
             inguard = self._version_text(payload.get("inguard_sw", ""), "InG SW")
-            source = payload.get("source", "panel")
-            if source not in {"panel", "user_default"}:
-                raise ValueError("未知的软件版本来源")
-            if source == "user_default" and (outguard != "2.10.882.24" or inguard):
-                raise ValueError("用户指定默认值只适用于 OutG SW 2.10.882.24")
-            worker.set_firmware_versions(outguard, inguard, source)
+            worker.set_firmware_versions(outguard, inguard)
             error = check_worker_error("记录面板软件版本失败")
             if error:
                 return error
             self.store.update(device=self._current_device_state())
-            message = ("已记录用户指定默认值，未经仪器核验" if source == "user_default"
-                       else "已记录面板核对的软件版本；这些版本不是通过SCPI读取")
-            return {"success": True, "message": message}
+            return {"success": True, "message": "已记录面板核对的软件版本；这些版本不是通过SCPI读取"}
 
         if action == "shutdown":
             worker.shutdown()
@@ -1480,13 +1455,9 @@ class WebCommandRouter(QObject):
             if duplicate_action == "overwrite" and not expected_duplicate_path:
                 raise ValueError("采集预检失败：缺少已确认的实验目录，请重新预检后再选择覆盖")
             settings = mode_settings_from_payload(payload.get("settings", {}))
-            iv_mode = payload.get("iv_mode") is True
-            if iv_mode and (action != "start" or settings.mode != Mode.DCI):
-                raise ValueError("IV 测量需要连续直流电流采集")
             name = validate_experiment_name(str(payload.get("name", "")))
             root = Path(str(payload.get("root", "")).strip()).expanduser()
             interval = self._interval(payload.get("interval_s", 1.0))
-            worker._iv_mode = iv_mode
             worker.start_experiment(
                 settings, name, str(root), interval, action == "single", duplicate_action,
                 expected_duplicate_path, settings,
@@ -1502,16 +1473,12 @@ class WebCommandRouter(QObject):
             return {"success": True, "message": message}
 
         if action == "interval":
-            if worker.state != AcquisitionState.STOPPED and getattr(worker, "_iv_mode", False):
-                raise ValueError("IV 采集中不能更改采样参数")
             interval = self._interval(payload.get("interval_s"))
             result = worker.set_target_interval(interval)
             error = check_worker_error("采样间隔更新失败")
             return error or result
 
         if action == "speed":
-            if worker.state != AcquisitionState.STOPPED and getattr(worker, "_iv_mode", False):
-                raise ValueError("IV 采集中不能更改采样参数")
             settings = mode_settings_from_payload(payload.get("settings", {}))
             if settings.mode != worker.current_mode:
                 raise ValueError("采集期间不能切换测量模式；请停止本次实验后再配置")

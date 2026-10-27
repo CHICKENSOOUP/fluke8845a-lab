@@ -11,7 +11,6 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_TEST_FILES = (
-    "tests/iv_frontend.test.cjs",
     "tests/web_frontend.test.cjs",
     "tests/web_history_worker.test.cjs",
     "tests/web_history_import_ui.test.cjs",

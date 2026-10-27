@@ -245,7 +245,7 @@ class LocalWebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/":
             path = _WEB_ROOT / "index.html"
-        elif parsed.path in ("/app.css", "/app.js", "/history_worker.js", "/iv.html", "/iv.css", "/iv.js", "/iv_math.js"):
+        elif parsed.path in ("/app.css", "/app.js", "/history_worker.js"):
             path = _WEB_ROOT / parsed.path.lstrip("/")
         else:
             self._not_found()

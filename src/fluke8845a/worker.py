@@ -120,7 +120,6 @@ class MeasurementWorker(QObject):
         self._valid_response_ends_ns: deque[int] = deque(maxlen=ACTUAL_RATE_WINDOW_POINTS)
         self._consecutive_timeouts = 0
         self._one_shot = False
-        self._iv_mode = False
         self._pending_rows: list[dict] = []
         self._last_gui_emit_ns = 0
         self._running_stats = RunningStats()
@@ -301,7 +300,7 @@ class MeasurementWorker(QObject):
         self._connect("MOCK", SerialSettings(), mode_settings, True, scenario, None)
 
     @Slot(str, str)
-    def set_firmware_versions(self, outguard_version: str, inguard_version: str, source: str = "panel") -> None:
+    def set_firmware_versions(self, outguard_version: str, inguard_version: str) -> None:
         """Store operator-verified front-panel software versions without SCPI writes."""
         outguard_version = str(outguard_version or "").strip()
         inguard_version = str(inguard_version or "").strip()
@@ -327,15 +326,11 @@ class MeasurementWorker(QObject):
             return
         previous_outguard_version = self.instrument.range_firmware[0] or ""
         self.instrument.set_firmware_versions(outguard_version, inguard_version)
-        self.instrument.firmware_source = source
-        if source == "user_default":
-            self.log_line.emit(f"OutG SW={outguard_version}：用户指定默认值，未经仪器核验")
-        else:
-            self.log_line.emit(
-                "已记录操作员从仪表面板核对的软件版本："
-                f"OutG SW={outguard_version.strip() or '未核对'}，"
-                f"InG SW={inguard_version.strip() or '未核对'}；未通过SCPI读取"
-            )
+        self.log_line.emit(
+            "已记录操作员从仪表面板核对的软件版本："
+            f"OutG SW={outguard_version.strip() or '未核对'}，"
+            f"InG SW={inguard_version.strip() or '未核对'}；未通过SCPI读取"
+        )
         if self.current_mode is not None:
             settings = self._settings_by_mode.get(self.current_mode)
             if settings is not None and descriptor(settings.mode).digital_filter:
@@ -730,8 +725,7 @@ class MeasurementWorker(QObject):
             self._stop_requested.clear()
             info = self.info
             panel_software = {
-                "outguard_sw": (getattr(self.instrument, "outguard_version", "") or None)
-                if getattr(self.instrument, "firmware_source", "panel") != "user_default" else None,
+                "outguard_sw": getattr(self.instrument, "outguard_version", "") or None,
                 "inguard_sw": getattr(self.instrument, "inguard_version", "") or None,
             }
             if hasattr(self.instrument, "range_firmware"):
@@ -791,8 +785,6 @@ class MeasurementWorker(QObject):
                                      "单次测量中" if one_shot else "连续采集中")
             self.log_line.emit(f"实验已启动：{self._recorder.directory}")
             self._recorder.log("INFO", f"采集目标间隔={interval_s}; 实际频率由时间戳计算")
-            if range_firmware_source == "用户指定默认值，未经仪器核验":
-                self._recorder.log("INFO", f"OutG SW={range_firmware}：{range_firmware_source}")
             active_recorder = self._recorder
             active_recorder.start_periodic_sync(
                 lambda exc, recorder=active_recorder: self.background_storage_sync_failed.emit(
@@ -1210,10 +1202,6 @@ class MeasurementWorker(QObject):
                 return
             if code == "communication_error" and isinstance(exc, InstrumentError):
                 self._finish_experiment("instrument_error")
-                return
-            if self._iv_mode:
-                self._finish_experiment("instrument_error")
-                self.status_changed.emit("电流读取失败，IV 采集已停止；请检查连接后手动重新开始")
                 return
             if self._one_shot:
                 self.stop()
