@@ -298,11 +298,16 @@ function finalizeStats(stats, rowCount) {
 
 async function scanHistoryFile(file, modeOptions, job) {
   let columns = null, rowCount = 0, modeValue = "", unitValue = "", experimentId = "";
+  let hasMissingExperimentId = false;
   const stats = scanAccumulator();
   const fileRead = await readCsvFile(file, (row) => {
     if (!columns) { columns = historyColumns(row); return; }
     rowCount++;
-    if (columns.experiment >= 0) experimentId = updateSingleValue(experimentId, row[columns.experiment]?.trim() || "", "实验标识");
+    if (columns.experiment >= 0) {
+      const rowExperimentId = row[columns.experiment]?.trim() || "";
+      if (!rowExperimentId) hasMissingExperimentId = true;
+      experimentId = updateSingleValue(experimentId, rowExperimentId, "实验标识");
+    }
     const values = rowValues(row, columns, rowCount - 1, "", "");
     if (values.status !== "ok" || !Number.isFinite(values.x) || !Number.isFinite(values.y)) return;
     if (columns.mode >= 0) modeValue = updateSingleValue(modeValue, row[columns.mode]?.trim() || "", "測量模式");
@@ -325,7 +330,9 @@ async function scanHistoryFile(file, modeOptions, job) {
   }
   return {
     columns, rowCount, modeValue, unit: unitValue,
-    experimentId: experimentId || null, stats: finalizeStats(stats, rowCount),
+    experimentId: hasMissingExperimentId ? null : experimentId || null,
+    hasMissingExperimentId,
+    stats: finalizeStats(stats, rowCount),
     incompleteTail: fileRead.incompleteTail,
     missingFinalTerminator: fileRead.missingFinalTerminator,
   };
@@ -486,6 +493,9 @@ self.addEventListener("message", async ({ data }) => {
     if (metadata.incompleteTail) warnings.push("测量 CSV 尾部有未完成记录，已忽略该尾部；原文件未修改。");
     if (metadata.missingFinalTerminator) {
       warnings.push("测量 CSV 末行没有 CR/LF 行结束符，已按 CSV 语法加载；无法判断该行是否曾被截断。");
+    }
+    if (metadata.hasMissingExperimentId) {
+      warnings.push("测量 CSV 有记录缺少 experiment_id；无法安全关联配套 events.csv。");
     }
     self.postMessage({
       ok: true,

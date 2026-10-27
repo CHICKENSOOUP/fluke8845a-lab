@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import platform
+import struct
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -135,6 +138,46 @@ def test_source_archive_provenance_digest_covers_exact_archive_sources(tmp_path)
         )
 
 
+def test_source_archive_validation_rejects_a_stale_dependency_lock_hash():
+    provenance = _provenance_module()
+    lock_bytes = b"numpy==2.0.0\n"
+    source_members = {
+        "README.md": b"source archive",
+        "requirements-lock.txt": lock_bytes,
+    }
+    document = {
+        "format_version": 1,
+        "artifact_scope": "source_only",
+        "candidate_build_name": "Fluke8845A_lock_hash_test",
+        "built_at_utc": "2026-10-16T00:00:00Z",
+        "head_commit": "1" * 40,
+        "worktree_dirty": False,
+        "build_source_kind": "commit_tree",
+        "source_tree_sha256": provenance.source_tree_digest_from_members(source_members.items()),
+        "source_tree_digest_algorithm": provenance.SOURCE_TREE_DIGEST_ALGORITHM,
+        "dependency_lock_sha256": {
+            "requirements-lock.txt": hashlib.sha256(lock_bytes).hexdigest().upper(),
+        },
+    }
+    provenance.validate_source_archive_provenance(
+        document,
+        source_members,
+        expected_candidate_build_name="Fluke8845A_lock_hash_test",
+    )
+
+    changed_members = {**source_members, "requirements-lock.txt": b"numpy==2.1.0\n"}
+    stale_hash_document = dict(
+        document,
+        source_tree_sha256=provenance.source_tree_digest_from_members(changed_members.items()),
+    )
+    with pytest.raises(ValueError, match="dependency lock SHA-256"):
+        provenance.validate_source_archive_provenance(
+            stale_hash_document,
+            changed_members,
+            expected_candidate_build_name="Fluke8845A_lock_hash_test",
+        )
+
+
 def test_source_only_provenance_validates_without_fabricated_executable_hashes(tmp_path):
     provenance = _provenance_module()
     document = {
@@ -244,6 +287,38 @@ def test_portable_zip_requires_build_provenance_at_archive_root():
     assert "BUILD-PROVENANCE.json" in REQUIRED_ENTRIES
 
 
+def test_desktop_only_provenance_binds_desktop_without_claiming_a_web_binary(tmp_path):
+    provenance = _provenance_module()
+    desktop = tmp_path / "Fluke8845A.exe"
+    desktop.write_bytes(b"desktop-only executable")
+    document = provenance.make_build_provenance(
+        candidate_build_name="Fluke8845A_desktop",
+        built_at_utc="2026-10-22T12:00:00Z",
+        source_tree_sha256="A" * 64,
+        git_state={"head_commit": "1" * 40, "worktree_dirty": True},
+        desktop_exe=desktop,
+        web_exe=None,
+        desktop_only=True,
+    )
+
+    assert document["artifact_scope"] == "desktop_only"
+    assert set(document["executables"]) == {"desktop"}
+    provenance.validate_windows_archive_provenance(
+        document, {"Fluke8845A.exe": desktop.read_bytes()},
+        expected_candidate_build_name="Fluke8845A_desktop",
+    )
+    with pytest.raises(ValueError, match="desktop executable"):
+        provenance.validate_windows_archive_provenance(
+            document, {"Fluke8845A.exe": b"wrong executable"},
+            expected_candidate_build_name="Fluke8845A_desktop",
+        )
+    with pytest.raises(ValueError, match="desktop-only"):
+        provenance.validate_windows_archive_provenance(
+            document, {"Fluke8845A.exe": desktop.read_bytes(), provenance.WEB_ARCHIVE_PATH: b"web"},
+            expected_candidate_build_name="Fluke8845A_desktop",
+        )
+
+
 def test_git_snapshot_distinguishes_clean_commit_from_dirty_worktree(tmp_path):
     provenance = _provenance_module()
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
@@ -321,4 +396,289 @@ def test_provenance_creation_rejects_source_changes_after_build_start(tmp_path):
             expected_source_tree_sha256=initial_digest,
             desktop_exe=desktop,
             web_exe=web,
+        )
+
+
+def test_build_provenance_records_source_version_not_stale_self_package_metadata(tmp_path, monkeypatch):
+    provenance = _provenance_module()
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "fluke8845a-lab"\nversion = "1.1.0"\n',
+        encoding="utf-8",
+    )
+    desktop = tmp_path / "Fluke8845A.exe"
+    web = tmp_path / "Fluke8845A-Web.exe"
+    desktop.write_bytes(b"desktop executable")
+    web.write_bytes(b"web executable")
+    monkeypatch.setattr(provenance, "source_tree_digest", lambda root: "A" * 64)
+    monkeypatch.setattr(
+        provenance,
+        "capture_git_state",
+        lambda root: {"head_commit": "1" * 40, "worktree_dirty": False},
+    )
+    monkeypatch.setattr(
+        provenance,
+        "capture_toolchain",
+        lambda: {
+            "python_version": "3.12.10",
+            "python_implementation": "CPython",
+            "python_architecture": "AMD64",
+            "python_bits": 64,
+            "nuitka_version": "4.1.1",
+            "node_version": "v24.19.0",
+            "compiler_version": "MSVC",
+        },
+    )
+    monkeypatch.setattr(provenance, "dependency_lock_hashes", lambda root: {})
+    monkeypatch.setattr(
+        provenance,
+        "installed_distribution_inventory",
+        lambda: [
+            {"name": "fluke8845a-lab", "version": "1.0.7"},
+            {"name": "PySide6_Essentials", "version": "6.12.0"},
+        ],
+    )
+
+    document = provenance.create_build_provenance(
+        root=tmp_path,
+        candidate_build_name="Fluke8845A_source_version",
+        expected_source_tree_sha256="A" * 64,
+        desktop_exe=desktop,
+        web_exe=web,
+    )
+
+    assert document["project_version"] == "1.1.0"
+    assert document["installed_distributions"] == [
+        {"name": "PySide6_Essentials", "version": "6.12.0"},
+    ]
+    provenance.validate_provenance(
+        document,
+        expected_candidate_build_name="Fluke8845A_source_version",
+        desktop_exe=desktop.read_bytes(),
+        web_exe=web.read_bytes(),
+    )
+
+    source_document = provenance.create_source_provenance(
+        root=tmp_path,
+        candidate_build_name="Fluke8845A_source_version_source",
+    )
+    assert source_document["project_version"] == "1.1.0"
+
+
+def test_build_provenance_records_toolchain_and_lockfile_hashes(tmp_path, monkeypatch):
+    provenance = _provenance_module()
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "fluke8845a-lab"\nversion = "1.1.0"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements-lock.txt").write_bytes(b"desktop dependencies\n")
+    (tmp_path / "requirements-lock-python311.txt").write_bytes(b"Python 3.11 dependencies\n")
+    desktop = tmp_path / "Fluke8845A.exe"
+    web = tmp_path / "Fluke8845A-Web.exe"
+    desktop.write_bytes(b"desktop executable")
+    web.write_bytes(b"web executable")
+    monkeypatch.setattr(provenance, "source_tree_digest", lambda root: "A" * 64)
+    monkeypatch.setattr(
+        provenance,
+        "capture_git_state",
+        lambda root: {"head_commit": "1" * 40, "worktree_dirty": False},
+    )
+    machine = "AMD64"
+    monkeypatch.setattr(provenance.platform, "machine", lambda: machine)
+    installed_distributions = [
+        {"name": "numpy", "version": "2.5.4"},
+        {"name": "pyserial", "version": "3.5"},
+    ]
+    monkeypatch.setattr(
+        provenance,
+        "installed_distribution_inventory",
+        lambda: installed_distributions,
+    )
+
+    def run_tool(command, **kwargs):
+        if command[-3:] == ["-m", "nuitka", "--version"]:
+            return SimpleNamespace(
+                stdout=(
+                    "Nuitka-Version: 4.1.1\n"
+                    "Version C compiler: gcc (GCC) 15.2.0.\n"
+                )
+            )
+        if Path(command[0]).name.lower().startswith("node"):
+            return SimpleNamespace(stdout="v24.19.0\n")
+        raise AssertionError(f"unexpected toolchain command: {command}")
+
+    monkeypatch.setattr(provenance.subprocess, "run", run_tool)
+
+    document = provenance.create_build_provenance(
+        root=tmp_path,
+        candidate_build_name="Fluke8845A_build_metadata",
+        expected_source_tree_sha256="A" * 64,
+        desktop_exe=desktop,
+        web_exe=web,
+    )
+
+    assert document["toolchain"] == {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "python_architecture": machine,
+        "python_bits": struct.calcsize("P") * 8,
+        "nuitka_version": "4.1.1",
+        "node_version": "v24.19.0",
+        "compiler_version": "gcc (GCC) 15.2.0.",
+    }
+    assert document["dependency_lock_sha256"] == {
+        "requirements-lock-python311.txt": hashlib.sha256(
+            b"Python 3.11 dependencies\n"
+        ).hexdigest().upper(),
+        "requirements-lock.txt": hashlib.sha256(
+            b"desktop dependencies\n"
+        ).hexdigest().upper(),
+    }
+    assert document["installed_distributions"] == installed_distributions
+    assert document["project_version"] == "1.1.0"
+
+    source_document = provenance.create_source_provenance(
+        root=tmp_path, candidate_build_name="Fluke8845A_source_build_metadata"
+    )
+    assert source_document["toolchain"] == document["toolchain"]
+    assert source_document["dependency_lock_sha256"] == document["dependency_lock_sha256"]
+    assert source_document["project_version"] == "1.1.0"
+    provenance.validate_provenance(
+        source_document,
+        expected_candidate_build_name="Fluke8845A_source_build_metadata",
+    )
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["abc", "1!!", "1.1", "1.1.0+", "1.1.0-", "01.1.0", "1.1.0-..", "1.1.0-01", "1.1.0+.."],
+)
+def test_source_project_metadata_rejects_invalid_semver(tmp_path, version):
+    provenance = _provenance_module()
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "fluke8845a-lab"\nversion = "{version}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="valid static project version"):
+        provenance.source_project_metadata(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["abc", "1!!", "1.1", "1.1.0+", "1.1.0-", "01.1.0", "1.1.0-..", "1.1.0-01", "1.1.0+.."],
+)
+def test_provenance_rejects_malformed_project_version(version):
+    provenance = _provenance_module()
+    document = {
+        "format_version": 1,
+        "candidate_build_name": "Fluke8845A_invalid_version",
+        "built_at_utc": "2026-10-16T00:00:00Z",
+        "head_commit": "1" * 40,
+        "worktree_dirty": False,
+        "build_source_kind": "commit_tree",
+        "source_tree_sha256": "A" * 64,
+        "source_tree_digest_algorithm": provenance.SOURCE_TREE_DIGEST_ALGORITHM,
+        "executables": {
+            "desktop": {"archive_path": "Fluke8845A.exe", "sha256": "B" * 64},
+            "web": {
+                "archive_path": "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
+                "sha256": "C" * 64,
+            },
+        },
+        "project_version": version,
+    }
+
+    with pytest.raises(ValueError, match="project version is malformed"):
+        provenance.validate_provenance(
+            document,
+            expected_candidate_build_name="Fluke8845A_invalid_version",
+        )
+
+
+def test_toolchain_provenance_keeps_unavailable_optional_tool_versions_null(monkeypatch):
+    provenance = _provenance_module()
+
+    def run_tool(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(provenance.subprocess, "run", run_tool)
+
+    def missing_distribution(name):
+        raise provenance.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(provenance.importlib.metadata, "version", missing_distribution)
+
+    toolchain = provenance.capture_toolchain()
+
+    assert toolchain["python_version"] == platform.python_version()
+    assert toolchain["python_architecture"] == platform.machine()
+    assert toolchain["nuitka_version"] is None
+    assert toolchain["node_version"] is None
+    assert toolchain["compiler_version"] is None
+
+
+def test_legacy_provenance_without_toolchain_or_lock_hashes_remains_valid():
+    provenance = _provenance_module()
+    document = {
+        "format_version": 1,
+        "candidate_build_name": "Fluke8845A_legacy",
+        "built_at_utc": "2026-10-16T00:00:00Z",
+        "head_commit": "1" * 40,
+        "worktree_dirty": False,
+        "build_source_kind": "commit_tree",
+        "source_tree_sha256": "A" * 64,
+        "source_tree_digest_algorithm": provenance.SOURCE_TREE_DIGEST_ALGORITHM,
+        "executables": {
+            "desktop": {"archive_path": "Fluke8845A.exe", "sha256": "B" * 64},
+            "web": {
+                "archive_path": "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
+                "sha256": "C" * 64,
+            },
+        },
+    }
+
+    provenance.validate_provenance(
+        document, expected_candidate_build_name="Fluke8845A_legacy"
+    )
+
+
+def test_provenance_rejects_malformed_optional_toolchain_and_lock_hashes():
+    provenance = _provenance_module()
+    document = {
+        "format_version": 1,
+        "candidate_build_name": "Fluke8845A_invalid_metadata",
+        "built_at_utc": "2026-10-16T00:00:00Z",
+        "head_commit": "1" * 40,
+        "worktree_dirty": False,
+        "build_source_kind": "commit_tree",
+        "source_tree_sha256": "A" * 64,
+        "source_tree_digest_algorithm": provenance.SOURCE_TREE_DIGEST_ALGORITHM,
+        "executables": {
+            "desktop": {"archive_path": "Fluke8845A.exe", "sha256": "B" * 64},
+            "web": {
+                "archive_path": "Fluke8845A-Web.dist/Fluke8845A-Web.exe",
+                "sha256": "C" * 64,
+            },
+        },
+        "toolchain": {"python_version": "3.12.10"},
+        "dependency_lock_sha256": {"requirements-lock.txt": "not-a-sha256"},
+    }
+
+    with pytest.raises(ValueError, match="toolchain metadata"):
+        provenance.validate_provenance(
+            document, expected_candidate_build_name="Fluke8845A_invalid_metadata"
+        )
+
+    document["toolchain"] = {
+        "python_version": "3.12.10",
+        "python_implementation": "CPython",
+        "python_architecture": "AMD64",
+        "python_bits": 64,
+        "nuitka_version": None,
+        "node_version": None,
+        "compiler_version": None,
+    }
+    with pytest.raises(ValueError, match="dependency lock SHA-256"):
+        provenance.validate_provenance(
+            document, expected_candidate_build_name="Fluke8845A_invalid_metadata"
         )

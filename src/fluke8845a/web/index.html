@@ -30,7 +30,7 @@
       <span id="connectionBadge" class="connection-badge"><i></i><span>未连接</span></span>
       <span id="scenarioBadge" class="scenario-badge hidden" role="status" aria-live="polite"></span>
       <button id="reconnectReal" class="button button-header hidden" type="button">重新连接</button>
-      <button id="openFiles" class="button button-header" type="button">实验文件</button>
+      <button id="openFiles" class="button button-header" type="button" aria-label="实验文件">实验文件</button>
       <button id="openSettings" class="button button-header" type="button" aria-keyshortcuts="Control+Alt+Comma" title="打开设置与分析；快捷键 Ctrl+Alt+,">设置与分析</button>
       <button id="shutdownService" class="service-exit" type="button" title="关闭浏览器标签页只会关闭页面；localhost 服务和当前采集仍会继续。使用此按钮才会停止采集并退出服务。">退出服务</button>
     </div>
@@ -60,10 +60,13 @@
       </section>
 
       <section class="action-bar" aria-label="采集控制">
+        <button id="newMeasurement" class="button button-primary" type="button" aria-keyshortcuts="Control+Alt+N" aria-describedby="newMeasurementHint" title="打开实验设置并填写名称，再选单次测量或连续采集。新测量开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键 Ctrl+Alt+N。">新建测量</button>
+        <button id="clearPlot" class="button button-outline" type="button" aria-describedby="newMeasurementHint" title="确认后清除当前图表、统计和事件显示；磁盘上的 CSV 不会删除。">清空图表</button>
         <button id="start" class="button button-primary" type="button" disabled aria-keyshortcuts="Control+Alt+R" title="开始采集；快捷键 Ctrl+Alt+R">开始采集</button>
         <button id="single" class="button button-outline" type="button" disabled>单次测量</button>
         <span class="pause-slot"><button id="pause" class="button button-quiet" type="button" disabled aria-keyshortcuts="Control+Alt+P" title="暂停采集；快捷键 Ctrl+Alt+P">暂停</button><button id="resume" class="button button-quiet hidden" type="button" aria-keyshortcuts="Control+Alt+P" title="继续采集；快捷键 Ctrl+Alt+P">继续</button></span>
         <button id="stop" class="button button-danger" type="button" disabled aria-keyshortcuts="Control+Alt+S" title="停止并保存；快捷键 Ctrl+Alt+S">停止并保存</button>
+        <span id="newMeasurementHint" class="new-measurement-hint">新建测量：点“新建测量”→ 填名称 → 点“单次测量”或“开始连续采集”。新测量开始后自动换图，旧 CSV 保留；“清空图表”只清除显示。</span>
         <span id="acquisitionFeedback" class="acquisition-feedback" role="status" aria-live="polite">尚未开始实验</span>
         <span id="commandStatus" class="command-status hidden" role="status" aria-live="polite"></span>
         <button id="acknowledgeUncertainCommand" class="button button-mini button-danger hidden" type="button" title="先确认仪器和采集状态，再解除重复命令阻止">已核对状态，解除阻止</button>
@@ -71,7 +74,7 @@
         <span id="experimentPath" class="experiment-path">实验目录尚未创建</span>
       </section>
 
-      <details id="applicationShortcutHelp" class="application-shortcut-help"><summary>采集快捷键</summary><p>Ctrl+Alt+R 开始 · Ctrl+Alt+P 暂停/继续 · Ctrl+Alt+S 停止并保存 · Ctrl+Alt+, 打开设置 · Ctrl+Alt+Enter 记录事件</p></details>
+      <details id="applicationShortcutHelp" class="application-shortcut-help"><summary>采集快捷键</summary><p>Ctrl+Alt+N 新建测量 · Ctrl+Alt+R 开始 · Ctrl+Alt+P 暂停/继续 · Ctrl+Alt+S 停止并保存 · Ctrl+Alt+, 打开设置 · Ctrl+Alt+Enter 记录事件</p></details>
 
       <section class="chart-panel">
         <div class="chart-toolbar">
@@ -81,23 +84,13 @@
             <button id="autoScale" class="button button-mini" type="button" title="重设时间轴与读数轴，适配当前数据">自动缩放</button>
             <button id="restoreLive" class="button button-mini hidden" type="button">返回实时</button>
             <button id="resetRealtimeView" class="button button-primary" type="button" title="清除手动缩放并恢复最新 120 秒自动跟随">回到实时窗口</button>
-            <label class="button button-mini file-button">加载 CSV<input id="historyFile" type="file" accept=".csv,text/csv"></label>
-            <label class="button button-mini file-button" title="选择包含 measurements.csv 与 events.csv 的实验文件夹；浏览器只会读取你明确选择的文件夹。">加载实验文件夹<input id="historyDirectory" type="file" webkitdirectory multiple></label>
-            <label class="button button-mini file-button" title="加载与当前测量 CSV 配套的 events.csv；软件会核对 experiment_id">配套事件<input id="eventsHistoryFile" type="file" accept=".csv,text/csv"></label>
-            <span id="historyImportProgress" class="field-hint hidden" role="status" aria-live="polite"></span><button id="cancelHistoryImport" class="button button-mini hidden" type="button">取消导入</button>
-            <button id="downloadCsv" class="button button-mini" type="button" disabled>下载原始 CSV</button>
-            <button id="downloadEventsSafe" class="button button-mini" type="button" disabled title="仅对事件文本做表格软件安全处理；原始 events.csv 不会更改">导出事件安全副本</button>
-            <button id="downloadMeasurementsSafe" class="button button-mini" type="button" disabled title="仅对原始响应和错误文本做表格软件安全处理；原始 measurements.csv 不会更改">导出测量安全副本</button>
-            <button id="downloadSharePackage" class="button button-mini" type="button" disabled title="将最近完成实验导出为脱敏 ZIP；隐藏串口、序列号和本机路径，对公式样式文本加前缀；有效数值保留，数值列中的非数值文本会脱敏，实验原文件不变">导出脱敏分享包</button>
-            <button id="savePlot" class="button button-mini" type="button">保存 PNG</button>
           </div>
-          <div class="safety-note csv-formula-warning" id="csvFormulaExportWarning" role="note"><span class="safety-symbol" aria-hidden="true">!</span><div><strong>CSV 表格公式风险提示</strong><p>原始 CSV 保持不变。以 =、+、- 或 @ 开头的自由文本在 Excel 等表格软件中可能被解释为公式；打开原始文件前，请导出上方的事件/测量安全副本。脱敏分享包会对包内 CSV 文本做公式安全处理，并隐藏设备身份和本机路径。</p></div></div>
         </div>
         <div id="chartContext" class="chart-context">
           <span><i class="legend-line"></i><span id="legendName">原始读数</span></span>
-          <span class="chart-context-actions"><span id="pointCursor">悬停读点</span><span id="chartGestureHint">滚轮读数轴 · Shift 时间轴 · Ctrl 双轴 · Alt 零点锚</span><details id="plotHelp" class="chart-help"><summary>图表操作 · 触屏</summary><p>悬停读取最近数据点；滚轮缩放读数轴，Shift+滚轮缩放时间轴，Ctrl+滚轮同时缩放两轴；Alt+滚轮以零点为锚缩放读数轴。手动缩放或平移任一坐标轴后，自动跟随关闭。鼠标拖动可平移；触屏单指平移、双指缩放。方向键选点、Home/End 跳到首末点、Enter 锁定基准；Alt+方向键平移，+/- 缩放。自动缩放显示全数据；点击“回到实时窗口”恢复最新数据跟随。普通文件选择不能访问同目录的 events.csv；要自动关联，请用“加载实验文件夹”选择包含两者的目录。</p></details></span>
+          <span class="chart-context-actions"><span id="pointCursor">悬停读点</span><span id="chartGestureHint">滚轮读数轴 · Shift 时间轴 · Ctrl 双轴 · Alt 零点锚</span><details id="plotHelp" class="chart-help"><summary>图表操作 · 触屏</summary><p>悬停读取最近数据点；滚轮缩放读数轴，Shift+滚轮缩放时间轴，Ctrl+滚轮同时缩放两轴；Alt+滚轮以零点为锚缩放读数轴。手动缩放或平移任一坐标轴后，自动跟随关闭。鼠标拖动可平移；触屏单指平移、双指缩放。方向键选点、Home/End 跳到首末点、Enter 锁定基准；Alt+方向键平移，+/- 缩放。自动缩放显示全数据；点击“回到实时窗口”恢复最新数据跟随。单独加载测量 CSV 后，可再选择配套 events.csv，软件会核对实验标识；也可用“加载实验文件夹”自动配对同目录文件。</p></details></span>
         </div>
-        <div class="plot-wrap"><canvas id="plot" role="img" tabindex="0" aria-keyshortcuts="ArrowLeft ArrowRight Home End Enter Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown + -" aria-label="测量曲线图；左右方向键选点，Home 和 End 跳到首末点，Enter 锁定基准，Alt 加方向键平移，正负号缩放" aria-describedby="plotAccessibilitySummary"></canvas><canvas id="plotOverlay" class="plot-overlay" aria-hidden="true"></canvas><div id="plotEmpty" class="plot-empty" aria-live="polite"><span class="empty-icon" aria-hidden="true">⌁</span><strong id="emptyTitle">等待连接</strong><span id="emptyDetail">连接 8845A 或先试用模拟器，曲线会显示在这里。</span><div class="empty-actions"><button id="emptyOpenSettings" class="button button-mini" type="button">打开设置</button><button id="emptyConnectMock" class="button button-mini" type="button">连接模拟器</button><button id="emptyStart" class="button button-mini button-primary hidden" type="button">开始采集</button></div></div></div>
+        <div class="plot-wrap"><canvas id="plot" role="img" tabindex="0" aria-keyshortcuts="ArrowLeft ArrowRight Home End Enter Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown + -" aria-label="测量曲线图；左右方向键选点，Home 和 End 跳到首末点，Enter 锁定基准，Alt 加方向键平移，正负号缩放" aria-describedby="plotAccessibilitySummary"></canvas><canvas id="plotOverlay" class="plot-overlay" aria-hidden="true"></canvas><div id="plotEmpty" class="plot-empty" aria-live="polite"><span class="empty-icon" aria-hidden="true">⌁</span><strong id="emptyTitle">等待连接</strong><span id="emptyDetail">连接 8845A 或先试用模拟器，曲线会显示在这里。</span><div class="empty-actions"><button id="emptyNewMeasurement" class="button button-mini button-primary hidden" type="button" title="填写实验名称并选择单次测量或连续采集；开始后自动显示新曲线，旧 CSV 保留。">新建测量</button><button id="emptyOpenSettings" class="button button-mini" type="button">打开设置</button><button id="emptyConnectMock" class="button button-mini" type="button">连接模拟器</button><button id="emptyStart" class="button button-mini button-primary hidden" type="button">开始采集</button></div></div></div>
         <div class="plot-footer"><span id="plotRange">等待数据</span><div class="plot-footer-tools"><span id="bufferNote">完整原始数据逐点保存到 CSV</span><div class="axis-range-control"><label for="yAxisSpan" title="范围按右侧单位输入；最小跨度受计算机浮点精度限制">纵轴跨度</label><input id="yAxisSpan" type="number" min="0" step="any" inputmode="decimal" aria-label="纵轴显示跨度" title="按右侧单位输入。例：单位为 MΩ 时，1e-12 MΩ = 1 µΩ；单位为 Ω 时，1e-6 Ω = 1 µΩ。最小跨度受计算机浮点精度限制，放大不会提升仪表分辨率；只改变图表显示，不修改原始读数。"><span id="yAxisSpanUnit">V</span><button id="applyYAxisSpan" class="button button-mini" type="button" title="按输入跨度缩放纵轴，并保持当前纵轴中心">应用</button></div></div></div>
         <div id="plotAccessibilitySummary" class="sr-only" aria-live="off">测量曲线图。摘要会在聚焦图表时提供当前读数、统计和范围；展开数据表可查看最近测量尝试。</div>
         <details class="accessible-data-table"><summary>曲线数据表（最近 50 条测量尝试）</summary><button id="copyPointTable" class="button button-mini" type="button">复制表格文本</button><div class="table-scroll"><table><thead><tr><th scope="col">样本</th><th scope="col">本地时间</th><th scope="col">原始响应 / 实际量程</th><th scope="col">换算值</th><th scope="col">状态</th></tr></thead><tbody id="pointTableBody"><tr><td colspan="5">等待测量数据</td></tr></tbody></table></div></details>
@@ -141,8 +134,8 @@
               <div id="connectionProgress" class="connection-progress hidden" role="status" aria-live="polite"></div>
               <ol id="connectionStages" class="connection-stages" aria-label="连接步骤"></ol>
               <div class="serial-grid firmware-grid">
-              <label title="从仪表前面板 VERSIONS + SN 页人工核对。*IDN? 修订字段可能是用户自定义内容，不用于固件门槛。400 mA 门槛只依据此处记录的 OutG SW；未知或无法解析不会限制量程。此记录按序列号保存在当前浏览器，不是 SCPI 读取。">OutG SW（面板核对）<input id="outguardSoftware" maxlength="64" placeholder="例如 2.10.882.24" disabled></label>
-                <label title="可选记录前面板显示的 InG SW，随实验配置保存。400 mA 门槛不依据 InG SW。">InG SW（可选记录）<input id="inguardSoftware" maxlength="64" placeholder="例如 ad300210" disabled></label>
+              <label title="从仪表前面板 VERSIONS + SN 页人工核对。*IDN? 修订字段可能是用户自定义内容，不用于固件门槛。DCI 的 400 mA 门槛依据此处记录的 OutG SW；ACI 官方资料未明确 1.0.700.18 门槛对应 OutG SW 还是 InG SW，本软件不根据这两个字段自动拒绝 ACI 400 mA，使用前请在面板核对软件版本。此记录按序列号保存在当前浏览器，不是 SCPI 读取。">OutG SW（面板核对）<input id="outguardSoftware" maxlength="64" placeholder="例如 2.10.882.24" disabled></label>
+                <label title="可选记录前面板显示的 InG SW，随实验配置保存。DCI 固件门槛不依据 InG SW；ACI 官方资料未明确版本门槛对应哪个字段，本软件不根据 OutG SW 或 InG SW 自动拒绝 ACI 400 mA，使用前请在面板核对软件版本。">InG SW（可选记录）<input id="inguardSoftware" maxlength="64" placeholder="例如 ad300210" disabled></label>
               </div>
               <div class="manual-software-row"><span id="manualSoftwareInfo" class="field-hint" role="status">来源：仪表面板人工核对；尚无记录</span><button id="clearManualSoftware" class="text-button" type="button" disabled>清除面板版本记录</button></div>
               <p id="idnFirmwareInfo" class="field-hint" role="status" aria-live="polite">未连接，尚未读取 *IDN?。</p>
@@ -162,7 +155,7 @@
 
             <section id="sectionExperiment" class="panel experiment-panel">
               <div class="section-heading"><div><span class="section-kicker">实验</span><h3>采样与文件</h3></div></div>
-              <label class="stack-label" for="experimentName">实验名称</label><input id="experimentName" type="text" maxlength="100" spellcheck="false"><p id="experimentNameError" class="field-error hidden" role="alert"></p><p class="field-hint">同名实验自动使用独立时间戳目录，不会覆盖已有数据。</p>
+              <label class="stack-label" for="experimentName">实验名称</label><input id="experimentName" type="text" maxlength="100" spellcheck="false"><p id="experimentNameError" class="field-error hidden" role="alert"></p><p class="field-hint">发现同名实验时，开始前可选“覆盖（先备份）”“新建独立目录”“修改名称”或“取消”；不会自动覆盖已有数据。</p>
               <label class="stack-label" for="outputRoot">保存目录</label><input id="outputRoot" type="text" spellcheck="false">
               <div class="interval-row"><label for="interval">目标采样间隔</label><div class="number-with-unit"><input id="interval" type="number" min="0" max="86400" step="0.001" value="1"><span>秒</span></div></div>
               <p class="field-hint">0 表示每次仪器读数后不额外等待；实际速度受测量设置与串口影响。</p>
@@ -216,7 +209,7 @@
         <details id="sectionDiagnostics" class="panel log-panel"><summary><span>SCPI 通信与运行日志</span><span id="logCount" class="log-count">0 条</span></summary><div class="log-actions"><label for="logFilter">筛选<select id="logFilter"><option value="all">全部日志</option><option value="error">错误</option><option value="scpi">SCPI 命令</option><option value="connection">连接</option><option value="acquisition">采集</option></select></label><button id="exportLogs" class="button button-mini" type="button">导出当前筛选</button></div><div id="logList" class="log-list"><div class="empty-log">连接设备后显示通信和运行信息。</div></div></details>
         </div>
       </div>
-      <footer class="dialog-footer"><span id="settingsApplyHint" role="status">采集前修改参数，再应用仪器参数。</span><div class="dialog-footer-actions"><button id="applySettings" class="button button-primary" type="button">应用仪器参数</button><button id="applySpeed" class="button button-outline" type="button">应用速度</button><button id="closeSettings" class="button button-quiet" type="button">关闭</button></div></footer>
+      <footer class="dialog-footer"><span id="settingsApplyHint" role="status">填写实验名称后，可在这里直接开始；新曲线自动替换显示，原始 CSV 保留。</span><div class="dialog-footer-actions"><button id="singleFromSettings" class="button button-outline" type="button" disabled title="通过预检后进行一次测量">单次测量</button><button id="startFromSettings" class="button button-primary" type="button" disabled title="通过预检后开始连续采集">开始连续采集</button><button id="applySettings" class="button button-outline" type="button">应用仪器参数</button><button id="applySpeed" class="button button-outline" type="button">应用速度</button><button id="closeSettings" class="button button-quiet" type="button">关闭</button></div></footer>
     </div>
   </dialog>
   <dialog id="filesDialog" class="files-dialog" aria-labelledby="filesTitle">
@@ -224,6 +217,31 @@
     <p id="filesDirectory" class="files-directory">实验目录尚未创建</p>
     <p id="filesStatus" class="field-hint" role="status" aria-live="polite">开始或完成一次实验后，文件会显示在这里。</p>
     <ul id="filesList" class="files-list" aria-label="实验目录文件"></ul>
+    <section class="files-workspace-section" aria-labelledby="filesImportTitle">
+      <h3 class="files-section-heading" id="filesImportTitle">导入历史文件</h3>
+      <p class="files-section-hint">加载测量 CSV 后，可单独选择配套 events.csv（会核对实验标识）；也可选择实验文件夹自动配对同目录文件。</p>
+      <div id="filesImportActions" class="files-import-area">
+        <div class="files-action-grid">
+          <label class="button button-mini file-button">加载测量 CSV<input id="historyFile" type="file" accept=".csv,text/csv"></label>
+          <label class="button button-mini file-button" title="选择包含 measurements.csv 与 events.csv 的实验文件夹；浏览器只会读取你明确选择的文件夹。">加载实验文件夹<input id="historyDirectory" type="file" webkitdirectory multiple></label>
+          <label class="button button-mini file-button" title="加载与当前测量 CSV 配套的 events.csv；软件会核对 experiment_id">单独加载事件 CSV<input id="eventsHistoryFile" type="file" accept=".csv,text/csv"></label>
+        </div>
+        <div class="files-import-progress-row"><span id="historyImportProgress" class="field-hint files-import-progress hidden" role="status" aria-live="polite"></span><button id="cancelHistoryImport" class="button button-mini hidden" type="button">取消导入</button></div>
+      </div>
+    </section>
+    <section id="filesExportActions" class="files-workspace-section" aria-labelledby="filesExportTitle">
+      <h3 class="files-section-heading" id="filesExportTitle">导出结果</h3>
+      <p class="files-section-hint">导出当前或最近一次实验的数据副本、分享包和曲线图。</p>
+      <ul id="filesExportResults" class="files-export-results" aria-label="本次会话最近导出结果"></ul>
+      <div class="files-action-grid">
+        <button id="downloadCsv" class="button button-mini" type="button" disabled>下载原始 CSV</button>
+        <button id="downloadEventsSafe" class="button button-mini" type="button" disabled title="仅对事件文本做表格软件安全处理；原始 events.csv 不会更改">导出事件安全副本</button>
+        <button id="downloadMeasurementsSafe" class="button button-mini" type="button" disabled title="仅对原始响应和错误文本做表格软件安全处理；原始 measurements.csv 不会更改">导出测量安全副本</button>
+        <button id="downloadSharePackage" class="button button-mini" type="button" disabled title="将最近完成实验导出为脱敏 ZIP；隐藏串口、序列号和本机路径，对公式样式文本加前缀；有效数值保留，数值列中的非数值文本会脱敏，实验原文件不变">导出脱敏分享包</button>
+        <button id="savePlot" class="button button-mini" type="button">保存 PNG 曲线</button>
+      </div>
+      <div class="safety-note csv-formula-warning" id="csvFormulaExportWarning" role="note"><span class="safety-symbol" aria-hidden="true">!</span><div><strong>CSV 表格公式风险提示</strong><p>原始 CSV 保持不变。以 =、+、- 或 @ 开头的自由文本在 Excel 等表格软件中可能被解释为公式；打开原始文件前，请使用本区的事件/测量安全副本。脱敏分享包会对包内 CSV 文本做公式安全处理，并隐藏设备身份和本机路径。</p></div></div>
+    </section>
     <footer class="files-dialog-footer"><button id="openFilesDirectory" class="button button-outline" type="button" disabled>在资源管理器中打开</button><button id="closeFiles" class="button button-primary" type="button">关闭</button></footer>
   </dialog>
   <dialog id="duplicateRunDialog" class="duplicate-dialog" aria-labelledby="duplicateRunTitle" aria-describedby="duplicateRunDescription">

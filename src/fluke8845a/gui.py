@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import csv
+import heapq
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QObject, QRunnable, QSignalBlocker, QStandardPaths, Qt, QThread, QThreadPool, QTimer,
+    QEvent, QObject, QRunnable, QSignalBlocker, QStandardPaths, Qt, QThread, QThreadPool, QTimer,
     Signal, Slot, QPointF, QRectF, QUrl,
 )
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QKeySequence, QPainter, QPen, QColor, QPixmap
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
     QApplication, QBoxLayout, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSpinBox, QStatusBar, QVBoxLayout, QWidget,
-    QTabWidget, QToolButton, QStackedLayout, QGridLayout,
+    QTabWidget, QToolButton, QStackedLayout, QGridLayout, QToolBar, QButtonGroup,
 )
 
 import numpy as np
@@ -35,7 +36,11 @@ import pyqtgraph as pg
 from . import __version__
 from .analysis import RunningStats, engineering_value, relative_change_percent, summarize
 from .build_identity import desktop_build_label
-from .filter_policy import digital_filter_enable_error
+from .filter_policy import (
+    DIGITAL_FILTER_INFO,
+    digital_filter_enable_error,
+    digital_filter_firmware_support,
+)
 from .history_import import load_history_csv, load_history_csv_range
 from .modes import (
     DESCRIPTORS, Mode, descriptor, mode_from_scpi_function,
@@ -45,12 +50,13 @@ from .mock import MockScenario
 from .plot_history import downsample_plot_data
 from .scpi import (
     FlowControl, InstrumentIdentityError, ModeSettings, SerialSettings,
-    current_autorange_block_reason,
+    current_autorange_block_reason, current_firmware_gate_evidence_note,
     parse_idn, select_range_firmware,
     unsupported_current_ranges,
 )
 from .versioning import compare_firmware
 from .share_export import export_share_package
+from .state import AcquisitionState
 from .storage import (
     complete_csv_prefix_size, find_existing_experiment_directories,
     estimate_recording_capacity_seconds, format_available_space,
@@ -65,6 +71,11 @@ log = logging.getLogger(__name__)
 _REGISTERED_UI_FONT_IDS: list[int] = []
 AUTO_FOLLOW_WINDOW_S = 120.0
 AUTO_FOLLOW_MIN_WINDOW_S = 10.0
+VOLTAGE_PLOT_ABSOLUTE_LIMIT_V = 1000.0
+MAX_LIVE_RENDER_POINTS = 12_000
+EVENT_MARKER_ASYNC_THRESHOLD = 256
+EVENT_MARKER_BATCH_SIZE = 64
+EVENT_MARKER_BATCH_INTERVAL_MS = 1
 
 
 def _classify_log_message(message: str) -> str:
@@ -192,6 +203,21 @@ def _plot_y_view_limits(min_y: float, max_y: float) -> tuple[float, float]:
     return max(-finite_bound, center - finite_bound), min(finite_bound, center + finite_bound)
 
 
+def _voltage_plot_value_is_visible(value: float) -> bool:
+    return math.isfinite(value) and abs(value) <= VOLTAGE_PLOT_ABSOLUTE_LIMIT_V
+
+
+def _mode_plot_y_view_limits(
+    mode: Mode | str, origin: float, min_y: float, max_y: float,
+) -> tuple[float, float]:
+    """Return local ViewBox limits while keeping voltage's absolute viewport within ±1000 V."""
+    if descriptor(mode).quantity == "voltage":
+        limit = VOLTAGE_PLOT_ABSOLUTE_LIMIT_V
+        safe_origin = origin if math.isfinite(origin) and abs(origin) <= limit else 0.0
+        return -limit - safe_origin, limit - safe_origin
+    return _plot_y_view_limits(min_y, max_y)
+
+
 def _engineering_axis_scale(span: float, unit_si: str) -> tuple[float, str]:
     """Choose an engineering unit from the visible span, not the raw baseline."""
     base_unit = "Ω" if unit_si == "Ohm" else unit_si
@@ -278,17 +304,15 @@ def _format_sampling_interval(rate_hz: float) -> str:
 
 
 def _wheel_zoom_axes(modifiers) -> tuple[bool, bool]:
-    if modifiers & Qt.KeyboardModifier.AltModifier:
-        return False, True
     if modifiers & Qt.KeyboardModifier.ControlModifier:
-        return True, True
+        return False, True
     if modifiers & Qt.KeyboardModifier.ShiftModifier:
         return True, False
-    return False, True
+    return True, True
 
 
 class _MeasurementViewBox(pg.ViewBox):
-    """Wheel zoom: Y by default, Shift=X, Ctrl=both, Alt=Y around zero."""
+    """Wheel zoom: both axes by default, Shift=X, Ctrl=Y; Alt has no special mapping."""
 
     userZoomed = Signal(bool, bool)
     rebaseRequested = Signal(float, object)
@@ -298,10 +322,21 @@ class _MeasurementViewBox(pg.ViewBox):
         super().__init__(*args, **kwargs)
         self.zero_y = 0.0
         self.y_anchor_tolerance = 0.0
+        self.pan_x_data_bounds: tuple[float, float] | None = None
         self.pan_y_data_bounds: tuple[float, float] | None = None
         self.y_anchor_provider = None
         self._last_zoom_rebase_changed = False
         self._last_zoom_rebase_delta = 0.0
+
+    def set_pan_x_data_bounds(self, bounds: tuple[float, float] | None) -> None:
+        if bounds is None:
+            self.pan_x_data_bounds = None
+            return
+        lower, upper = (float(value) for value in bounds)
+        if math.isfinite(lower) and math.isfinite(upper) and lower <= upper:
+            self.pan_x_data_bounds = (lower, upper)
+        else:
+            self.pan_x_data_bounds = None
 
     def set_pan_y_data_bounds(self, bounds: tuple[float, float] | None) -> None:
         if bounds is None:
@@ -313,29 +348,35 @@ class _MeasurementViewBox(pg.ViewBox):
         else:
             self.pan_y_data_bounds = None
 
+    def _clamp_pan_delta(self, axis: int, delta, bounds: tuple[float, float] | None):
+        if bounds is None or delta is None or not math.isfinite(float(delta)):
+            return delta
+        view_low, view_high = self.targetRange()[axis]
+        span = float(view_high - view_low)
+        center = float(view_low / 2 + view_high / 2)
+        if not math.isfinite(span) or span <= 0 or not math.isfinite(center):
+            return delta
+
+        # Keep part of the data envelope visible during panning, while allowing
+        # the zoom range itself to remain unchanged.
+        center_margin = span * 0.3
+        desired_center = center + float(delta)
+        min_center = bounds[0] - center_margin
+        max_center = bounds[1] + center_margin
+        if not all(math.isfinite(value) for value in (desired_center, min_center, max_center)):
+            return delta
+        adjusted_center = min(max(desired_center, min_center), max_center)
+        return adjusted_center - center
+
     def translateBy(self, t=None, x=None, y=None) -> None:
-        bounds = self.pan_y_data_bounds
-        if bounds is not None:
-            tuple_translation = t is not None
-            if tuple_translation:
-                x, y = t[0], t[1]
-            if y is not None and math.isfinite(float(y)):
-                view_low, view_high = self.targetRange()[1]
-                span = float(view_high - view_low)
-                center = float(view_low / 2 + view_high / 2)
-                if math.isfinite(span) and span > 0 and math.isfinite(center):
-                    # Keep part of the data envelope visible during panning,
-                    # while allowing the zoom range itself to remain unbounded.
-                    center_margin = span * 0.3
-                    desired_center = center + float(y)
-                    min_center = bounds[0] - center_margin
-                    max_center = bounds[1] + center_margin
-                    if all(math.isfinite(value) for value in (desired_center, min_center, max_center)):
-                        adjusted_center = min(max(desired_center, min_center), max_center)
-                        y = adjusted_center - center
-                        if tuple_translation:
-                            t = (x, y)
-                            x = y = None
+        tuple_translation = t is not None
+        if tuple_translation:
+            x, y = t[0], t[1]
+        x = self._clamp_pan_delta(0, x, self.pan_x_data_bounds)
+        y = self._clamp_pan_delta(1, y, self.pan_y_data_bounds)
+        if tuple_translation:
+            t = (x, y)
+            x = y = None
         super().translateBy(t=t, x=x, y=y)
 
     def _scale_y_by(self, factor: float, center_y: float) -> None:
@@ -403,14 +444,15 @@ class _MeasurementViewBox(pg.ViewBox):
             return
         modifiers = event.modifiers()
         zoom_x, zoom_y = _wheel_zoom_axes(modifiers)
+        if zoom_x:
+            self.enableAutoRange(x=False)
         if zoom_y:
             # Resolve a pending live auto-range and take manual control before
             # mapping the cursor anchor or applying this wheel step. Disabling
             # auto-range after scaling can execute that pending update and erase
             # the very zoom this event just requested.
             self.enableAutoRange(y=False)
-        zoom_sensitivity = 0.18 if modifiers & Qt.KeyboardModifier.AltModifier else 0.9
-        factor = math.exp(-float(delta) / 120.0 * zoom_sensitivity)
+        factor = math.exp(-float(delta) / 120.0 * 0.9)
         scene_position = event.scenePos()
         center = self.mapSceneToView(scene_position)
         scene_bounds = self.sceneBoundingRect()
@@ -426,7 +468,7 @@ class _MeasurementViewBox(pg.ViewBox):
             center.setY(y_min + (y_max - y_min) / 2)
         has_curve_anchor = False
         absolute_curve_anchor = None
-        if zoom_y and not (modifiers & Qt.KeyboardModifier.AltModifier):
+        if zoom_y:
             # Anchor vertical zoom to a recorded sample near the pointer's
             # time. A linearly interpolated value is only a display estimate;
             # rebasing to it can leave a sub-ULP residual around a large
@@ -442,7 +484,7 @@ class _MeasurementViewBox(pg.ViewBox):
                 absolute_curve_anchor = None
                 center.setY(y_min / 2 + y_max / 2)
         # Use one stable wheel mapping across the plot and its axis items:
-        # plain/Alt zoom Y, Shift zooms time, and Ctrl zooms both. PyQtGraph
+        # plain zooms both axes, Shift zooms time, and Ctrl zooms Y only. PyQtGraph
         # forwards axis-item events with an axis index, which otherwise makes
         # a plain wheel over the time ticks appear to stop vertical zooming.
         if zoom_x and not math.isfinite(center.x()):
@@ -452,24 +494,21 @@ class _MeasurementViewBox(pg.ViewBox):
         x_factor = factor if zoom_x else 1.0
         y_factor = factor if zoom_y else 1.0
         if zoom_y and factor < 1.0:
-            y_anchor = self.zero_y if modifiers & Qt.KeyboardModifier.AltModifier else center.y()
+            y_anchor = center.y()
             y_min, y_max = self.viewRange()[1]
             reference = max(abs(y_anchor), abs(y_min), abs(y_max))
             floor = math.ulp(reference)
             if (y_max - y_min) * factor < floor * 16:
                 self._last_zoom_rebase_changed = False
                 self._last_zoom_rebase_delta = 0.0
-                absolute_anchor = 0.0 if modifiers & Qt.KeyboardModifier.AltModifier else absolute_curve_anchor
-                self.rebaseRequested.emit(float(y_anchor), absolute_anchor)
+                self.rebaseRequested.emit(float(y_anchor), absolute_curve_anchor)
                 if self._last_zoom_rebase_changed:
                     # Rebasing changes only the Y data origin. Preserve the
                     # selected vertical anchor using the actual origin delta;
                     # remapping the mouse position here would replace a sample
                     # anchor with the cursor's screen Y for Ctrl+wheel.
                     center.setY(center.y() - self._last_zoom_rebase_delta)
-        if modifiers & Qt.KeyboardModifier.AltModifier:
-            center.setY(self.zero_y)
-        elif not has_curve_anchor and abs(center.y()) <= self.y_anchor_tolerance:
+        if not has_curve_anchor and abs(center.y()) <= self.y_anchor_tolerance:
             # Qt's scene-to-view transform can accumulate sub-ULP drift at a
             # fixed mouse position. Snap only fallback coordinates too small
             # to distinguish from the plotted origin; a curve-provided sample
@@ -1180,6 +1219,7 @@ class WiringConfirmationDialog(QDialog):
         current_range_si: float | None = None, autorange: bool = True,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("wiringConfirmationDialog")
         self.instructions = instructions
         self.setWindowTitle("确认测量接线")
         self.setModal(True)
@@ -1202,7 +1242,7 @@ class WiringConfirmationDialog(QDialog):
         layout.addWidget(self.schematic, 1)
         self.note_label = QLabel("示意图依据 Fluke 8845A《Users Manual》中文本第 4-4、4-9 至 4-11 页整理。SCPI可回读量程与FRONT/REAR，不能确认表笔接入哪个电流孔，也不能检测保险丝或外部回路。")
         self.note_label.setWordWrap(True)
-        self.note_label.setStyleSheet("color: #687386;")
+        self.note_label.setStyleSheet("color: #596762;")
         layout.addWidget(self.note_label)
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("我已断电并核对接线")
@@ -1292,6 +1332,10 @@ class MainWindow(QMainWindow):
         self._connection_stage_status: dict[str, tuple[str, str]] = {}
         self._last_run_single = False
         self._user_stop_pending = False
+        self._new_measurement_after_save = False
+        self._new_measurement_stop_finished = False
+        self._new_measurement_save_succeeded = False
+        self._new_measurement_save_directory = ""
         self._experiment_name_valid = True
         self._active_port = ""
         self._has_connected_before = False
@@ -1332,6 +1376,7 @@ class MainWindow(QMainWindow):
         self._safe_events_export_task: _SafeEventsExportTask | None = None
         self._safe_measurements_export_task: _SafeMeasurementsExportTask | None = None
         self._share_export_task: _SharePackageExportTask | None = None
+        self._file_export_results: list[tuple[str, str]] = []
         self._region_stats_request_id = 0
         self._region_stats_tasks: dict[int, _RegionStatisticsTask] = {}
         self._region_stats_scanning = False
@@ -1343,6 +1388,13 @@ class MainWindow(QMainWindow):
         self._region_stats_bounds: tuple[float, float] | None = None
         self._event_lines: list = []
         self._event_labels: list = []
+        self._pending_event_markers: list[tuple[float, str]] = []
+        self._pending_event_marker_index = 0
+        self._event_markers_loading = False
+        self._event_marker_timer = QTimer(self)
+        self._event_marker_timer.setSingleShot(True)
+        self._event_marker_timer.setInterval(EVENT_MARKER_BATCH_INTERVAL_MS)
+        self._event_marker_timer.timeout.connect(self._append_event_marker_batch)
         self._last_elapsed = 0.0
         self._global_stats = {"count": 0, "minimum": None, "maximum": None, "mean": None, "sample_stddev": None}
         self._crosshair_x = None
@@ -1403,6 +1455,7 @@ class MainWindow(QMainWindow):
         self._worker.connection_stage.connect(self._on_connection_stage)
         self._worker.control_mode_changed.connect(self._on_control_mode_changed)
         self._worker.control_mode_result.connect(self._on_control_mode_result)
+        self._worker.acquisition_state_changed.connect(self._on_acquisition_state_changed)
         self._worker.status_changed.connect(self._on_status)
         self._worker.log_line.connect(self._append_log)
         self._worker.scpi_logs_ready.connect(self._on_scpi_logs_ready)
@@ -1468,25 +1521,6 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.brand_icon)
         header_layout.addLayout(title_stack)
         header_layout.addStretch(1)
-        navigation_layout = QHBoxLayout()
-        navigation_layout.setContentsMargins(0, 0, 0, 0)
-        navigation_layout.setSpacing(4)
-        navigation_buttons = (
-            ("通讯", "communicationsNavigation", "communications"),
-            ("采集", "acquisitionNavigation", "acquisition"),
-            ("分析", "analysisNavigation", "analysis"),
-            ("实验文件", "experimentFilesNavigation", "files"),
-            ("诊断日志", "diagnosticsNavigation", "diagnostics"),
-        )
-        for label, object_name, section in navigation_buttons:
-            button = QPushButton(label)
-            button.setObjectName(object_name)
-            button.setProperty("class", "secondaryButton")
-            button.setToolTip(f"打开{label}工作区")
-            button.clicked.connect(lambda _checked=False, page=section: self._navigate_workspace(page))
-            navigation_layout.addWidget(button)
-            setattr(self, f"{section}NavigationButton", button)
-        header_layout.addLayout(navigation_layout)
         self.connection_badge = QLabel("未连接")
         self.connection_badge.setObjectName("connectionBadge")
         self.connection_badge.setMinimumHeight(32)
@@ -1499,6 +1533,7 @@ class MainWindow(QMainWindow):
         self.instrument_readback_status = QLabel("未连接")
         self.instrument_readback_status.setObjectName("instrumentReadbackBadge")
         self.instrument_readback_status.setMinimumHeight(32)
+        self.instrument_readback_status.hide()
         header_layout.addWidget(self.instrument_readback_status)
         root_layout.addWidget(header)
 
@@ -1518,6 +1553,29 @@ class MainWindow(QMainWindow):
         dialog_title = QLabel("仪器与实验设置")
         dialog_title.setObjectName("dialogTitle")
         dialog_heading.addWidget(dialog_title)
+        self.configuration_nav_group = QButtonGroup(self)
+        self.configuration_nav_group.setExclusive(True)
+        self.configuration_nav_buttons: dict[str, QToolButton] = {}
+        for key, label in (
+            ("communications", "通信"),
+            ("measurement", "测量"),
+            ("experiment", "实验"),
+            ("analysis", "分析总览"),
+            ("chart", "曲线设置"),
+        ):
+            button = QToolButton(self.configuration_dialog)
+            button.setObjectName(f"configurationSection_{key}")
+            button.setText(label)
+            button.setProperty("class", "secondaryButton")
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            button.setAccessibleName(f"{label}设置")
+            self.configuration_nav_group.addButton(button)
+            button.clicked.connect(
+                lambda _checked=False, section=key: self._select_configuration_section(section)
+            )
+            self.configuration_nav_buttons[key] = button
+            dialog_heading.addWidget(button)
         dialog_heading.addStretch(1)
         close_settings = QPushButton("完成")
         close_settings.setObjectName("secondaryButton")
@@ -1535,11 +1593,14 @@ class MainWindow(QMainWindow):
         self.workspace_stack.addWidget(setup_scroll)
         self.workspace_stack.addWidget(self.analysis_tabs)
         dialog_layout.addLayout(self.workspace_stack, 1)
+        self._sync_configuration_navigation()
+        self.configuration_dialog.installEventFilter(self)
 
         self.files_dialog = QDialog(self)
         self.files_dialog.setObjectName("experimentFilesDialog")
         self.files_dialog.setWindowTitle("实验文件")
         self.files_dialog.resize(760, 540)
+        self.files_dialog.installEventFilter(self)
         files_layout = QVBoxLayout(self.files_dialog)
         files_heading = QLabel("实验文件与导出结果")
         files_heading.setObjectName("dialogTitle")
@@ -1550,10 +1611,17 @@ class MainWindow(QMainWindow):
         self.files_directory_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.files_directory_label.setWordWrap(True)
         files_layout.addWidget(self.files_directory_label)
+        files_layout.addWidget(QLabel("实验目录文件"))
         self.experiment_file_list = QListWidget()
         self.experiment_file_list.setObjectName("experimentFileList")
         self.experiment_file_list.setAccessibleName("当前实验文件和导出结果")
         files_layout.addWidget(self.experiment_file_list, 1)
+        files_layout.addWidget(QLabel("最近导出结果（本次运行）"))
+        self.files_export_results_list = QListWidget()
+        self.files_export_results_list.setObjectName("fileExportResultsList")
+        self.files_export_results_list.setAccessibleName("本次运行导出的文件及保存路径")
+        self.files_export_results_list.setMaximumHeight(88)
+        files_layout.addWidget(self.files_export_results_list)
         files_actions = QGridLayout()
         self.refresh_files_button = QPushButton("刷新列表")
         self.refresh_files_button.clicked.connect(self._refresh_file_workspace)
@@ -1607,25 +1675,194 @@ class MainWindow(QMainWindow):
         self.critical_error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.critical_error_label.hide()
         self.statusBar().addPermanentWidget(self.critical_error_label, 1)
+
+        self.navigation_toolbar = QToolBar("工作区导航", self)
+        self.navigation_toolbar.setObjectName("workspaceNavigationToolbar")
+        self.navigation_toolbar.setMovable(False)
+        self.navigation_toolbar.setFloatable(False)
+        self.navigation_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.navigation_toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.navigation_toolbar)
+        self.navigation_buttons: dict[str, QToolButton] = {}
+        self._navigation_button_group = QButtonGroup(self)
+        self._navigation_button_group.setExclusive(True)
+        navigation_items = (
+            ("communications", "通信", "communicationsNavigation", "串口连接、仪器识别与 SCPI 日志"),
+            ("acquisition", "采集", "acquisitionNavigation", "返回实时读数和采集曲线"),
+            ("analysis", "分析", "analysisNavigation", "数据分析、基准值和曲线设置"),
+            ("files", "实验文件", "experimentFilesNavigation", "查看当前实验文件、加载历史 CSV 或导出"),
+            ("diagnostics", "诊断日志", "diagnosticsNavigation", "打开通信和 SCPI 日志；仪器诊断可从“仪器”菜单运行"),
+        )
+        for section, text, object_name, tooltip in navigation_items:
+            button = QToolButton(self.navigation_toolbar)
+            button.setObjectName(object_name)
+            button.setText(text)
+            button.setToolTip(tooltip)
+            button.setAccessibleName(f"{text}工作区")
+            button.setCheckable(True)
+            button.setAutoRaise(True)
+            self._navigation_button_group.addButton(button)
+            self.navigation_toolbar.addWidget(button)
+            button.clicked.connect(
+                lambda _checked=False, target=section: self._navigate_workspace(target)
+            )
+            self.navigation_buttons[section] = button
+        self.navigation_toolbar.addSeparator()
+        self.new_measurement_button = QPushButton("新建测量")
+        self.new_measurement_button.setObjectName("newMeasurementButton")
+        self.new_measurement_button.setProperty("class", "primaryButton")
+        self.new_measurement_button.setAccessibleName("新建测量；开始后自动显示新曲线")
+        self.new_measurement_button.setMinimumWidth(146)
+        self.new_measurement_button.setFixedHeight(36)
+        self.new_measurement_button.setToolTip(
+            "打开新实验设置并填写名称，然后选择单次测量或连续采集。"
+            "开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键：Ctrl+N。"
+        )
+        self.new_measurement_button.clicked.connect(self._open_new_measurement_setup)
+        self._measurement_action_layout.insertWidget(0, self.new_measurement_button)
+        self.clear_plot_button = QPushButton("清空图表")
+        self.clear_plot_button.setObjectName("clearPlotButton")
+        self.clear_plot_button.setAccessibleName("清空当前图表显示，不删除已保存数据")
+        self.clear_plot_button.setMinimumWidth(112)
+        self.clear_plot_button.setFixedHeight(36)
+        self.clear_plot_button.setToolTip(
+            "确认后清除当前图表、统计和事件标记；已保存的 measurements.csv 和 events.csv 不会删除。"
+        )
+        self.clear_plot_button.clicked.connect(self._clear_plot_from_ui)
+        self._measurement_action_layout.insertWidget(1, self.clear_plot_button)
         self.configuration_button = QPushButton("设置与分析…")
-        self.configuration_button.setObjectName("secondaryButton")
-        self.configuration_button.setToolTip("打开串口、测量、实验、分析及日志设置。快捷键：Ctrl+,")
+        self.configuration_button.setObjectName("configurationNavigation")
+        self.configuration_button.setFixedHeight(30)
+        self.configuration_button.setToolTip("打开仪器、采集、曲线、分析及日志设置。快捷键：Ctrl+,")
+        self.configuration_button.setAccessibleName("打开设置与分析")
         self.configuration_button.clicked.connect(self._show_configuration)
-        header_layout.addWidget(self.configuration_button)
+        self.configuration_navigation_action = self.navigation_toolbar.addWidget(
+            self.configuration_button
+        )
+        self.navigation_buttons["acquisition"].setChecked(True)
         self.statusBar().setSizeGripEnabled(False)
 
         self._build_log_dock()
         self._build_menus()
         self.log_dock.toggleViewAction().setText("显示通信日志面板")
 
+    def _record_file_export_result(self, label: str, destination: str | Path) -> None:
+        path_text = str(destination)
+        self._file_export_results.insert(0, (label, path_text))
+        del self._file_export_results[10:]
+        if not hasattr(self, "files_export_results_list"):
+            return
+        self.files_export_results_list.clear()
+        for result_label, result_path in self._file_export_results:
+            item = QListWidgetItem(f"{result_label} · {Path(result_path).name}")
+            item.setToolTip(result_path)
+            self.files_export_results_list.addItem(item)
+
     def _show_configuration(self) -> None:
+        self.files_dialog.hide()
+        if hasattr(self, "navigation_buttons"):
+            target = "analysis" if self.workspace_stack.currentIndex() == 1 else "communications"
+            self.navigation_buttons[target].setChecked(True)
         self._fit_configuration_dialog()
         self.configuration_dialog.show()
         self.configuration_dialog.raise_()
         self.configuration_dialog.activateWindow()
+        QTimer.singleShot(0, self._update_plot_toolbar_layout)
+
+    @staticmethod
+    def _suggest_experiment_name(mode: Mode) -> str:
+        """Build a short, sortable default name; storage still guarantees unique run directories."""
+        return f"实验_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{mode.value}"
+
+    def _open_new_measurement_setup(self) -> None:
+        """Open the experiment settings used to name and start a fresh run."""
+        if self._history_load_pending:
+            self.statusBar().showMessage("历史 CSV 正在后台加载，完成后可新建测量。", 8000)
+            return
+        if self._new_measurement_after_save:
+            self.statusBar().showMessage("当前采集正在停止并保存，完成后会自动打开新测量设置。", 8000)
+            return
+        if self._acquiring:
+            answer = QMessageBox.question(
+                self,
+                "停止并新建测量？",
+                "将先停止并保存当前实验，再打开新测量设置。当前曲线和已保存 CSV 会保留到新测量开始；"
+                "选择“否”会继续当前采集。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._new_measurement_after_save = True
+            self._new_measurement_stop_finished = False
+            self._new_measurement_save_succeeded = False
+            self._update_controls()
+            self._stop()
+            return
+        if self._experiment_active or self._start_pending:
+            self.statusBar().showMessage(
+                "当前实验正在收尾并保存，完成后可新建测量。当前曲线和 CSV 已保留。", 8000
+            )
+            return
+        self.experiment_name.setText(self._suggest_experiment_name(self._current_mode))
+        self._set_configuration_workspace(0)
+        self._show_setup_section(2)
+        self._show_configuration()
+        QTimer.singleShot(0, self.experiment_name.setFocus)
+        QTimer.singleShot(0, self.experiment_name.selectAll)
+
+    def _start_from_configuration(self, *, one_shot: bool) -> None:
+        """Start a run from the experiment settings and return to the live plot."""
+        pending_before_start = self._start_pending
+        self.configuration_dialog.hide()
+        self.raise_()
+        self.activateWindow()
+        try:
+            self._start(one_shot=one_shot)
+        except Exception as exc:
+            self._start_pending = pending_before_start
+            self._update_controls()
+            self.preflight_status.setText(f"启动失败：{exc}")
+            self._show_error(str(exc))
+        finally:
+            if not self._start_pending:
+                self.configuration_dialog.show()
+                self.configuration_dialog.raise_()
+                self.configuration_dialog.activateWindow()
+
+    def _clear_plot_from_ui(self) -> None:
+        """Clear only the current in-memory chart; saved experiment files are untouched."""
+        if self._history_load_pending:
+            self.statusBar().showMessage("历史 CSV 正在后台加载，完成后再清空图表。", 8000)
+            return
+        if self._acquiring or self._experiment_active or self._start_pending:
+            self.statusBar().showMessage(
+                "请先停止并保存当前实验，再清空图表。当前 CSV 不会被删除。", 8000
+            )
+            return
+        if not self._plot_x and not self._history_mode:
+            self.statusBar().showMessage("当前没有可清空的曲线。", 5000)
+            return
+        self._clear_plot()
+        self.plot_empty_title.setText("曲线已清空")
+        self.plot_empty_hint.setText(
+            "重新测量：点“新建测量”填写名称并选择单次或连续采集。"
+            "新测量开始后自动换图，旧实验 CSV 保留；无需先清空。"
+        )
+        self.plot_empty_new_measurement_button.show()
+        self._return_to_live_view()
+        self._update_controls()
+        self.statusBar().showMessage(
+            "图表显示已清空；已保存的 measurements.csv 和 events.csv 未删除，可用“加载 CSV”恢复。",
+            10000,
+        )
 
     def _navigate_workspace(self, section: str) -> None:
-        """Expose primary work areas in one shallow navigation row."""
+        """Open a task workspace and keep the top-level navigation in sync."""
+        navigation_section = "analysis" if section == "chart" else section
+        if navigation_section not in self.navigation_buttons:
+            navigation_section = "communications"
+        self.navigation_buttons[navigation_section].setChecked(True)
         if section == "acquisition":
             self.configuration_dialog.hide()
             self.files_dialog.hide()
@@ -1641,24 +1878,67 @@ class MainWindow(QMainWindow):
             self.files_dialog.activateWindow()
             return
         if section == "diagnostics":
+            self.configuration_dialog.hide()
+            self.files_dialog.hide()
+            self.raise_()
+            self.activateWindow()
             self.log_dock.show()
             self.log_dock.raise_()
             return
         if section == "analysis":
-            self.workspace_stack.setCurrentIndex(1)
+            self._select_configuration_section("analysis")
+        elif section == "chart":
+            self._select_configuration_section("chart")
         else:
-            self.workspace_stack.setCurrentIndex(0)
-            self._show_setup_section(0)
+            self._select_configuration_section("communications")
         self.files_dialog.hide()
         self._show_configuration()
+
+    def _set_configuration_workspace(self, index: int) -> None:
+        index = max(0, min(int(index), self.workspace_stack.count() - 1))
+        self.workspace_stack.setCurrentIndex(index)
+        if hasattr(self, "navigation_buttons"):
+            target = "analysis" if index == 1 else "communications"
+            self.navigation_buttons[target].setChecked(True)
+        self._sync_configuration_navigation()
+        QTimer.singleShot(0, self._update_plot_toolbar_layout)
+
+    def _select_configuration_section(self, section: str) -> None:
+        setup_sections = {"communications": 0, "measurement": 1, "experiment": 2}
+        if section in setup_sections:
+            self._set_configuration_workspace(0)
+            self._show_setup_section(setup_sections[section])
+        elif section == "analysis":
+            self._set_configuration_workspace(1)
+            self.analysis_tabs.setCurrentWidget(self.analysis_overview_tab)
+        elif section == "chart":
+            self._set_configuration_workspace(1)
+            self.analysis_tabs.setCurrentWidget(self.chart_settings_tab)
+        else:
+            return
+        self._sync_configuration_navigation()
+
+    def _sync_configuration_navigation(self) -> None:
+        if not hasattr(self, "configuration_nav_buttons"):
+            return
+        if self.workspace_stack.currentIndex() == 0:
+            current_section = ("communications", "measurement", "experiment")[
+                self.setup_section_stack.currentIndex()
+            ]
+        else:
+            current_section = (
+                "chart" if self.analysis_tabs.currentWidget() is self.chart_settings_tab
+                else "analysis"
+            )
+        for section, button in self.configuration_nav_buttons.items():
+            button.setChecked(section == current_section)
 
     def _show_setup_section(self, index: int) -> None:
         if not hasattr(self, "setup_section_stack"):
             return
         index = max(0, min(int(index), self.setup_section_stack.count() - 1))
         self.setup_section_stack.setCurrentIndex(index)
-        for button_index, button in enumerate(self.setup_section_buttons):
-            button.setChecked(button_index == index)
+        self._sync_configuration_navigation()
 
     def _fit_configuration_dialog(self, available=None, *, initial: bool = False) -> None:
         if available is None:
@@ -1691,37 +1971,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(8)
-        panel_title = QLabel("工作区设置")
-        panel_title.setObjectName("panelTitle")
-        panel_subtitle = QLabel("通信连接、测量参数与实验文件分区管理")
-        panel_subtitle.setObjectName("secondaryText")
-        layout.addWidget(panel_title)
-        layout.addWidget(panel_subtitle)
 
-        section_navigation = QHBoxLayout()
-        section_navigation.setContentsMargins(0, 2, 0, 4)
-        section_navigation.setSpacing(6)
         self.setup_section_stack = QStackedLayout()
         self.setup_section_stack.setObjectName("settingsSectionStack")
-        self.setup_section_buttons = []
-        for index, (label, object_name) in enumerate((
-            ("通信", "communicationsSectionButton"),
-            ("测量", "measurementSectionButton"),
-            ("实验", "experimentSectionButton"),
-        )):
-            button = QToolButton()
-            button.setText(label)
-            button.setObjectName(object_name)
-            button.setProperty("class", "secondaryButton")
-            button.setCheckable(True)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            button.clicked.connect(
-                lambda _checked=False, page=index: self._show_setup_section(page)
-            )
-            section_navigation.addWidget(button)
-            self.setup_section_buttons.append(button)
-        section_navigation.addStretch(1)
-        layout.addLayout(section_navigation)
 
         self.communication_workspace = QWidget()
         self.communication_workspace.setObjectName("communicationWorkspace")
@@ -1777,7 +2029,8 @@ class MainWindow(QMainWindow):
         self.idn_label.setObjectName("secondaryText")
         self.idn_label.setToolTip(
             "*IDN?第四字段可由用户自定义；即使其中有可解析的点分数字，也不能证明它是 OutG SW。"
-            "SYST:VERS?返回SCPI命令版本，不是仪器固件。400 mA门槛只依据人工核对的面板 OutG SW。"
+            "SYST:VERS?返回SCPI命令版本，不是仪器固件。DCI 400 mA 门槛依据人工核对的面板 OutG SW；"
+            "ACI 官方资料未明确 1.0.700.18 门槛对应 OutG SW 还是 InG SW；ACI 不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档，使用前请在仪表面板核对软件版本。"
         )
         form.addRow("识别结果", self.idn_label)
         self.connection_stages_label = QLabel("设备 待开始 · 串口 待开始 · 8845A 待开始 · 配置 待开始 · 就绪 待开始")
@@ -1796,16 +2049,21 @@ class MainWindow(QMainWindow):
         self.outguard_sw_edit.setPlaceholderText("面板核对，例如 2.10.882.24")
         self.outguard_sw_edit.setToolTip(
             "从仪器前面板 INSTR SETUP → SYSTEM → VERSIONS + SN 读取，并按仪器序列号保存在本机。"
-            "*IDN?修订字段可能是用户自定义内容，不用它判断固件。400 mA门槛只依据此处人工核对的 OutG SW；未知或无法解析不会限制量程。"
+            "*IDN?修订字段可能是用户自定义内容，不用它判断固件。DCI 400 mA 门槛依据此处人工核对的 OutG SW；"
+            "ACI 官方资料未明确 1.0.700.18 门槛对应 OutG SW 还是 InG SW；ACI 不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档。使用前请在仪表面板核对软件版本。"
+            "未知或无法解析不会按过旧拒绝量程。"
             "这是人工核对记录，不是通过SCPI读取。"
         )
+        self._outguard_sw_tooltip = self.outguard_sw_edit.toolTip()
         self.inguard_sw_edit = QLineEdit()
         self.inguard_sw_edit.setMaxLength(64)
         self.inguard_sw_edit.setPlaceholderText("可选记录，例如 ad300210")
         self.inguard_sw_edit.setToolTip(
             "可选记录同一前面板版本页显示的 InG SW，并随实验配置保存。"
-            "InG SW不参与400 mA门槛判断；该门槛只依据人工核对的 OutG SW。"
+            "DCI 固件门槛不依据 InG SW；ACI 官方资料未明确版本门槛对应哪个字段，"
+            "ACI 不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档；使用前请在仪表面板核对软件版本。"
         )
+        self._inguard_sw_tooltip = self.inguard_sw_edit.toolTip()
         self.outguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
         self.inguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
         form.addRow("OutG SW（面板核对）", self.outguard_sw_edit)
@@ -1817,6 +2075,7 @@ class MainWindow(QMainWindow):
         self.clear_firmware_profile_button = QPushButton("清除版本记录")
         self.clear_firmware_profile_button.setObjectName("secondaryButton")
         self.clear_firmware_profile_button.setToolTip("仅清除本机为当前仪器序列号保存的人工版本记录。")
+        self._clear_firmware_profile_tooltip = self.clear_firmware_profile_button.toolTip()
         self.clear_firmware_profile_button.clicked.connect(self._clear_firmware_profile)
         firmware_profile_row.addWidget(self.firmware_profile_status, 1)
         firmware_profile_row.addWidget(self.clear_firmware_profile_button)
@@ -1842,7 +2101,18 @@ class MainWindow(QMainWindow):
         control_mode_row.setSpacing(6)
         control_mode_row.addWidget(self.control_mode_combo, 1)
         control_mode_row.addWidget(self.set_control_mode_button)
-        form.addRow(self.control_mode_label, control_mode_row)
+        control_mode_column = QVBoxLayout()
+        control_mode_column.setContentsMargins(0, 0, 0, 0)
+        control_mode_column.setSpacing(4)
+        control_mode_column.addLayout(control_mode_row)
+        self.control_mode_explanation_label = QLabel(
+            "Computer：软件可设置仪表并采集（RS-232 协议也须设为 COMPUTER）。"
+            "Local：使用面板操作；软件停用测量、参数设置、诊断和 ZERO，串口连接保留。"
+        )
+        self.control_mode_explanation_label.setObjectName("secondaryText")
+        self.control_mode_explanation_label.setWordWrap(True)
+        control_mode_column.addWidget(self.control_mode_explanation_label)
+        form.addRow(self.control_mode_label, control_mode_column)
 
         self.serial_advanced_button = QToolButton()
         self.serial_advanced_button.setObjectName("disclosureButton")
@@ -1930,7 +2200,7 @@ class MainWindow(QMainWindow):
 
         self.autorange_check = QCheckBox("自动量程")
         self.autorange_check.setChecked(True)
-        self.autorange_check.toggled.connect(self._update_range_enabled)
+        self.autorange_check.toggled.connect(self._update_controls)
         self.autorange_check.toggled.connect(self._settings_changed)
         self.range_combo = QComboBox()
         self.range_combo.currentIndexChanged.connect(self._settings_changed)
@@ -1975,10 +2245,9 @@ class MainWindow(QMainWindow):
         )
         self.input_impedance_auto_check.toggled.connect(self._settings_changed)
         mode_form.addRow("输入阻抗", self.input_impedance_auto_check)
-        self.digital_filter_check = QCheckBox("直流数字滤波（暂时关闭）")
+        self.digital_filter_check = QCheckBox("直流数字滤波")
         self.digital_filter_check.setToolTip(
-            "Fluke 8845A 数字滤波适用于直流电压、电流和电阻；手册规定积分时间须大于 1 NPLC。"
-            "它会影响读数响应；交流模式不适用。"
+            DIGITAL_FILTER_INFO
         )
         self.digital_filter_check.toggled.connect(self._update_digital_filter_availability)
         self.digital_filter_check.toggled.connect(self._settings_changed)
@@ -2033,12 +2302,13 @@ class MainWindow(QMainWindow):
         self.apply_button = QPushButton("应用仪器参数")
         self.apply_button.setObjectName("primaryButton")
         self.apply_button.clicked.connect(self._apply_settings)
-        self.initialize_parameters_button = QPushButton("初始化参数")
+        self.initialize_parameters_button = QPushButton("恢复默认设置")
         self.initialize_parameters_button.setObjectName("secondaryButton")
         self.initialize_parameters_button.setToolTip(
-            "将六种测量模式及软件采样间隔恢复到默认值。不会更改串口设置、保存目录，"
-            "也不会向仪表发送复位命令；当前模式要写入仪表时，再点“应用仪器参数”。"
+            "将六种测量模式及软件目标采样间隔恢复为默认值。此操作仅恢复软件控件和配置，不会立即下发仪器；"
+            "需要生效时点击“应用仪器参数”。串口设置和保存目录会保留，也不会复位仪表。"
         )
+        self._initialize_parameters_tooltip = self.initialize_parameters_button.toolTip()
         self.initialize_parameters_button.clicked.connect(self._initialize_parameters)
         self.apply_speed_button = QPushButton("应用采集速度")
         self.apply_speed_button.setObjectName("secondaryButton")
@@ -2072,6 +2342,111 @@ class MainWindow(QMainWindow):
         self.safety_text.setObjectName("safetyBox")
         self.safety_text.setWordWrap(True)
         mode_form.addRow("接线提示", self.safety_text)
+        self.terminal_diagram = QFrame()
+        self.terminal_diagram.setObjectName("terminalDiagram")
+        self.terminal_diagram.setAccessibleName("当前测量模式的仪表端子示意图")
+        terminal_diagram_layout = QVBoxLayout(self.terminal_diagram)
+        terminal_diagram_layout.setContentsMargins(8, 6, 8, 6)
+        terminal_diagram_layout.setSpacing(5)
+        self.terminal_diagram_title = QLabel("INPUT")
+        self.terminal_diagram_title.setObjectName("terminalDiagramTitle")
+        terminal_diagram_layout.addWidget(self.terminal_diagram_title)
+        terminal_groups_layout = QHBoxLayout()
+        terminal_groups_layout.setContentsMargins(0, 0, 0, 0)
+        terminal_groups_layout.setSpacing(12)
+        terminal_diagram_layout.addLayout(terminal_groups_layout)
+
+        self.terminal_socket_widgets = {}
+        self.terminal_input_group = QWidget()
+        terminal_input_layout = QVBoxLayout(self.terminal_input_group)
+        terminal_input_layout.setContentsMargins(0, 0, 0, 0)
+        terminal_input_layout.setSpacing(3)
+        input_heading = QLabel("INPUT")
+        input_heading.setObjectName("terminalGroupHeading")
+        terminal_input_layout.addWidget(input_heading)
+        input_sockets = QGridLayout()
+        input_sockets.setContentsMargins(0, 0, 0, 0)
+        input_sockets.setHorizontalSpacing(6)
+        input_sockets.setVerticalSpacing(4)
+        terminal_input_layout.addLayout(input_sockets)
+        for key, label_text, tone, row, column in (
+            ("hi", "HI", "high", 0, 0),
+            ("lo", "LO", "low", 0, 1),
+            ("ma", "mA / 400 mA", "current", 1, 0),
+            ("10a", "10 A", "current_high", 1, 1),
+        ):
+            socket = QFrame()
+            socket.setObjectName("terminalSocket")
+            socket.setProperty("socketTone", tone)
+            socket.setAccessibleName(f"{label_text}端子")
+            socket_layout = QHBoxLayout(socket)
+            socket_layout.setContentsMargins(7, 4, 7, 4)
+            socket_layout.setSpacing(6)
+            marker = QFrame()
+            marker.setObjectName("terminalSocketMarker")
+            marker.setProperty("socketTone", tone)
+            marker.setFixedSize(16, 16)
+            marker_color = {
+                "high": "#c04a53", "low": "#565e5f",
+                "current": "#c04a53", "current_high": "#a87930",
+            }[tone]
+            marker.setStyleSheet(
+                f"background: #30383c; border: 2px solid {marker_color}; border-radius: 8px;"
+            )
+            socket_layout.addWidget(marker)
+            socket_label = QLabel(label_text)
+            socket_label.setObjectName("terminalSocketLabel")
+            socket_layout.addWidget(socket_label, 1)
+            self.terminal_socket_widgets[key] = socket
+            input_sockets.addWidget(socket, row, column)
+        terminal_groups_layout.addWidget(self.terminal_input_group, 1)
+
+        self.terminal_sense_group = QWidget()
+        terminal_sense_layout = QVBoxLayout(self.terminal_sense_group)
+        terminal_sense_layout.setContentsMargins(0, 0, 0, 0)
+        terminal_sense_layout.setSpacing(3)
+        sense_heading = QLabel("SENSE")
+        sense_heading.setObjectName("terminalGroupHeading")
+        terminal_sense_layout.addWidget(sense_heading)
+        sense_sockets = QVBoxLayout()
+        sense_sockets.setContentsMargins(0, 0, 0, 0)
+        sense_sockets.setSpacing(4)
+        terminal_sense_layout.addLayout(sense_sockets)
+        for key, label_text, tone in (
+            ("sense_hi", "SENSE HI", "high"),
+            ("sense_lo", "SENSE LO", "low"),
+        ):
+            socket = QFrame()
+            socket.setObjectName("terminalSocket")
+            socket.setProperty("socketTone", tone)
+            socket.setAccessibleName(f"{label_text}端子")
+            socket_layout = QHBoxLayout(socket)
+            socket_layout.setContentsMargins(7, 4, 7, 4)
+            socket_layout.setSpacing(6)
+            marker = QFrame()
+            marker.setObjectName("terminalSocketMarker")
+            marker.setProperty("socketTone", tone)
+            marker.setFixedSize(16, 16)
+            marker_color = {"high": "#c04a53", "low": "#565e5f"}[tone]
+            marker.setStyleSheet(
+                f"background: #30383c; border: 2px solid {marker_color}; border-radius: 8px;"
+            )
+            socket_layout.addWidget(marker)
+            socket_label = QLabel(label_text)
+            socket_label.setObjectName("terminalSocketLabel")
+            socket_layout.addWidget(socket_label, 1)
+            self.terminal_socket_widgets[key] = socket
+            sense_sockets.addWidget(socket)
+        terminal_groups_layout.addWidget(self.terminal_sense_group, 1)
+
+        self.terminal_diagram_note = QLabel(
+            "仅供端子位置参考，不检测实际接线；请以仪器面板丝印和接线提示为准。"
+        )
+        self.terminal_diagram_note.setObjectName("terminalDiagramNote")
+        self.terminal_diagram_note.setWordWrap(True)
+        self.terminal_diagram_note.setAccessibleName("端子示意图限制说明")
+        terminal_diagram_layout.addWidget(self.terminal_diagram_note)
+        mode_form.addRow("端子示意", self.terminal_diagram)
         measurement_layout.addWidget(mode_box)
 
         experiment = QGroupBox("实验文件")
@@ -2080,7 +2455,7 @@ class MainWindow(QMainWindow):
         exp_form.setContentsMargins(12, 18, 12, 12)
         exp_form.setHorizontalSpacing(9)
         exp_form.setVerticalSpacing(7)
-        self.experiment_name = QLineEdit(f"实验_{datetime.now().strftime('%Y%m%d_%H%M')}")
+        self.experiment_name = QLineEdit(self._suggest_experiment_name(self._current_mode))
         self.experiment_name.textChanged.connect(self._validate_experiment_name_field)
         exp_form.addRow("实验名称", self.experiment_name)
         self.experiment_name_validation = QLabel("名称有效；如有同名实验，可选择先备份再覆盖、另存目录或改名。")
@@ -2092,6 +2467,38 @@ class MainWindow(QMainWindow):
         self.preflight_status.setWordWrap(True)
         exp_form.addRow("采集预检", self.preflight_status)
         self.experiment_name.textChanged.connect(lambda _text: self._reset_preflight_status())
+        configuration_start_actions = QHBoxLayout()
+        configuration_start_actions.setSpacing(8)
+        self.configuration_single_button = QPushButton("单次测量")
+        self.configuration_single_button.setObjectName("configurationSingleButton")
+        self.configuration_single_button.setProperty("class", "secondaryButton")
+        self.configuration_single_button.setMinimumHeight(34)
+        self.configuration_single_button.setToolTip(
+            "完成采集预检后读取一次并保存。真实仪器会先要求确认接线和安全状态。"
+        )
+        self.configuration_single_button.clicked.connect(
+            lambda: self._start_from_configuration(one_shot=True)
+        )
+        self.configuration_start_button = QPushButton("开始连续采集")
+        self.configuration_start_button.setObjectName("configurationStartButton")
+        self.configuration_start_button.setProperty("class", "primaryButton")
+        self.configuration_start_button.setMinimumHeight(34)
+        self.configuration_start_button.setToolTip(
+            "完成采集预检后开始连续采集。真实仪器会先要求确认接线和安全状态。"
+        )
+        self.configuration_start_button.clicked.connect(
+            lambda: self._start_from_configuration(one_shot=False)
+        )
+        configuration_start_actions.addWidget(self.configuration_single_button)
+        configuration_start_actions.addWidget(self.configuration_start_button)
+        configuration_start_actions.addStretch(1)
+        exp_form.addRow("开始测量", configuration_start_actions)
+        self.measurement_setup_hint = QLabel(
+            "新测量开始后，主界面曲线自动切换到本次数据；旧实验 CSV 保存在各自目录。无需先清空曲线。"
+        )
+        self.measurement_setup_hint.setObjectName("fieldHint")
+        self.measurement_setup_hint.setWordWrap(True)
+        exp_form.addRow("", self.measurement_setup_hint)
         default_root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)) / "Fluke8845A_Experiments"
         saved_root = self._profiles.get("output_root", "")
         self.output_root = QLineEdit(saved_root or str(default_root))
@@ -2120,7 +2527,7 @@ class MainWindow(QMainWindow):
         recent_path_row.addWidget(self.copy_experiment_path_button)
         exp_form.addRow("最近实验", recent_path_row)
         self.recent_experiment_files_label = QLabel(
-            "采集后包含：measurements.csv · events.csv · config.json · run.log；曲线 PNG 按需另存。"
+            "采集后尝试生成 CSV_打开说明.txt；若未生成，实验摘要会提示使用 events_excel_safe.csv。曲线 PNG 按需另存。"
         )
         self.recent_experiment_files_label.setObjectName("fieldHint")
         self.recent_experiment_files_label.setWordWrap(True)
@@ -2162,10 +2569,11 @@ class MainWindow(QMainWindow):
         self.interval_spin.valueChanged.connect(self._on_sampling_interval_changed)
         interval_row = QHBoxLayout()
         interval_row.setContentsMargins(0, 0, 0, 0)
+        interval_row.setSpacing(5)
         self.target_interval_label = QLabel("目标采样间隔")
         self.target_interval_label.setObjectName("targetIntervalLabel")
         interval_row.addWidget(self.target_interval_label)
-        self.interval_spin.setMinimumWidth(110)
+        self.interval_spin.setFixedWidth(150)
         interval_row.addWidget(self.interval_spin)
         self.fastest_interval_label = QLabel("0 = 最快可用")
         self.fastest_interval_label.setObjectName("fastestIntervalLabel")
@@ -2327,6 +2735,26 @@ class MainWindow(QMainWindow):
         self.latest_invalid_log_button.clicked.connect(self._jump_to_latest_invalid_log)
         self.latest_invalid_row.addWidget(self.latest_invalid_log_button, 0)
         status_layout.addLayout(self.latest_invalid_row)
+        self.display_loss_warning = QLabel("")
+        self.display_loss_warning.setObjectName("displayLossWarning")
+        self.display_loss_warning.setWordWrap(True)
+        self.display_loss_warning.setAccessibleName("曲线显示点丢弃提示")
+        self.display_loss_warning.setToolTip(
+            "此提示只针对实时曲线的显示缓存。每次仪器测量仍会逐点写入原始 measurements.csv。"
+        )
+        self.display_loss_warning.hide()
+        status_layout.addWidget(self.display_loss_warning)
+        self.voltage_range_warning = QLabel("")
+        self.voltage_range_warning.setObjectName("voltageRangeWarning")
+        self.voltage_range_warning.setWordWrap(True)
+        self.voltage_range_warning.setAccessibleName("电压图表范围提示")
+        self.voltage_range_warning.setToolTip(
+            "±1000 V 是图表显示边界，不是仪器量程或输入额定值；8845A ACV 最大输入为 750 V RMS、1000 V peak "
+            "或 8×10^7 V·Hz 乘积，以先达到的限制为准。"
+            "超出图表边界的点只隐藏曲线显示，原始数据仍保留。"
+        )
+        self.voltage_range_warning.hide()
+        status_layout.addWidget(self.voltage_range_warning)
         self.recovery_hint_label = QLabel("")
         self.recovery_hint_label.setObjectName("recoveryHintLabel")
         self.recovery_hint_label.setWordWrap(True)
@@ -2367,6 +2795,26 @@ class MainWindow(QMainWindow):
         self._reading_layout_mode = None
         self._short_chart_layout = None
         self._short_viewport_layout = None
+
+        measurement_action_bar = QFrame()
+        measurement_action_bar.setObjectName("measurementActionBar")
+        self.measurement_action_bar = measurement_action_bar
+        measurement_action_layout = QHBoxLayout(measurement_action_bar)
+        measurement_action_layout.setContentsMargins(10, 5, 10, 5)
+        measurement_action_layout.setSpacing(8)
+        self._measurement_action_layout = measurement_action_layout
+        self._new_measurement_idle_hint = (
+            "新建测量：点“新建测量”（Ctrl+N）→ 填名称 → 点“单次测量”或“开始连续采集”。"
+            "新测量开始后自动换图，旧 CSV 保留；“清空图表”只清除显示。"
+        )
+        self._new_measurement_compact_hint = (
+            "重测：点“新建测量”→ 填名称并开始；新测量开始后自动换图，旧 CSV 保留。“清空图表”只清显示。"
+        )
+        self.new_measurement_hint = QLabel(self._new_measurement_idle_hint)
+        self.new_measurement_hint.setObjectName("secondaryText")
+        self.new_measurement_hint.setWordWrap(True)
+        measurement_action_layout.addWidget(self.new_measurement_hint, 1)
+        layout.addWidget(measurement_action_bar)
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
@@ -2466,6 +2914,7 @@ class MainWindow(QMainWindow):
         self.y_axis_span_unit_label.setObjectName("secondaryText")
         self.apply_y_axis_span_button = QPushButton("应用")
         self.apply_y_axis_span_button.setObjectName("secondaryButton")
+        self.apply_y_axis_span_button.setFixedWidth(72)
         self.apply_y_axis_span_button.setToolTip("按输入跨度缩放纵轴，并保持当前纵轴中心")
         y_axis_span_layout.addWidget(y_axis_span_label)
         y_axis_span_layout.addWidget(self.y_axis_span_edit)
@@ -2484,12 +2933,10 @@ class MainWindow(QMainWindow):
             self.history_button,
             self.screenshot_button,
         )
-        layout.addWidget(plot_toolbar)
 
         self.chart_gesture_help = QLabel(
-            "图表内滚轮向上缩小读数轴（纵轴）跨度，向下放大；"
-            "Shift+滚轮缩放时间轴；Ctrl+滚轮同时缩放两轴；"
-            "Alt+滚轮以零点为锚缩放读数轴。拖动曲线可平移，点击曲线可锁定读数点；"
+            "普通滚轮同时缩放横轴和纵轴；Shift+滚轮只缩放时间轴；Ctrl+滚轮只缩放读数轴；Alt 对滚轮无特殊操作。"
+            "拖动图表可平移，双击图表自动缩放到全部数据，单击曲线可锁定读数点；"
             "聚焦图表后按方向键选点，Enter将锁定点设为基准；Shift+方向键平移，"
             "PageUp/PageDown缩放，Ctrl缩放时间轴，Alt缩放读数轴。手动缩放任一坐标轴或平移时间轴会停止自动跟随；"
             "点击“回到实时窗口”可恢复最新数据跟随；"
@@ -2500,7 +2947,6 @@ class MainWindow(QMainWindow):
         self.chart_gesture_help.setContentsMargins(8, 2, 8, 5)
         self.chart_gesture_help.hide()
         self.chart_gesture_help_button.toggled.connect(self.chart_gesture_help.setVisible)
-        layout.addWidget(self.chart_gesture_help)
 
         plot_frame = QFrame()
         plot_frame.setObjectName("plotCard")
@@ -2511,9 +2957,13 @@ class MainWindow(QMainWindow):
         self.view_box = _MeasurementViewBox()
         self.plot_widget = _MeasurementPlotWidget(view_box=self.view_box)
         self.plot_widget.setObjectName("trendPlot")
+        self._plot_viewport = self.plot_widget.viewport()
+        self._plot_viewport.installEventFilter(self)
         wheel_tooltip = (
-            "图表内滚轮向上缩小纵轴跨度，优先以鼠标横坐标附近的实测点为锚；无有效曲线时以视区中心为锚，向下放大；"
-            "Shift+滚轮缩放时间轴；Ctrl+滚轮同时缩放两轴；Alt+滚轮以零点为锚缩放纵轴。"
+            "普通滚轮同时缩放横轴与纵轴；Shift+滚轮只缩放时间轴；Ctrl+滚轮只缩放纵轴；Alt 不改变滚轮行为。"
+            "纵轴缩放优先以鼠标时间位置附近的实测点为锚，无有效曲线时以视区中心为锚。"
+            "电压模式的绝对显示范围为 −1000 至 +1000 V；这只是图表显示边界，不是仪器量程或输入额定值；"
+            "8845A ACV 最大输入为 750 V RMS、1000 V peak 或 8×10^7 V·Hz 乘积，以先达到的限制为准；"
             "纵轴单位随当前显示跨度采用工程前缀；相对刻度会标明参考读数。"
             "缩放只改变图表显示，不修改原始读数。"
         )
@@ -2561,6 +3011,18 @@ class MainWindow(QMainWindow):
         self.plot_empty_hint.setObjectName("plotEmptyHint")
         self.plot_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(self.plot_empty_hint)
+        self.plot_empty_new_measurement_button = QPushButton("新建测量…")
+        self.plot_empty_new_measurement_button.setObjectName("plotEmptyNewMeasurementButton")
+        self.plot_empty_new_measurement_button.setProperty("class", "primaryButton")
+        self.plot_empty_new_measurement_button.setAccessibleName("新建测量并重新绘制曲线")
+        self.plot_empty_new_measurement_button.setMinimumWidth(124)
+        self.plot_empty_new_measurement_button.setFixedHeight(34)
+        self.plot_empty_new_measurement_button.setToolTip(
+            "填写实验名称并选择单次测量或连续采集。开始后曲线自动换新，已保存的旧实验 CSV 保留。"
+        )
+        self.plot_empty_new_measurement_button.clicked.connect(self._open_new_measurement_setup)
+        self.plot_empty_new_measurement_button.hide()
+        empty_layout.addWidget(self.plot_empty_new_measurement_button, 0, Qt.AlignmentFlag.AlignHCenter)
         self.plot_empty_connect_button = QPushButton("连接设备或模拟器…")
         self.plot_empty_connect_button.setObjectName("plotEmptyConnectButton")
         self.plot_empty_connect_button.setToolTip("打开通讯设置，选择真实仪器或明确标记的 MOCK 模拟器。")
@@ -2576,7 +3038,7 @@ class MainWindow(QMainWindow):
 
         self.baseline_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen("#d97706", width=1.5, style=Qt.PenStyle.DashLine),
+            pen=pg.mkPen("#8a5d13", width=1.5, style=Qt.PenStyle.DashLine),
         )
         self.plot_widget.addItem(self.baseline_line, ignoreBounds=True)
         self.baseline_line.hide()
@@ -2606,10 +3068,12 @@ class MainWindow(QMainWindow):
         self.analysis_tabs = QTabWidget()
         self.analysis_tabs.setObjectName("analysisTabs")
         self.analysis_tabs.setDocumentMode(True)
+        self.analysis_tabs.tabBar().hide()
         self.analysis_tabs.setMinimumHeight(180)
         self.analysis_tabs.setMaximumHeight(16777215)
 
         stats_tab = QWidget()
+        stats_tab.setObjectName("analysisStatisticsSection")
         stats_layout = QVBoxLayout(stats_tab)
         stats_layout.setContentsMargins(12, 7, 12, 7)
         stats_layout.setSpacing(4)
@@ -2645,12 +3109,15 @@ class MainWindow(QMainWindow):
         stats_layout.addWidget(self.stats_label)
         stats_layout.addWidget(self._region_stats_label)
         stats_layout.addStretch(1)
-        self.analysis_tabs.addTab(stats_tab, "统计")
 
         baseline_tab = QWidget()
+        baseline_tab.setObjectName("analysisBaselineSection")
         baseline_layout = QVBoxLayout(baseline_tab)
         baseline_layout.setContentsMargins(12, 7, 12, 7)
         baseline_layout.setSpacing(5)
+        baseline_title = QLabel("基准与相对变化")
+        baseline_title.setObjectName("panelTitle")
+        baseline_layout.addWidget(baseline_title)
         baseline_row = QHBoxLayout()
         baseline_row.addWidget(QLabel("R₀ / V₀ / I₀"))
         self.baseline_edit = QLineEdit()
@@ -2695,12 +3162,14 @@ class MainWindow(QMainWindow):
         self.cursor_label.setObjectName("secondaryText")
         baseline_layout.addWidget(self.cursor_label)
         baseline_layout.addStretch(1)
-        self.analysis_tabs.addTab(baseline_tab, "基准变化")
-
         event_tab = QWidget()
+        event_tab.setObjectName("analysisEventsSection")
         event_layout = QVBoxLayout(event_tab)
         event_layout.setContentsMargins(12, 7, 12, 7)
         event_layout.setSpacing(6)
+        event_title = QLabel("实验事件")
+        event_title.setObjectName("panelTitle")
+        event_layout.addWidget(event_title)
         event_layout.addWidget(QLabel("记录操作、环境变化或刺激切换；事件将写入实验记录并标记在曲线上。"))
         event_row = QHBoxLayout()
         self.event_edit = QLineEdit()
@@ -2736,13 +3205,93 @@ class MainWindow(QMainWindow):
         event_layout.addWidget(self.event_csv_safety_warning)
         event_layout.addWidget(self.export_events_safe_button)
         event_layout.addStretch(1)
-        self.analysis_tabs.addTab(event_tab, "实验事件")
+
+        overview_content = QWidget()
+        overview_content.setObjectName("analysisOverviewContent")
+        overview_layout = QVBoxLayout(overview_content)
+        overview_layout.setContentsMargins(10, 10, 10, 10)
+        overview_layout.setSpacing(12)
+        overview_layout.addWidget(stats_tab)
+        overview_layout.addWidget(baseline_tab)
+        overview_layout.addWidget(event_tab)
+        overview_layout.addStretch(1)
+        self.analysis_overview_scroll_area = QScrollArea()
+        self.analysis_overview_scroll_area.setObjectName("analysisOverviewScrollArea")
+        self.analysis_overview_scroll_area.setWidgetResizable(True)
+        self.analysis_overview_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.analysis_overview_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.analysis_overview_scroll_area.setWidget(overview_content)
+        self.analysis_overview_tab = self.analysis_overview_scroll_area
+        self.analysis_tabs.addTab(self.analysis_overview_tab, "分析总览")
+
+        chart_tab = QWidget()
+        chart_tab.setObjectName("chartSettingsTab")
+        chart_layout = QVBoxLayout(chart_tab)
+        chart_layout.setContentsMargins(12, 7, 12, 7)
+        chart_layout.setSpacing(8)
+        chart_title = QLabel("曲线与视图")
+        chart_title.setObjectName("panelTitle")
+        chart_layout.addWidget(chart_title)
+        chart_note = QLabel(
+            "缩放、自动跟随、历史数据和截图只影响图表显示；原始测量数据保持不变。"
+        )
+        chart_note.setObjectName("secondaryText")
+        chart_note.setWordWrap(True)
+        chart_layout.addWidget(chart_note)
+        chart_layout.addWidget(self.plot_toolbar)
+        chart_layout.addWidget(self.chart_gesture_help)
+        chart_layout.addStretch(1)
+        self.chart_settings_tab = chart_tab
+        self.analysis_tabs.addTab(chart_tab, "曲线设置")
+        self.analysis_tabs.installEventFilter(self)
+        self.analysis_tabs.currentChanged.connect(self._on_analysis_section_changed)
         return panel
+
+    def _on_analysis_section_changed(self, _index: int) -> None:
+        self._sync_configuration_navigation()
+        QTimer.singleShot(0, self._update_plot_toolbar_layout)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_readout_layout()
-        QTimer.singleShot(0, self._update_plot_toolbar_layout)
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            watched is getattr(self, "_plot_viewport", None)
+            and event.type() == QEvent.Type.MouseButtonDblClick
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._autoscale_plot()
+            return True
+        if (
+            watched is getattr(self, "files_dialog", None)
+            and event.type() == QEvent.Type.Hide
+            and hasattr(self, "navigation_buttons")
+            and self.navigation_buttons["files"].isChecked()
+        ):
+            self.navigation_buttons["acquisition"].setChecked(True)
+        if (
+            watched is getattr(self, "configuration_dialog", None)
+            and event.type() == QEvent.Type.Hide
+            and hasattr(self, "navigation_buttons")
+        ):
+            active_navigation = next(
+                (name for name, button in self.navigation_buttons.items() if button.isChecked()),
+                None,
+            )
+            if active_navigation in {"communications", "analysis"}:
+                self.navigation_buttons["acquisition"].setChecked(True)
+        if (
+            (
+                watched is getattr(self, "configuration_dialog", None)
+                or watched is getattr(self, "analysis_tabs", None)
+            )
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(0, self._update_plot_toolbar_layout)
+        return super().eventFilter(watched, event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2765,7 +3314,6 @@ class MainWindow(QMainWindow):
             and short_chart == self._short_chart_layout
             and short_viewport == self._short_viewport_layout
         ):
-            self._update_plot_toolbar_layout()
             return
         self._reading_layout_mode = mode
         self._short_chart_layout = short_chart
@@ -2792,11 +3340,21 @@ class MainWindow(QMainWindow):
             self.status_dot,
             self.experiment_status,
             self.latest_invalid_label,
+            self.display_loss_warning,
             self._rate_caption,
             self.actual_rate_label,
             self._elapsed_caption,
             self.elapsed_label,
             self.recovery_hint_label,
+        ):
+            widget.setProperty("short", short_viewport)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.updateGeometry()
+        for widget in (
+            self.target_interval_label,
+            self.interval_spin,
+            self.fastest_interval_label,
         ):
             widget.setProperty("short", short_viewport)
             widget.style().unpolish(widget)
@@ -2856,6 +3414,19 @@ class MainWindow(QMainWindow):
             self._update_latest_invalid_summary()
         self._reading_text_layout.setSpacing(1 if stacked or short_viewport else 3)
         self._chart_panel_layout.setSpacing(3 if short_viewport else 5 if stacked or short_chart else 9)
+        if short_viewport:
+            self._measurement_action_layout.setContentsMargins(4, 1, 4, 1)
+            self._measurement_action_layout.setSpacing(5)
+            self.new_measurement_button.setFixedHeight(28)
+            self.clear_plot_button.setFixedHeight(28)
+            self.new_measurement_hint.setMaximumHeight(36)
+        else:
+            self._measurement_action_layout.setContentsMargins(10, 5, 10, 5)
+            self._measurement_action_layout.setSpacing(8)
+            self.new_measurement_button.setFixedHeight(36)
+            self.clear_plot_button.setFixedHeight(36)
+            self.new_measurement_hint.setMaximumHeight(16777215)
+        self.new_measurement_hint.show()
         if stacked or short_chart:
             self._action_layout.setContentsMargins(10, 4, 10, 4)
         else:
@@ -2865,8 +3436,8 @@ class MainWindow(QMainWindow):
         self._action_bar.setProperty("short", short_viewport)
         self._action_bar.style().unpolish(self._action_bar)
         self._action_bar.style().polish(self._action_bar)
-        self.plot_widget.setMinimumHeight(108 if short_viewport else 170 if compact_chart else 230)
-        self._plot_frame.setMinimumHeight(110 if short_viewport else 172 if compact_chart else 232)
+        self.plot_widget.setMinimumHeight(78 if short_viewport else 170 if compact_chart else 230)
+        self._plot_frame.setMinimumHeight(82 if short_viewport else 172 if compact_chart else 232)
         self._reading_card.style().unpolish(self._reading_card)
         self._reading_card.style().polish(self._reading_card)
         self._reading_card.updateGeometry()
@@ -2878,7 +3449,36 @@ class MainWindow(QMainWindow):
         self._reading_divider.setFrameShape(
             QFrame.Shape.HLine if mode == "stacked" else QFrame.Shape.VLine
         )
-        self._update_plot_toolbar_layout()
+        self._update_measurement_hint()
+
+    def _update_measurement_hint(self) -> None:
+        if not hasattr(self, "new_measurement_hint"):
+            return
+        compact_hint = bool(getattr(self, "_short_viewport_layout", False))
+        if self._history_load_pending:
+            text = "历史 CSV 正在加载；完成后可新建测量。"
+        elif self._start_pending:
+            text = "正在处理启动请求；稍候再新建测量。"
+        elif self._new_measurement_after_save:
+            text = "正在停止并保存当前实验；完成后自动打开新测量设置。"
+        elif self._acquiring:
+            text = (
+                "采集中；点“新建测量”后先停止并保存，取消则继续当前采集。"
+                if compact_hint else
+                "当前实验仍在运行；点击“新建测量”后将先停止并保存，取消则继续当前采集。旧数据会保留。"
+            )
+        elif self._experiment_active:
+            text = (
+                "正在保存；完成后可新建测量或清空图表。"
+                if compact_hint else
+                "当前实验正在收尾并保存；完成后可新建测量或清空图表。原始 CSV 会保留。"
+            )
+        else:
+            text = (
+                self._new_measurement_compact_hint
+                if compact_hint else self._new_measurement_idle_hint
+            )
+        self.new_measurement_hint.setText(text)
 
     def _update_latest_invalid_summary(self) -> None:
         """Keep the compact status card's error cause readable beside its log link."""
@@ -2917,6 +3517,8 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_plot_toolbar_layout"):
             return
         width = self.plot_toolbar.width()
+        if width <= 0:
+            return
         short_viewport = bool(getattr(self, "_short_viewport_layout", False))
         mode = "short" if short_viewport else "wide" if width >= 1080 else "compact" if width >= 820 else "narrow"
         if mode == self._plot_toolbar_mode:
@@ -2947,11 +3549,15 @@ class MainWindow(QMainWindow):
                 toolbar_layout.addWidget(widget, 0, column)
             toolbar_layout.setColumnStretch(2, 1)
             toolbar_layout.setColumnStretch(4, 1)
-            toolbar_layout.addWidget(self.y_axis_span_control, 1, 0, 1, 9)
+            toolbar_layout.addWidget(
+                self.y_axis_span_control, 1, 0, 1, 9, Qt.AlignmentFlag.AlignLeft
+            )
         elif mode == "short":
             for column, widget in enumerate((follow, view_mode, source, autoscale, live, history, screenshot, gestures)):
                 toolbar_layout.addWidget(widget, 0, column)
-            toolbar_layout.addWidget(self.y_axis_span_control, 1, 0, 1, 8)
+            toolbar_layout.addWidget(
+                self.y_axis_span_control, 1, 0, 1, 8, Qt.AlignmentFlag.AlignLeft
+            )
             toolbar_layout.setColumnStretch(1, 1)
         else:
             toolbar_layout.addWidget(follow, 0, 0)
@@ -2961,7 +3567,9 @@ class MainWindow(QMainWindow):
                 toolbar_layout.addWidget(widget, 0, column)
             toolbar_layout.addWidget(hint, 1, 0, 1, 6)
             toolbar_layout.addWidget(gestures, 1, 6)
-            toolbar_layout.addWidget(self.y_axis_span_control, 2, 0, 1, 7)
+            toolbar_layout.addWidget(
+                self.y_axis_span_control, 2, 0, 1, 7, Qt.AlignmentFlag.AlignLeft
+            )
             toolbar_layout.setColumnStretch(1, 1)
         self.plot_toolbar.updateGeometry()
 
@@ -2994,7 +3602,7 @@ class MainWindow(QMainWindow):
                 "自动跟随最新数据" if enabled else "手动视图 · 自动跟随已关闭"
             )
         if hasattr(self, "return_live_button") and hasattr(self, "_plot_x"):
-            self.return_live_button.setEnabled(bool(self._plot_x))
+            self._set_return_live_enabled(bool(self._plot_x))
 
     def _move_plot_selection(self, step: int) -> bool:
         if not self._plot_x:
@@ -3120,6 +3728,12 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
+        self.experiment_files_action = QAction("实验文件…", self)
+        self.experiment_files_action.setObjectName("experimentFilesAction")
+        self.experiment_files_action.triggered.connect(
+            lambda: self._navigate_workspace("files")
+        )
+        file_menu.addAction(self.experiment_files_action)
         load_action = QAction("加载历史 CSV…", self)
         load_action.triggered.connect(self._load_history)
         file_menu.addAction(load_action)
@@ -3136,19 +3750,58 @@ class MainWindow(QMainWindow):
         def add_shortcut_action(object_name: str, text: str, sequence: str, callback) -> QAction:
             action = QAction(text, self)
             action.setObjectName(object_name)
-            action.setShortcut(QKeySequence(sequence))
-            action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            if sequence:
+                action.setShortcut(QKeySequence(sequence))
+                action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
             action.triggered.connect(callback)
             self.addAction(action)
             capture_menu.addAction(action)
             self._shortcut_actions[object_name] = action
             return action
 
+        add_shortcut_action(
+            "newMeasurementShortcutAction", "新建测量", "Ctrl+N",
+            self._open_new_measurement_setup,
+        )
         add_shortcut_action("startShortcutAction", "开始连续采集", "Ctrl+R", self._start_continuous)
+        add_shortcut_action("singleShortcutAction", "单次测量", "", self._start_single)
         add_shortcut_action("pauseShortcutAction", "暂停 / 继续", "Ctrl+P", self._pause_or_resume)
         add_shortcut_action("stopShortcutAction", "停止并保存", "Ctrl+Shift+S", self._stop)
         add_shortcut_action("settingsShortcutAction", "打开设置与分析", "Ctrl+,", self._show_configuration)
         add_shortcut_action("eventShortcutAction", "记录实验事件", "Ctrl+Return", self._mark_event)
+        chart_menu = self.menuBar().addMenu("曲线")
+        self.autoscale_action = QAction("全部数据自动缩放", self)
+        self.autoscale_action.setObjectName("autoscaleChartAction")
+        self.autoscale_action.triggered.connect(self._autoscale_plot)
+        chart_menu.addAction(self.autoscale_action)
+        self.return_live_action = QAction("回到实时窗口", self)
+        self.return_live_action.setObjectName("returnLiveChartAction")
+        self.return_live_action.triggered.connect(self._return_to_live_view)
+        chart_menu.addAction(self.return_live_action)
+        chart_menu.addSeparator()
+        self.follow_action = QAction("自动跟随", self)
+        self.follow_action.setObjectName("followChartAction")
+        self.follow_action.setCheckable(True)
+        self.follow_action.setChecked(self.follow_check.isChecked())
+        self.follow_action.toggled.connect(self.follow_check.setChecked)
+        self.follow_check.toggled.connect(self.follow_action.setChecked)
+        chart_menu.addAction(self.follow_action)
+        self.chart_gesture_action = QAction("鼠标与键盘操作说明", self)
+        self.chart_gesture_action.setObjectName("chartGestureHelpAction")
+        self.chart_gesture_action.setCheckable(True)
+        self.chart_gesture_action.setChecked(self.chart_gesture_help_button.isChecked())
+        self.chart_gesture_action.toggled.connect(self.chart_gesture_help_button.setChecked)
+        self.chart_gesture_help_button.toggled.connect(self.chart_gesture_action.setChecked)
+        chart_menu.addAction(self.chart_gesture_action)
+        chart_menu.addSeparator()
+        self.clear_plot_action = QAction("清空图表", self)
+        self.clear_plot_action.setObjectName("clearPlotAction")
+        self.clear_plot_action.triggered.connect(self._clear_plot_from_ui)
+        chart_menu.addAction(self.clear_plot_action)
+        chart_settings_action = QAction("打开曲线设置…", self)
+        chart_settings_action.setObjectName("chartSettingsAction")
+        chart_settings_action.triggered.connect(lambda: self._navigate_workspace("chart"))
+        chart_menu.addAction(chart_settings_action)
         instrument_menu = self.menuBar().addMenu("仪器")
         diag = QAction("SCPI诊断…", self)
         diag.triggered.connect(self._diagnose)
@@ -3165,8 +3818,9 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self) -> None:
         self.setStyleSheet("""
-            QMainWindow { background: #252d31; color: #273136; }
-            QWidget { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; color: #273136; }
+            QMainWindow { background: #252d31; }
+            QWidget { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+            QMainWindow QWidget { color: #e7e8df; }
             QWidget#appRoot { background: #252d31; }
             QFrame#appHeader { background: #30383c; border: 1px solid #465156; border-radius: 9px; }
             QLabel#brandIcon { background: #f1efe6; border: 1px solid #bdc0b7; border-radius: 6px; color: #176d72; font-weight: 800; }
@@ -3176,6 +3830,11 @@ class MainWindow(QMainWindow):
             QMenu { background: #30383c; color: #f1efe6; border: 1px solid #505b5f; padding: 4px; }
             QDialog#configurationDialog { background: #f1efe6; }
             QDialog#configurationDialog QWidget { color: #273136; }
+            QDialog#experimentFilesDialog { background: #f1efe6; }
+            QDialog#experimentFilesDialog QWidget { color: #273136; }
+            QDialog#wiringConfirmationDialog { background: #f1efe6; }
+            QDialog#wiringConfirmationDialog QWidget { color: #273136; }
+            QMessageBox QWidget { color: #273136; }
             QLabel#dialogTitle { color: #273136; font-size: 19px; font-weight: 700; }
             QFrame#settingsComparison { background: #e7eee9; border: 1px solid #b6c3bc; border-radius: 6px; }
             QLabel#settingsSummaryHeading { color: #3d4c4d; font-size: 12px; font-weight: 700; }
@@ -3194,6 +3853,9 @@ class MainWindow(QMainWindow):
             QWidget#measurementWorkspace QLabel#secondaryText { color: #b7c2bc; }
             QLabel#latestInvalidLabel { color: #f4c579; font-size: 12px; }
             QLabel#latestInvalidLabel[short="true"] { font-size: 11px; }
+            QLabel#displayLossWarning { color: #f4c579; font-size: 12px; font-weight: 700; }
+            QLabel#displayLossWarning[short="true"] { font-size: 11px; }
+            QLabel#voltageRangeWarning { color: #f4c579; font-size: 12px; }
             QLabel#recoveryHintLabel { color: #f4c579; font-size: 12px; }
             QLabel#recoveryHintLabel[short="true"] { font-size: 11px; }
             QLabel#warningBanner { color: #634411; background: #fff2cc; border: 1px solid #d6ad54; border-radius: 6px; padding: 8px 10px; font-weight: 650; }
@@ -3215,6 +3877,17 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { color: #99a09e; background: #e7e8e1; border-color: #d1d4cd; }
             QPushButton#primaryButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; }
             QPushButton#primaryButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#newMeasurementButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; padding-left: 12px; padding-right: 12px; }
+            QPushButton#newMeasurementButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#plotEmptyNewMeasurementButton { background: #167b80; border: 1px solid #167b80; color: #fffefa; font-weight: 700; padding: 6px 12px; }
+            QPushButton#plotEmptyNewMeasurementButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#clearPlotButton { color: #344247; }
+            QFrame#measurementActionBar { background: #30383c; border: 1px solid #465156; border-radius: 7px; }
+            QFrame#measurementActionBar QPushButton { min-height: 34px; }
+            QFrame#measurementActionBar QLabel#secondaryText { color: #e1e8e1; font-size: 12px; font-weight: 600; }
+            QPushButton#newMeasurementButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; padding-left: 12px; padding-right: 12px; }
+            QPushButton#newMeasurementButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#clearPlotButton { color: #344247; }
             QPushButton#primaryButton[connectionTarget="mock"] { background: #8a5d13; border-color: #8a5d13; color: #fff8e6; }
             QPushButton#primaryButton[connectionTarget="mock"]:hover { background: #704b10; border-color: #704b10; }
             QPushButton#primaryButton[connectionTarget="mock"]:disabled { background: #5c4a2e; border-color: #6a5a3f; color: #c1b79d; }
@@ -3222,8 +3895,13 @@ class MainWindow(QMainWindow):
             QPushButton#secondaryButton { color: #344247; }
             QToolButton[class="secondaryButton"] { background: #faf9f4; color: #344247; border: 1px solid #bfc7c4; border-radius: 5px; padding: 6px 12px; min-height: 25px; }
             QToolButton[class="secondaryButton"]:checked { background: #d8eeeb; color: #176d72; border-color: #29aab0; font-weight: 700; }
-            QPushButton#statusAction { background: #414b4f; color: #e9e9df; border: 1px solid #596468; padding: 3px 12px; min-height: 22px; }
-            QPushButton#statusAction:hover { color: #6de1e2; border-color: #42aeb1; }
+            QToolBar#workspaceNavigationToolbar { background: #30383c; border: 1px solid #465156; border-radius: 7px; spacing: 5px; padding: 4px 8px; margin: 0px 18px 8px 18px; }
+            QToolBar#workspaceNavigationToolbar::separator { background: #596367; width: 1px; margin: 4px 5px; }
+            QToolBar#workspaceNavigationToolbar QToolButton { background: transparent; color: #d6ded8; border: 1px solid transparent; border-radius: 5px; padding: 4px 11px; min-height: 28px; font-size: 13px; }
+            QToolBar#workspaceNavigationToolbar QToolButton:hover { background: #414d51; color: #73e2e2; border-color: #59676a; }
+            QToolBar#workspaceNavigationToolbar QToolButton:checked { background: #1d262a; color: #73e2e2; border-color: #42aeb1; font-weight: 700; }
+            QPushButton#configurationNavigation { background: #167b80; color: #fffefa; border: 1px solid #167b80; border-radius: 5px; padding: 2px 12px; min-height: 28px; font-size: 13px; font-weight: 700; }
+            QPushButton#configurationNavigation:hover { background: #12666b; border-color: #42aeb1; }
             QToolButton#disclosureButton { color: #536166; border: 0; text-align: left; padding: 4px 2px; }
             QCheckBox { spacing: 7px; color: #3e4a4f; }
             QLabel#connectionBadge { padding: 6px 10px; background: #424c50; border: 1px solid #5b6669; border-radius: 6px; color: #d7ded9; font-size: 12px; font-weight: 700; }
@@ -3242,12 +3920,12 @@ class MainWindow(QMainWindow):
             QFrame#readingCard[stacked="true"] QLabel#readingValue { font-size: 27px; }
             QFrame#readingCard[short="true"] QLabel#eyebrow { font-size: 11px; }
             QFrame#readingCard[short="true"] QLabel#readingMode { font-size: 11px; }
-            QFrame#readingCard[short="true"] QLabel#readingValue { font-size: 22px; }
+            QFrame#readingCard[short="true"] QLabel#readingValue { font-size: 17px; }
             QFrame#readingCard[short="true"] QLabel#metricValue,
             QFrame#readingCard[short="true"] QLabel#statusValue { font-size: 11px; }
             QLabel#eyebrow[short="true"] { font-size: 11px; }
             QLabel#readingMode[short="true"] { font-size: 11px; }
-            QLabel#readingValue[short="true"] { font-size: 22px; }
+            QLabel#readingValue[short="true"] { font-size: 17px; }
             QLabel#metricValue[short="true"],
             QLabel#statusValue[short="true"] { font-size: 11px; }
             QFrame#metricCell { background: #303b3e; border: 1px solid #465458; border-radius: 6px; }
@@ -3262,8 +3940,16 @@ class MainWindow(QMainWindow):
             QFrame#actionBar { background: #30383c; border: 1px solid #465156; border-radius: 7px; }
             QFrame#actionBar QPushButton { min-height: 30px; }
             QFrame#actionBar[short="true"] QPushButton { padding: 1px 6px; min-height: 22px; }
-            QLabel#targetIntervalLabel { color: #d6ded8; font-size: 12px; }
-            QLabel#fastestIntervalLabel { color: #d6ded8; font-size: 12px; }
+            QFrame#plotToolbar { background: #252d31; border: 1px solid #465156; border-radius: 8px; padding: 4px; }
+            QDialog#configurationDialog QFrame#plotToolbar QLabel#secondaryText { color: #d6ded8; }
+            QDialog#configurationDialog QFrame#plotToolbar QLabel#chartViewMode { color: #d6ded8; font-size: 12px; }
+            QDialog#configurationDialog QFrame#plotToolbar QLabel#chartAcquisitionHint { color: #d6ded8; font-size: 12px; }
+            QDialog#configurationDialog QFrame#plotToolbar QLabel#chartSourceLabel { color: #d6ded8; font-size: 12px; }
+            QDialog#configurationDialog QFrame#plotToolbar QCheckBox#chartFollowCheck { color: #d6ded8; font-size: 12px; }
+            QLabel#targetIntervalLabel { color: #344247; font-size: 12px; }
+            QLabel#fastestIntervalLabel { color: #344247; font-size: 12px; }
+            QFrame#actionBar QLabel#targetIntervalLabel, QFrame#actionBar QLabel#fastestIntervalLabel { color: #d6ded8; }
+            QLabel#targetIntervalLabel[short="true"], QLabel#fastestIntervalLabel[short="true"] { font-size: 11px; }
             QLabel#chartViewMode { color: #d6ded8; font-size: 12px; }
             QLabel#chartAcquisitionHint { color: #d6ded8; font-size: 12px; }
             QCheckBox#chartFollowCheck { color: #d6ded8; font-size: 12px; }
@@ -3286,6 +3972,15 @@ class MainWindow(QMainWindow):
             QLabel#toolbarLabel { color: #d6ded8; font-weight: 700; }
             QLabel#toolbarHint { color: #b7c2bc; font-size: 12px; }
             QLabel#safetyBox { background: #fff3d7; color: #75551e; border: 1px solid #e5c27d; border-radius: 6px; padding: 9px; }
+            QFrame#terminalDiagram { background: #d8d4c8; border: 1px solid #777b77; border-radius: 6px; }
+            QLabel#terminalDiagramTitle { color: #343b3a; font-weight: 700; }
+            QLabel#terminalGroupHeading { color: #525a57; font-size: 11px; font-weight: 700; }
+            QFrame#terminalSocket { background: #eeece3; border: 1px solid #a0a198; border-radius: 5px; }
+            QLabel#terminalSocketLabel { color: #333b39; background: transparent; font-weight: 700; }
+            QFrame#terminalSocketMarker { background: #30383c; border: 2px solid #c04a53; border-radius: 7px; }
+            QFrame#terminalSocketMarker[socketTone="low"] { border-color: #565e5f; }
+            QFrame#terminalSocketMarker[socketTone="current_high"] { border-color: #a87930; }
+            QLabel#terminalDiagramNote { color: #4d5652; font-size: 11px; }
             QLabel#changeLabel { color: #966219; font-weight: 700; }
             QStatusBar { background: #252d31; color: #c1cbc5; border-top: 1px solid #414c50; }
             QLabel#operationStatus { color: #c1cbc5; padding: 2px 8px; font-size: 12px; }
@@ -3757,6 +4452,7 @@ class MainWindow(QMainWindow):
         label.setProperty("state", state)
         label.style().unpolish(label)
         label.style().polish(label)
+        label.setVisible(bool(self._connected))
 
     @Slot(str)
     def _on_control_mode_changed(self, mode: str) -> None:
@@ -3997,6 +4693,27 @@ class MainWindow(QMainWindow):
     def _refresh_safety_hint(self) -> None:
         if hasattr(self, "safety_text"):
             self.safety_text.setText(self._mode_safety_instructions(self._current_mode))
+        if hasattr(self, "terminal_diagram_title"):
+            self._refresh_terminal_diagram(self._current_mode)
+
+    def _refresh_terminal_diagram(self, mode: Mode) -> None:
+        current = mode in {Mode.DCI, Mode.ACI}
+        four_wire = mode == Mode.RES4
+        title = {
+            Mode.DCV: "电压输入 · 并联连接",
+            Mode.ACV: "电压输入 · 并联连接",
+            Mode.DCI: "电流输入 · 串联连接",
+            Mode.ACI: "电流输入 · 串联连接",
+            Mode.RES2: "两线电阻 · INPUT HI / LO",
+            Mode.RES4: "四线电阻 · INPUT 与 SENSE",
+        }[mode]
+        self.terminal_diagram_title.setText(title)
+        self.terminal_socket_widgets["ma"].setVisible(current)
+        self.terminal_socket_widgets["10a"].setVisible(current)
+        self.terminal_sense_group.setVisible(four_wire)
+        self.terminal_diagram.setToolTip(
+            f"{title}。示意图不检测实际接线；接线前请核对仪器面板丝印和提示。"
+        )
 
     def _load_mode_controls(self, mode: Mode) -> None:
         self._loading_mode_controls = True
@@ -4015,14 +4732,23 @@ class MainWindow(QMainWindow):
         autorange_reason = None if self._simulation or spec.quantity != "current" else current_autorange_block_reason(
             mode, self._firmware, self._terminals
         )
+        firmware_field_note = current_firmware_gate_evidence_note(mode)
         self.autorange_check.setEnabled(autorange_reason is None)
-        self.autorange_check.setToolTip(autorange_reason or "由仪器在该模式已确认支持的量程间自动选择")
+        autorange_tooltip = autorange_reason or "由仪器在该模式已确认支持的量程间自动选择"
+        if mode == Mode.ACI and not self._simulation:
+            autorange_tooltip = f"{autorange_tooltip}。{firmware_field_note}。"
+        self.autorange_check.setToolTip(autorange_tooltip)
         limit_messages = []
+        if mode == Mode.ACI and not self._simulation:
+            limit_messages.append(
+                "ACI 400 mA 档要求软件版本 ≥1.0.700.18；官方资料未说明对应 OutG SW 还是 InG SW。"
+                "本软件不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档；使用 400 mA 固定档或自动量程前，请在仪表面板核对软件版本。"
+            )
         if 0.4 in unsupported:
-            minimum = "2.0" if mode == Mode.DCI else "1.0.700.18"
+            minimum = "2.0" if mode == Mode.DCI else ""
             limit_messages.append(
                 f"400 mA 档被禁用：当前固件版本 {self._firmware or '未核实'} 低于 {mode.value} 要求 {minimum}。"
-                "下一步：核对并录入面板 OutG SW 后重新应用；确认前选用不超过100 mA的固定量程。"
+                f"{firmware_field_note}下一步：核对并录入面板 OutG SW 后重新应用；确认前选用不超过100 mA的固定量程。"
             )
         if any(value in unsupported for value in (1.0, 3.0, 10.0)):
             terminals = self._terminals.strip() or "未确认"
@@ -4036,14 +4762,21 @@ class MainWindow(QMainWindow):
             self.autorange_check.setChecked(False)
             stored["autorange"] = False
         for i in range(1, self.range_combo.count()):
+            if mode == Mode.ACI and self.range_combo.itemData(i) == 0.4 and not self._simulation:
+                item = self.range_combo.model().item(i)
+                if item is not None:
+                    item.setToolTip(
+                        "ACI 官方扩展规格要求软件版本 ≥1.0.700.18，但未说明对应 OutG SW 还是 InG SW。"
+                        "本软件不会根据 OutG SW 或 InG SW 自动拒绝该档；使用前请在仪表面板核对软件版本。"
+                    )
             if self.range_combo.itemData(i) in unsupported:
                 item = self.range_combo.model().item(i)
                 if item is not None:
                     item.setEnabled(False)
                     value = float(self.range_combo.itemData(i))
                     if value == 0.4:
-                        minimum = "2.0" if mode == Mode.DCI else "1.0.700.18"
-                        reason = f"当前固件版本（{self._firmware}）低于该模式400 mA档要求（{minimum}）。"
+                        minimum = "2.0" if mode == Mode.DCI else ""
+                        reason = f"当前固件版本（{self._firmware}）低于该模式400 mA档要求（{minimum}）。{firmware_field_note}"
                         next_step = "核对并录入仪器 OutG 软件版本后重新应用；确认版本前请选用不超过100 mA的固定量程。"
                     else:
                         terminals = self._terminals.strip() or "未确认"
@@ -4056,6 +4789,10 @@ class MainWindow(QMainWindow):
             else:
                 next_step = "把电流线连接到前面板电流端子并刷新仪器配置；否则关闭自动量程，选择适用于当前端子的固定量程。"
             self.autorange_check.setToolTip(f"原因：{autorange_reason}。\n下一步：{next_step}")
+            if mode == Mode.ACI and not self._simulation:
+                self.autorange_check.setToolTip(
+                    f"原因：{autorange_reason}。\n下一步：{next_step}\n{firmware_field_note}。"
+                )
         idx = self.range_combo.findData(stored.get("range_si"))
         selected_item = self.range_combo.model().item(idx) if idx > 0 else None
         if selected_item is not None and not selected_item.isEnabled():
@@ -4133,13 +4870,13 @@ class MainWindow(QMainWindow):
         self.input_impedance_auto_check.setChecked(
             bool(stored.get("input_impedance_auto", False)) if spec.input_impedance_auto else False
         )
-        stored_digital_filter = False
-        stored["digital_filter"] = False
+        stored_digital_filter = bool(stored.get("digital_filter", False))
         self.digital_filter_check.setVisible(spec.digital_filter)
         self.digital_filter_check.setChecked(stored_digital_filter)
         self._update_digital_filter_availability()
         self.autozero_check.setChecked(bool(stored.get("autozero", True)))
         self.safety_text.setText(self._mode_safety_instructions(mode))
+        self._refresh_terminal_diagram(mode)
         baseline = stored.get("baseline")
         self._baseline = float(baseline) if baseline is not None else None
         self.baseline_edit.setText("" if self._baseline is None else repr(self._baseline))
@@ -4158,16 +4895,40 @@ class MainWindow(QMainWindow):
             return
         spec = descriptor(self._current_mode)
         self.digital_filter_check.setVisible(spec.digital_filter)
-        self.digital_filter_check.setEnabled(False)
-        if self.digital_filter_check.isChecked():
+        nplc = self.nplc_combo.currentData() if spec.nplc_values else None
+        firmware_support = digital_filter_firmware_support(self._current_mode, self._firmware)
+        nplc_error = digital_filter_enable_error(self._current_mode, nplc=nplc)
+        reason = ""
+        if not spec.digital_filter:
+            reason = f"{spec.label}不支持直流数字滤波。"
+        elif firmware_support is False:
+            reason = "OutG SW 早于 2.0 不支持该功能；请在仪表 SYSTEM→VERSION 页面核对软件版本。"
+        elif nplc_error:
+            reason = nplc_error + "。"
+
+        command_available = (
+            not self._connected or self._simulation or self._control_mode == "computer"
+        )
+        setting_supported = spec.digital_filter and not reason
+        enabled = setting_supported and command_available
+        self.digital_filter_check.setEnabled(enabled)
+        if spec.digital_filter:
+            tooltip_parts = [DIGITAL_FILTER_INFO]
+            if firmware_support is None:
+                tooltip_parts.append("未知固件将尝试设置并回读，同时检查SCPI错误队列。")
+            if reason:
+                tooltip_parts.append(reason)
+            elif not command_available:
+                tooltip_parts.append("仪表处于 Local 模式；切换到 Computer 后可更改。")
+            self.digital_filter_check.setToolTip("\n".join(tooltip_parts))
+
+        if self.digital_filter_check.isChecked() and not setting_supported:
             blocked = self.digital_filter_check.blockSignals(True)
             self.digital_filter_check.setChecked(False)
             self.digital_filter_check.blockSignals(blocked)
-        if spec.digital_filter:
-            self.digital_filter_check.setToolTip(
-                "此滤波器会对多个读数求平均，平均数量随直流功能和量程变化；"
-                f"{digital_filter_enable_error(self._current_mode)}。"
-            )
+            self._profiles[self._current_mode.value]["digital_filter"] = False
+            if not self._loading_mode_controls:
+                self._persist_current_settings()
 
     def _persist_current_settings(self) -> None:
         mode = self._current_mode
@@ -4373,14 +5134,23 @@ class MainWindow(QMainWindow):
             if not settings.autorange and settings.range_si != value:
                 continue
             reasons = []
-            minimum = (2, 0) if settings.mode == Mode.DCI else (1, 0, 700, 18)
-            if value == 0.4 and compare_firmware(self._firmware, minimum) is False:
+            minimum = {Mode.DCI: (2, 0)}.get(settings.mode)
+            if value == 0.4 and minimum is not None and compare_firmware(self._firmware, minimum) is False:
                 reasons.append(f"固件 {self._firmware} 低于 400 mA 档要求")
+                evidence_note = current_firmware_gate_evidence_note(settings.mode)
+                if evidence_note:
+                    reasons.append(evidence_note)
             if value in (1.0, 3.0, 10.0) and not self._terminals.strip().upper().startswith("FRON"):
                 reasons.append(f"端子 {self._terminals or '未确认'} 不支持该前面板档位")
             if reasons:
+                conflict_dimensions = []
+                if value == 0.4 and minimum is not None and compare_firmware(self._firmware, minimum) is False:
+                    conflict_dimensions.append("固件")
+                if value in (1.0, 3.0, 10.0) and not self._terminals.strip().upper().startswith("FRON"):
+                    conflict_dimensions.append("端子")
+                dimension_label = "/".join(conflict_dimensions) or "仪器"
                 conflicts.append(
-                    f"量程：{range_label(value, spec.unit_si)} 与当前固件/端子冲突（{'；'.join(reasons)}）"
+                    f"量程：{range_label(value, spec.unit_si)} 与当前{dimension_label}状态冲突（{'；'.join(reasons)}）"
                 )
         return conflicts
 
@@ -4440,7 +5210,7 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            "初始化测量参数",
+            "恢复默认测量设置",
             "将六种测量模式恢复为默认参数：自动量程、默认积分时间/交流带宽、关闭模拟滤波和自动高输入阻抗、启用自动零点并清除模式基准；"
             "软件目标采样间隔设为 1 秒。\n\n"
             "串口设置和保存目录会保留。此操作只改软件配置，不会复位仪表；若要让当前模式生效，请随后点击“应用仪器参数”。\n\n"
@@ -4678,7 +5448,6 @@ class MainWindow(QMainWindow):
             if self.mock_mode_check.isChecked() and not self._simulation:
                 raise ValueError("MOCK模式未连接。请先点击“连接真实仪器”以通过MOCK后端连接；UI会明确显示模拟状态。")
             self._persist_current_settings()
-            self._clear_plot()
             self._start_pending = True
             self._last_run_single = bool(one_shot)
             self._user_stop_pending = False
@@ -4811,8 +5580,28 @@ class MainWindow(QMainWindow):
             self._worker.request_stop()
             self._bridge.stop.emit()
 
+    @Slot(str, bool)
+    def _on_acquisition_state_changed(self, state: str, one_shot_running: bool) -> None:
+        try:
+            acquisition_state = AcquisitionState(state)
+        except ValueError:
+            log.error("Worker emitted an unknown acquisition state: %r", state)
+            return
+        self._acquiring = acquisition_state in {AcquisitionState.RUNNING, AcquisitionState.PAUSED}
+        self._paused = acquisition_state is AcquisitionState.PAUSED
+        self._single_shot_running = bool(one_shot_running)
+        if self._acquiring:
+            self._experiment_active = True
+        # The recorder remains active while the Worker flushes and finalizes
+        # files after transitioning to STOPPED. _on_experiment_finished owns
+        # clearing this lock so exports cannot race final CSV writes.
+        dot_state = "paused" if self._paused else "running" if self._acquiring else "idle"
+        self.status_dot.setProperty("state", dot_state)
+        self.status_dot.style().unpolish(self.status_dot)
+        self.status_dot.style().polish(self.status_dot)
+        self._update_controls()
+
     def _on_status(self, status: str) -> None:
-        self._single_shot_running = "单次测量中" in status
         if status.startswith(("连续超时", "SCPI响应超时", "串口读取超时", "串口通信异常", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
             self._last_acquisition_issue = status
             self._show_recovery_guidance(status)
@@ -4835,36 +5624,6 @@ class MainWindow(QMainWindow):
         self.experiment_status.setText(display_status)
         self.experiment_status.setToolTip(status)
         self.statusBar().showMessage(status)
-        if "连续采集中" in status or "单次测量中" in status:
-            self._acquiring = True
-            self._paused = False
-            self._experiment_active = True
-        elif "暂停" in status:
-            self._acquiring = True
-            self._paused = True
-            self._experiment_active = True
-        elif status.startswith("连续超时"):
-            self._acquiring = False
-            self._paused = False
-            self._experiment_active = False
-        elif status.startswith(("SCPI响应超时", "串口读取超时", "串口通信异常", "仪器已切回LOCAL", "RS-232当前不是Computer", "连接中断")) or "过量程" in status:
-            self._acquiring = False
-            self._paused = False
-            self._experiment_active = False
-        elif status.startswith("就绪") or "已执行" in status:
-            self._acquiring = False
-            self._paused = False
-            # The recorder may be closed slightly before this status reaches the GUI.
-            if status.startswith("就绪"):
-                self._experiment_active = False
-        elif status.startswith("SCPI"):
-            self._acquiring = False
-            self._paused = False
-            self._experiment_active = False
-        dot_state = "paused" if self._paused else "running" if self._acquiring else "idle"
-        self.status_dot.setProperty("state", dot_state)
-        self.status_dot.style().unpolish(self.status_dot)
-        self.status_dot.style().polish(self.status_dot)
         self._update_controls()
 
     def _show_recovery_guidance(self, status: str) -> None:
@@ -4936,6 +5695,8 @@ class MainWindow(QMainWindow):
             "Local 模式下不发送设置命令；切换到 Computer 后可操作。" if self._connected and not computer_control else
             "请先连接仪器或模拟器。" if not self._connected else ""
         )
+        if self._connected and not computer_control and (self._acquiring or self._start_pending):
+            reason += "\nLocal 模式下不发送设置命令；切换到 Computer 后可操作。"
         self.mode_combo.setEnabled(command_ready and computer_control)
         spec = descriptor(self._current_mode)
         autorange_allowed = (
@@ -4965,6 +5726,15 @@ class MainWindow(QMainWindow):
         self.interval_spin.setEnabled(True)
         self.apply_button.setEnabled(command_ready and self._connected and computer_control)
         self.initialize_parameters_button.setEnabled(command_ready and computer_control)
+        initialize_reason = ""
+        if not computer_control and self._connected:
+            initialize_reason = "Local 模式下不更改软件测量配置；切换到 Computer 后可初始化。"
+        elif not command_ready:
+            initialize_reason = reason or "当前仪器操作尚未完成；完成后可初始化参数。"
+        self.initialize_parameters_button.setToolTip(
+            f"{initialize_reason}\n\n{self._initialize_parameters_tooltip}"
+            if initialize_reason else self._initialize_parameters_tooltip
+        )
         self.apply_speed_button.setEnabled(
             self._acquiring and self._connected and computer_control and not self._speed_update_pending
             and bool(spec.nplc_values or spec.ac_bandwidths_hz)
@@ -4974,12 +5744,15 @@ class MainWindow(QMainWindow):
         history_load_ready = not self._history_load_pending
         self.start_button.setEnabled(
             command_ready and self._connected and computer_control
-            and self._experiment_name_valid and history_load_ready
+            and self._experiment_name_valid and history_load_ready and not self._experiment_active
         )
         self.single_button.setEnabled(
             command_ready and self._connected and computer_control
-            and self._experiment_name_valid and history_load_ready
+            and self._experiment_name_valid and history_load_ready and not self._experiment_active
         )
+        if hasattr(self, "configuration_start_button"):
+            self.configuration_start_button.setEnabled(self.start_button.isEnabled())
+            self.configuration_single_button.setEnabled(self.single_button.isEnabled())
         self.pause_button.setEnabled(self._acquiring and not self._single_shot_running)
         self.pause_button.setText("继续" if self._paused else "暂停")
         self.stop_button.setEnabled(self._acquiring)
@@ -5000,10 +5773,37 @@ class MainWindow(QMainWindow):
         self.control_mode_combo.setEnabled(
             self._connected and not self._simulation and idle and not self._control_mode_switch_pending
         )
-        self.outguard_sw_edit.setEnabled(self._connected and not self._simulation and idle)
-        self.inguard_sw_edit.setEnabled(self._connected and not self._simulation and idle)
+        firmware_lock_reason = (
+            "连接真实仪器后才能记录面板软件版本。" if not self._connected else
+            "MOCK 模拟模式不使用真实仪器的面板版本。" if self._simulation else
+            "采集中不能更改面板版本记录；请先停止并保存当前实验。" if not idle else
+            ""
+        )
+        for widget, help_text in (
+            (self.outguard_sw_edit, self._outguard_sw_tooltip),
+            (self.inguard_sw_edit, self._inguard_sw_tooltip),
+        ):
+            widget.setEnabled(not firmware_lock_reason)
+            widget.setToolTip(
+                f"{firmware_lock_reason}\n\n{help_text}"
+                if firmware_lock_reason else help_text
+            )
+        saved_firmware = self._firmware_profiles.get(self._device_serial, {})
+        has_saved_firmware = bool(
+            isinstance(saved_firmware, dict)
+            and (saved_firmware.get("outguard_sw") or saved_firmware.get("inguard_sw"))
+        )
+        clear_firmware_reason = firmware_lock_reason or (
+            "尚无当前仪器的面板版本记录可清除。"
+            if not self._device_serial or not has_saved_firmware else ""
+        )
         self.clear_firmware_profile_button.setEnabled(
-            self._connected and not self._simulation and idle and bool(self._device_serial)
+            self._connected and not self._simulation and idle
+            and bool(self._device_serial) and has_saved_firmware
+        )
+        self.clear_firmware_profile_button.setToolTip(
+            f"{clear_firmware_reason}\n\n{self._clear_firmware_profile_tooltip}"
+            if clear_firmware_reason else self._clear_firmware_profile_tooltip
         )
         mock_selected = bool(self.mock_mode_check.isChecked() or self._simulation)
         self.scenario_combo.setEnabled(mock_selected and not self._connected)
@@ -5014,7 +5814,16 @@ class MainWindow(QMainWindow):
         )
         self.mode_combo.setToolTip(reason)
         self.autorange_check.setToolTip(reason or self.autorange_check.toolTip())
-        self.range_combo.setToolTip(reason or "选择当前测量模式的固定量程。")
+        range_lock_reason = reason
+        if not self._connected and reason == "请先连接仪器或模拟器。":
+            range_lock_reason = ""
+        range_tooltip_parts = [range_lock_reason]
+        if self.autorange_check.isChecked():
+            range_tooltip_parts.append("自动量程已启用；关闭自动量程后可选择固定量程。")
+        self.range_combo.setToolTip(
+            "\n".join(part for part in range_tooltip_parts if part)
+            or "选择当前测量模式的固定量程。"
+        )
         self.nplc_combo.setToolTip(
             reason if self._connected and not computer_control else
             "NPLC 决定积分时间；更高 NPLC 通常需要更长读数时间。应用速度后从下一次仪器读数起生效。"
@@ -5032,10 +5841,20 @@ class MainWindow(QMainWindow):
         name_reason = self.experiment_name_validation.text() if not self._experiment_name_valid else ""
         start_reason = (
             "历史 CSV 正在后台加载，完成后再开始采集。"
-            if self._history_load_pending else reason or name_reason
+            if self._history_load_pending else
+            "正在处理启动请求，请稍候；完成后可继续操作。"
+            if self._start_pending else
+            "当前实验正在收尾并保存，完成后可开始新测量。"
+            if self._experiment_active and not self._acquiring else
+            "当前测量采集中；先点“停止并保存”，完成后再开始下一次测量。"
+            if self._acquiring else
+            reason or name_reason
         )
         self.start_button.setToolTip((start_reason or "开始连续采集；原始结果逐点保存到当前实验 CSV。") + " 快捷键：Ctrl+R。")
         self.single_button.setToolTip(start_reason or "只读取一次并保存为独立实验数据。")
+        if hasattr(self, "configuration_start_button"):
+            self.configuration_start_button.setToolTip(self.start_button.toolTip())
+            self.configuration_single_button.setToolTip(self.single_button.toolTip())
         pause_tooltip = (
             "继续当前已暂停的采集。快捷键：Ctrl+P。" if self._paused else
             "单次测量不支持暂停；可停止当前读数。" if self._single_shot_running else
@@ -5051,6 +5870,47 @@ class MainWindow(QMainWindow):
             "当前没有进行中的采集；开始连续采集后可停止并保存。快捷键：Ctrl+Shift+S。"
         )
         self.stop_button.setToolTip(stop_tooltip)
+        can_start_new_measurement = (
+            not self._history_load_pending
+            and not self._start_pending
+            and not self._new_measurement_after_save
+            and (not self._experiment_active or self._acquiring)
+        )
+        self.new_measurement_button.setEnabled(can_start_new_measurement)
+        self._update_measurement_hint()
+        self.new_measurement_button.setToolTip(
+            "正在停止并保存当前实验；完成后自动打开新测量设置。"
+            if self._new_measurement_after_save else
+            "历史 CSV 正在加载，完成后可新建测量。" if self._history_load_pending else
+            "正在处理启动请求，请稍候；完成后可新建测量。" if self._start_pending else
+            "点击后先停止并保存当前实验；确认框中选择“否”会继续采集。当前曲线和 CSV 会保留。"
+            if self._acquiring else
+            "打开新实验设置并填写名称，然后选择单次测量或连续采集。"
+            "开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键：Ctrl+N。"
+            if can_start_new_measurement else
+            "当前实验正在收尾并保存，完成后可新建测量。"
+            if self._experiment_active and not self._acquiring else
+            "请先停止并保存当前实验，再新建测量。"
+        )
+        can_clear_plot = not (
+            self._acquiring or self._experiment_active or self._start_pending
+            or self._history_load_pending
+        )
+        clear_plot_tooltip = (
+            "立即清除当前图表、统计和事件标记；已保存的 measurements.csv 和 events.csv 不会删除。"
+            if can_clear_plot else
+            "历史 CSV 正在加载，完成后再清空图表。" if self._history_load_pending else
+            "正在处理启动请求，请稍候；完成后再清空图表。" if self._start_pending else
+            "当前实验正在收尾并保存，完成后可清空图表；原始 CSV 会保留。"
+            if self._experiment_active and not self._acquiring else
+            "请先停止并保存当前实验，再清空图表；原始 CSV 会保留。"
+        )
+        self.clear_plot_button.setEnabled(can_clear_plot)
+        self.clear_plot_button.setToolTip(clear_plot_tooltip)
+        clear_plot_action = getattr(self, "clear_plot_action", None)
+        if clear_plot_action is not None:
+            clear_plot_action.setEnabled(can_clear_plot)
+            clear_plot_action.setToolTip(clear_plot_tooltip)
         self.event_button.setToolTip(
             ("请先开始一次实验，再记录事件。" if not self._experiment_active else "记录带有当前时间、样本号和读数的实验事件。")
             + " 快捷键：Ctrl+Enter。"
@@ -5068,7 +5928,9 @@ class MainWindow(QMainWindow):
         self.diagnose_button.setToolTip(reason or "读取仪器身份、配置与错误队列。")
         actions = getattr(self, "_shortcut_actions", {})
         for object_name, enabled in (
+            ("newMeasurementShortcutAction", self.new_measurement_button.isEnabled()),
             ("startShortcutAction", self.start_button.isEnabled()),
+            ("singleShortcutAction", self.single_button.isEnabled()),
             ("pauseShortcutAction", self.pause_button.isEnabled()),
             ("stopShortcutAction", self.stop_button.isEnabled()),
             ("eventShortcutAction", self.event_button.isEnabled()),
@@ -5079,10 +5941,26 @@ class MainWindow(QMainWindow):
         pause_action = actions.get("pauseShortcutAction")
         if pause_action is not None:
             pause_action.setText("继续采集" if self._paused else "暂停采集")
+        single_action = actions.get("singleShortcutAction")
+        if single_action is not None:
+            single_action.setText(self.single_button.text())
+            single_action.setToolTip(self.single_button.toolTip())
+        return_live_action = getattr(self, "return_live_action", None)
+        self._set_return_live_enabled(self.return_live_button.isEnabled())
+
+    def _set_return_live_enabled(self, enabled: bool) -> None:
+        """Keep the chart-toolbar button and menu action on the same view state."""
+        enabled = bool(enabled)
+        self.return_live_button.setEnabled(enabled)
+        action = getattr(self, "return_live_action", None)
+        if action is not None:
+            action.setEnabled(enabled)
 
     @Slot()
     def _on_sample_ready(self) -> None:
-        rows, rate, full_stats = self._worker.take_sample_update()
+        rows, rate, full_stats = self._worker.take_sample_update(
+            include_display_dropped_rows=True,
+        )
         self._on_sample(rows, rate, full_stats)
 
     @Slot(object, float, object)
@@ -5095,8 +5973,18 @@ class MainWindow(QMainWindow):
             )
             self._global_stats = full_stats
             valid_count = int(full_stats.get("valid_count", full_stats.get("count", 0)) or 0)
+            display_dropped_rows = int(full_stats.get("display_dropped_rows", 0) or 0)
+            if display_dropped_rows > 0:
+                self.display_loss_warning.setText(
+                    "曲线显示丢点，CSV 原始数据完整。"
+                    f"累计丢弃 {display_dropped_rows:,} 个曲线显示点。"
+                )
+                self.display_loss_warning.show()
+            else:
+                self.display_loss_warning.hide()
             self.valid_sample_count_label.setText(f"有效样本 {valid_count:,}")
             invalid_log_entries: list[tuple[str, str]] = []
+            valid_rows: list[dict] = []
             for row in rows:
                 try:
                     sample_index = int(row.get("sample_index") or 0)
@@ -5105,14 +5993,30 @@ class MainWindow(QMainWindow):
                     self._last_sample_index = max(self._last_sample_index, sample_index)
                 except (TypeError, ValueError):
                     pass
-                if row.get("status") != "ok" or row.get("value_si") in (None, ""):
+                row_status = str(row.get("status") or "无状态")
+                invalid_value_reason = ""
+                value = elapsed = None
+                if row_status == "ok":
+                    if row.get("value_si") in (None, ""):
+                        invalid_value_reason = "有效状态样本缺少读数"
+                    else:
+                        try:
+                            value = float(row["value_si"])
+                            elapsed = float(row["elapsed_s"])
+                        except (KeyError, TypeError, ValueError, OverflowError):
+                            invalid_value_reason = "读数或经过时间无法解析"
+                        else:
+                            if not math.isfinite(value) or not math.isfinite(elapsed):
+                                invalid_value_reason = "读数或经过时间不是有限数值"
+                if row_status != "ok" or invalid_value_reason:
                     self._plot_break_pending = True
-                    status = str(row.get("status") or "无状态")
-                    error = str(row.get("error") or "无详细原因")
-                    self._latest_invalid_log_text = f"! 数据无效：{row.get('status')} · {row.get('error')}"
+                    status = "非有限值" if "不是有限数值" in invalid_value_reason else row_status
+                    error = invalid_value_reason or str(row.get("error") or "无详细原因")
+                    self._latest_invalid_log_text = f"! 数据无效：{status} · {error}"
                     invalid_detail = (
                         f"最近无效读数 #{row.get('sample_index') or self._last_sample_index}："
                         f"{status} · {error}"
+                        f"{' · 已从曲线中排除' if invalid_value_reason else ''}"
                     )
                     self.latest_invalid_label.setToolTip(invalid_detail)
                     self.latest_invalid_label.setText(invalid_detail)
@@ -5127,8 +6031,7 @@ class MainWindow(QMainWindow):
                         (self._latest_invalid_log_text, f"{log_timestamp}  {self._latest_invalid_log_text}")
                     )
                     continue
-                value = float(row["value_si"])
-                elapsed = float(row["elapsed_s"])
+                assert value is not None and elapsed is not None
                 self._last_value = value
                 self._last_elapsed = elapsed
                 self._last_actual_range_si = None
@@ -5154,6 +6057,7 @@ class MainWindow(QMainWindow):
                     "mode": row.get("mode", self._current_mode.value),
                     "range_si": row.get("range_si"),
                 })
+                valid_rows.append(row)
             if invalid_log_entries:
                 self._store_log_entries(invalid_log_entries)
             if len(self._plot_x) > MAX_PLOT_POINTS:
@@ -5169,7 +6073,6 @@ class MainWindow(QMainWindow):
                 self._plot_y = deque(plot_y)
                 self._plot_break_before = deque(plot_breaks)
                 self._plot_metadata = deque(plot_metadata)
-            valid_rows = [r for r in rows if r.get("status") == "ok" and r.get("value_si") not in (None, "")]
             if valid_rows:
                 self.plot_empty_overlay.hide()
                 self._refresh_curve()
@@ -5195,7 +6098,7 @@ class MainWindow(QMainWindow):
                     right = max(AUTO_FOLLOW_MIN_WINDOW_S, elapsed + 1.0)
                     left = max(0.0, right - AUTO_FOLLOW_WINDOW_S)
                     self.plot_widget.setXRange(left, right, padding=0)
-                self.return_live_button.setEnabled(True)
+                self._set_return_live_enabled(True)
             if rows:
                 self._update_stats(full_stats)
                 if self._region.isVisible():
@@ -5429,13 +6332,41 @@ class MainWindow(QMainWindow):
         )
 
     def _nearest_plot_index(self, x: float) -> int | None:
-        if not self._plot_x:
+        try:
+            x = float(x)
+        except (TypeError, ValueError, OverflowError):
             return None
-        xs = list(self._plot_x)
-        idx = min(max(bisect.bisect_left(xs, x), 0), len(xs) - 1)
-        if idx > 0 and abs(xs[idx - 1] - x) < abs(xs[idx] - x):
-            idx -= 1
-        return idx
+        if not math.isfinite(x):
+            return None
+        x_values = self._plot_y_anchor_x
+        y_values = self._plot_y_anchor_values
+        if x_values.ndim != 1 or y_values.ndim != 1 or len(x_values) != len(y_values) or not len(x_values):
+            return None
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
+        if not np.any(valid):
+            return None
+        if not self._plot_x_nondecreasing:
+            valid_indices = np.flatnonzero(valid)
+            return int(valid_indices[np.argmin(np.abs(x_values[valid_indices] - x))])
+
+        left_edge = int(np.searchsorted(x_values, x, side="left"))
+        right_edge = int(np.searchsorted(x_values, x, side="right"))
+        if left_edge < right_edge:
+            exact = np.flatnonzero(valid[left_edge:right_edge])
+            if exact.size:
+                # Match zoom anchoring: use the last finite reading at a duplicate X.
+                return left_edge + int(exact[-1])
+        left = left_edge - 1
+        while left >= 0 and not valid[left]:
+            left -= 1
+        right = right_edge
+        while right < len(x_values) and not valid[right]:
+            right += 1
+        if left < 0:
+            return right if right < len(x_values) else None
+        if right >= len(x_values):
+            return left
+        return left if x - x_values[left] <= x_values[right] - x else right
 
     def _describe_plot_point(self, x: float, y: float, sample_number: int, metadata: dict | None = None) -> str:
         row = metadata or {}
@@ -5485,6 +6416,9 @@ class MainWindow(QMainWindow):
         pos = event.scenePos()
         if not vb.sceneBoundingRect().contains(pos):
             return
+        if callable(getattr(event, "double", None)) and event.double():
+            self._autoscale_plot()
+            return
         point = vb.mapSceneToView(pos)
         self._lock_plot_point_at(point.x())
 
@@ -5499,8 +6433,8 @@ class MainWindow(QMainWindow):
         xs = list(self._plot_x)
         y = self._plot_y[idx]
         if self._crosshair_x is None:
-            self._crosshair_x = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#d7e2ec", style=Qt.PenStyle.DotLine))
-            self._crosshair_y = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#d7e2ec", style=Qt.PenStyle.DotLine))
+            self._crosshair_x = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#35485b", style=Qt.PenStyle.DotLine))
+            self._crosshair_y = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#35485b", style=Qt.PenStyle.DotLine))
             self.plot_widget.addItem(self._crosshair_x, ignoreBounds=True)
             self.plot_widget.addItem(self._crosshair_y, ignoreBounds=True)
         self._crosshair_x.setPos(xs[idx])
@@ -5636,7 +6570,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         line = pg.InfiniteLine(
             angle=90, movable=False,
-            pen=pg.mkPen("#e9c46a", width=1, style=Qt.PenStyle.DashLine),
+            pen=pg.mkPen("#8a5d13", width=1, style=Qt.PenStyle.DashLine),
         )
         label = pg.TextItem(
             text, color="#f5d27d", anchor=(0, 0), fill=pg.mkBrush("#1a2430"),
@@ -5659,10 +6593,51 @@ class MainWindow(QMainWindow):
             self._position_event_labels()
 
     def _add_event_markers(self, events: list[tuple[float, str]]) -> None:
-        for elapsed_s, text in events:
-            self._add_event_marker(text, elapsed_s=elapsed_s, reposition_labels=False)
-        if events:
+        if not events:
+            return
+        if self._event_markers_loading:
+            self._pending_event_markers.extend(events)
+            return
+        self._cancel_pending_event_marker_load()
+        if len(events) <= EVENT_MARKER_ASYNC_THRESHOLD:
+            for elapsed_s, text in events:
+                self._add_event_marker(text, elapsed_s=elapsed_s, reposition_labels=False)
             self._position_event_labels()
+            return
+        self._pending_event_markers = list(events)
+        self._pending_event_marker_index = 0
+        self._event_markers_loading = True
+        self._append_event_marker_batch()
+
+    def _append_event_marker_batch(self) -> None:
+        if not self._event_markers_loading or self._shutdown_started:
+            return
+        start = self._pending_event_marker_index
+        end = min(start + EVENT_MARKER_BATCH_SIZE, len(self._pending_event_markers))
+        plot_updates = self.plot_widget.updatesEnabled()
+        list_updates = self.event_list_widget.updatesEnabled()
+        self.plot_widget.setUpdatesEnabled(False)
+        self.event_list_widget.setUpdatesEnabled(False)
+        try:
+            for elapsed_s, text in self._pending_event_markers[start:end]:
+                self._add_event_marker(text, elapsed_s=elapsed_s, reposition_labels=False)
+        finally:
+            self.plot_widget.setUpdatesEnabled(plot_updates)
+            self.event_list_widget.setUpdatesEnabled(list_updates)
+        self._pending_event_marker_index = end
+        if end < len(self._pending_event_markers):
+            self._event_marker_timer.start()
+            return
+        self._pending_event_markers.clear()
+        self._pending_event_marker_index = 0
+        self._event_markers_loading = False
+        self._position_event_labels()
+
+    def _cancel_pending_event_marker_load(self) -> None:
+        self._event_marker_timer.stop()
+        self._pending_event_markers.clear()
+        self._pending_event_marker_index = 0
+        self._event_markers_loading = False
 
     def _focus_event_item(self, item: QListWidgetItem | None) -> None:
         if item is None:
@@ -5785,14 +6760,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
 
     def _position_event_labels(self, *_args) -> None:
-        if not self._event_labels:
+        if self._event_markers_loading or not self._event_labels:
             return
         view = self.plot_widget.getPlotItem().vb
         _, y_range = view.viewRange()
         y_min, y_max = y_range
         scene_rect = view.sceneBoundingRect()
         units_per_pixel_y = (y_max - y_min) / max(scene_rect.height(), 1.0)
-        row_edges: list[float] = []
+        layout_items: list[tuple[float, float, float, object, bool]] = []
         markers = sorted(zip(self._event_lines, self._event_labels), key=lambda item: item[0].value())
         for line, label in markers:
             x_value = line.value()
@@ -5803,14 +6778,22 @@ class MainWindow(QMainWindow):
             right_aligned = scene_x + label_width > scene_rect.right() - 3
             label.setAnchor((1, 0) if right_aligned else (0, 0))
             label_left = scene_x - label_width if right_aligned else scene_x
-            row = next(
-                (i for i, right_edge in enumerate(row_edges) if label_left >= right_edge + 5),
-                len(row_edges),
-            )
-            if row == len(row_edges):
-                row_edges.append(scene_x + label_width if not right_aligned else scene_x)
+            label_right = scene_x if right_aligned else scene_x + label_width
+            layout_items.append((label_left, label_right, x_value, label, right_aligned))
+        layout_items.sort(key=lambda item: (item[0], item[2]))
+        active_rows: list[tuple[float, int]] = []
+        available_rows: list[int] = []
+        row_count = 0
+        for label_left, label_right, x_value, label, right_aligned in layout_items:
+            while active_rows and active_rows[0][0] + 5 <= label_left:
+                _right_edge, available_row = heapq.heappop(active_rows)
+                heapq.heappush(available_rows, available_row)
+            if available_rows:
+                row = heapq.heappop(available_rows)
             else:
-                row_edges[row] = scene_x + label_width if not right_aligned else scene_x
+                row = row_count
+                row_count += 1
+            heapq.heappush(active_rows, (label_right, row))
             y = y_max - (4 + row * 24) * units_per_pixel_y
             label.setPos(x_value, y)
 
@@ -5820,7 +6803,6 @@ class MainWindow(QMainWindow):
         self._single_shot_running = False
         self._paused = False
         self._experiment_active = False
-        self._experiment_csv_path = Path(directory) / "measurements.csv"
         if self._shutdown_started:
             self.shutdown_status_label.setText("采集数据已保存，正在关闭仪器连接与后台工作线程…")
             self.statusBar().showMessage(self.shutdown_status_label.text())
@@ -5829,6 +6811,9 @@ class MainWindow(QMainWindow):
         self.status_dot.style().unpolish(self.status_dot)
         self.status_dot.style().polish(self.status_dot)
         self._update_controls()
+        if self._new_measurement_after_save:
+            self._new_measurement_stop_finished = True
+            self._maybe_open_new_measurement_after_save()
 
     @Slot(str, bool, str)
     def _on_experiment_save_result(self, directory: str, saved_ok: bool, detail: str) -> None:
@@ -5837,6 +6822,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(detail, 20000)
             self._user_stop_pending = False
             self._last_run_single = False
+            self._clear_pending_new_measurement()
             self._update_controls()
             return
         csv_path = Path(directory) / "measurements.csv"
@@ -5871,10 +6857,48 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(feedback, 20000)
         self._user_stop_pending = False
         self._last_run_single = False
+        if self._new_measurement_after_save:
+            self._new_measurement_save_succeeded = True
+            self._new_measurement_save_directory = directory
         self._update_controls()
+        self._maybe_open_new_measurement_after_save()
+
+    def _clear_pending_new_measurement(self) -> None:
+        self._new_measurement_after_save = False
+        self._new_measurement_stop_finished = False
+        self._new_measurement_save_succeeded = False
+        self._new_measurement_save_directory = ""
+
+    def _maybe_open_new_measurement_after_save(self) -> None:
+        if not self._new_measurement_after_save:
+            return
+        if self._shutdown_started:
+            self._clear_pending_new_measurement()
+            return
+        if not self._new_measurement_stop_finished or not self._new_measurement_save_succeeded:
+            return
+        self._clear_pending_new_measurement()
+        self._open_new_measurement_setup()
 
     @Slot(str)
     def _on_experiment_started(self, directory: str) -> None:
+        # Keep the current chart visible until the worker confirms it has
+        # configured the instrument and created this run's recorder. If startup
+        # fails, _show_error clears the pending state while preserving the old
+        # plot and its saved CSV reference.
+        self._clear_plot()
+        for mode in Mode:
+            self._profiles[mode.value]["baseline"] = None
+        self._baseline = None
+        self.baseline_edit.clear()
+        self.baseline_line.hide()
+        self.change_label.setText("未设置基准值")
+        self.view_box.setLimits(xMin=None, xMax=None, minXRange=None, maxXRange=None)
+        self.region_start_spin.setValue(0.0)
+        self.region_end_spin.setValue(60.0)
+        self._region.setRegion((0.0, 60.0))
+        self._save_profiles()
+        self._return_to_live_view()
         self._start_pending = False
         self._user_stop_pending = False
         self._last_acquisition_issue = ""
@@ -5916,6 +6940,9 @@ class MainWindow(QMainWindow):
         return directory if directory.is_dir() else None
 
     def _export_safe_events_csv(self) -> None:
+        if self._safe_events_export_task is not None:
+            self.statusBar().showMessage("事件安全副本正在后台生成，请稍候。", 8000)
+            return
         if self._experiment_active:
             QMessageBox.information(self, "请先停止采集", "停止采集后再导出事件副本，原始 events.csv 会保持不变。")
             return
@@ -5937,10 +6964,12 @@ class MainWindow(QMainWindow):
             task = _SafeEventsExportTask(source, destination)
             task.signals.completed.connect(self._on_safe_events_exported)
             self._safe_events_export_task = task
-            self.export_events_safe_button.setEnabled(False)
+            self._update_experiment_directory_controls()
             self.statusBar().showMessage("正在后台生成事件安全副本；原始 events.csv 保持不变。")
             QThreadPool.globalInstance().start(task)
         except Exception as exc:
+            self._safe_events_export_task = None
+            self._update_experiment_directory_controls()
             self._show_error(f"事件安全副本导出失败：{exc}")
 
     @Slot(str, object)
@@ -5949,15 +6978,25 @@ class MainWindow(QMainWindow):
         if self._shutdown_started:
             self._record_shutdown_file_task_result("事件安全副本", error)
             return
+        directory = self._experiment_directory()
         self.export_events_safe_button.setEnabled(
-            self._experiment_directory() is not None and not self._experiment_active
+            directory is not None and not self._experiment_active
+            and self._safe_events_export_task is None
         )
+        self.files_safe_events_button.setEnabled(
+            directory is not None and not self._experiment_active
+            and self._safe_events_export_task is None
+            and (directory / "events.csv").is_file()
+        )
+        self._update_export_action_tooltips(directory)
         if error:
             self._show_error(f"事件安全副本导出失败：{error}")
             return
         self.statusBar().showMessage(
             f"已导出事件安全副本；原始 events.csv 未修改：{destination}", 10000
         )
+        self._record_file_export_result("事件安全副本", destination)
+        self._refresh_file_workspace()
 
     def _export_safe_measurements_csv(self) -> None:
         if self._experiment_active:
@@ -5985,6 +7024,7 @@ class MainWindow(QMainWindow):
             task.signals.completed.connect(self._on_safe_measurements_exported)
             self._safe_measurements_export_task = task
             self.files_safe_measurements_button.setEnabled(False)
+            self._update_export_action_tooltips(directory)
             self.statusBar().showMessage(
                 "正在后台生成测量安全副本；原始 measurements.csv 保持不变。"
             )
@@ -6001,14 +7041,18 @@ class MainWindow(QMainWindow):
         directory = self._experiment_directory()
         self.files_safe_measurements_button.setEnabled(
             directory is not None and not self._experiment_active
+            and self._safe_measurements_export_task is None
             and (directory / "measurements.csv").is_file()
         )
+        self._update_export_action_tooltips(directory)
         if error:
             self._show_error(f"测量安全副本导出失败：{error}")
             return
         self.statusBar().showMessage(
             f"已导出测量安全副本；原始 measurements.csv 未修改：{destination}", 10000
         )
+        self._record_file_export_result("测量安全副本", destination)
+        self._refresh_file_workspace()
 
     def _export_share_package(self) -> None:
         if self._experiment_active:
@@ -6034,6 +7078,7 @@ class MainWindow(QMainWindow):
         task.signals.completed.connect(self._on_share_package_exported)
         self._share_export_task = task
         self.files_share_package_button.setEnabled(False)
+        self._update_export_action_tooltips(directory)
         self.statusBar().showMessage("\u6b63\u5728\u540e\u53f0\u751f\u6210\u8131\u654f\u5206\u4eab\u5305\uff1b\u539f\u59cb\u5b9e\u9a8c\u6587\u4ef6\u4fdd\u6301\u4e0d\u53d8\u3002")
         QThreadPool.globalInstance().start(task)
 
@@ -6046,45 +7091,137 @@ class MainWindow(QMainWindow):
         directory = self._experiment_directory()
         self.files_share_package_button.setEnabled(
             directory is not None and not self._experiment_active
+            and self._share_export_task is None
             and (directory / "measurements.csv").is_file()
             and (directory / "config.json").is_file()
         )
+        self._update_export_action_tooltips(directory)
         if error:
             self._show_error(f"\u8131\u654f\u5206\u4eab\u5305\u5bfc\u51fa\u5931\u8d25\uff1a{error}")
             return
         self.statusBar().showMessage(
             f"\u5df2\u751f\u6210\u8131\u654f\u5206\u4eab\u5305\uff1b\u539f\u59cb\u5b9e\u9a8c\u6587\u4ef6\u672a\u4fee\u6539\uff1a{destination}", 12000
         )
+        self._record_file_export_result("脱敏分享包", destination)
+        self._refresh_file_workspace()
 
     def _update_experiment_directory_controls(self) -> None:
         directory = self._experiment_directory()
         if hasattr(self, "export_events_safe_button"):
-            self.export_events_safe_button.setEnabled(directory is not None and not self._experiment_active)
+            self.export_events_safe_button.setEnabled(
+                directory is not None and not self._experiment_active
+                and self._safe_events_export_task is None
+            )
         if hasattr(self, "files_safe_events_button"):
             self.files_safe_events_button.setEnabled(
                 directory is not None and not self._experiment_active
+                and self._safe_events_export_task is None
                 and (directory / "events.csv").is_file()
             )
         if hasattr(self, "files_safe_measurements_button"):
             self.files_safe_measurements_button.setEnabled(
                 directory is not None and not self._experiment_active
+                and self._safe_measurements_export_task is None
                 and (directory / "measurements.csv").is_file()
             )
         if hasattr(self, "files_share_package_button"):
             self.files_share_package_button.setEnabled(
                 directory is not None and not self._experiment_active
+                and self._share_export_task is None
                 and (directory / "measurements.csv").is_file()
                 and (directory / "config.json").is_file()
             )
         available = directory is not None
         self.recent_experiment_path.setText(str(directory) if available else "尚无可用实验目录")
-        self.recent_experiment_files_label.setText(
-            "当前实验：measurements.csv · events.csv · config.json · run.log；曲线 PNG 按需另存。"
-            if available else
-            "采集后会列出 measurements.csv、events.csv、config.json 和 run.log；曲线 PNG 按需另存。"
-        )
+        if available:
+            if (directory / "CSV_打开说明.txt").is_file():
+                notice_summary = "CSV_打开说明.txt"
+            else:
+                notice_summary = "CSV 安全说明未生成；请先导出 events_excel_safe.csv 再用表格软件打开事件数据"
+            self.recent_experiment_files_label.setText(
+                "当前实验：measurements.csv · events.csv · config.json · run.log · "
+                f"{notice_summary}；曲线 PNG 按需另存。"
+            )
+        else:
+            self.recent_experiment_files_label.setText(
+                "尚无实验数据；开始采集后软件会尝试生成 CSV_打开说明.txt。曲线 PNG 按需另存。"
+            )
         self.open_experiment_directory_button.setEnabled(available)
         self.copy_experiment_path_button.setEnabled(available)
+        self._update_export_action_tooltips(directory)
+
+    def _update_export_action_tooltips(self, directory: Path | None = None) -> None:
+        if directory is None:
+            directory = self._experiment_directory()
+        active = self._experiment_active
+        snapshot_path = self._experiment_csv_path
+        snapshot_ready = bool(snapshot_path is not None and snapshot_path.is_file())
+        events_ready = bool(directory is not None and (directory / "events.csv").is_file())
+        measurements_ready = bool(
+            directory is not None and (directory / "measurements.csv").is_file()
+        )
+        config_ready = bool(directory is not None and (directory / "config.json").is_file())
+
+        snapshot_help = (
+            "采集中导出原始 CSV 的完整记录快照，不修改正在写入的原文件；快照时间保存在配套 JSON 中。"
+        )
+        events_help = (
+            "若当前实验目录有 events.csv，可生成表格软件安全副本；原始文件保持不变。"
+        )
+        measurements_help = (
+            "仅处理原始响应和错误文本，生成表格软件安全副本；原始 measurements.csv 保持不变。"
+        )
+        share_help = (
+            "生成脱敏分享包；隐藏序列号、COM 口及本机路径，原始实验文件不修改。"
+        )
+
+        snapshot_reason = (
+            "正在后台生成 CSV 快照。" if self._snapshot_pending else
+            "当前没有正在进行的实验可导出快照。" if not active else
+            "采集 CSV 尚未创建或暂不可读取；等到文件写出后再导出快照。" if not snapshot_ready else
+            ""
+        )
+        export_reason = (
+            "请先停止并保存当前采集，再导出安全副本或分享包。" if active else
+            "尚无实验目录；完成并保存一次实验后即可导出。" if directory is None else
+            ""
+        )
+        events_reason = export_reason or (
+            "正在后台生成事件安全副本。" if self._safe_events_export_task is not None else ""
+        )
+        files_events_reason = export_reason or (
+            "正在后台生成事件安全副本。" if self._safe_events_export_task is not None else
+            "当前实验目录没有 events.csv，无法导出事件安全副本。" if not events_ready else ""
+        )
+        measurements_reason = export_reason or (
+            "正在后台生成测量安全副本。" if self._safe_measurements_export_task is not None else
+            "当前实验目录没有 measurements.csv，无法导出测量安全副本。"
+            if not measurements_ready else ""
+        )
+        share_reason = export_reason or (
+            "正在后台生成脱敏分享包。" if self._share_export_task is not None else
+            "分享包需要 measurements.csv 和 config.json；当前实验尚缺少所需文件。"
+            if not measurements_ready or not config_ready else ""
+        )
+
+        tooltip_by_kind = {
+            "snapshot": (snapshot_reason, snapshot_help),
+            "events": (events_reason, events_help),
+            "files_events": (files_events_reason, events_help),
+            "measurements": (measurements_reason, measurements_help),
+            "share": (share_reason, share_help),
+        }
+        for attribute, kind in (
+            ("export_snapshot_button", "snapshot"), ("files_snapshot_button", "snapshot"),
+            ("export_events_safe_button", "events"), ("files_safe_events_button", "files_events"),
+            ("files_safe_measurements_button", "measurements"),
+            ("files_share_package_button", "share"),
+        ):
+            button = getattr(self, attribute, None)
+            if button is None:
+                continue
+            reason, help_text = tooltip_by_kind[kind]
+            button.setToolTip(f"{reason}\n\n{help_text}" if reason else help_text)
 
     def _refresh_file_workspace(self) -> None:
         if not hasattr(self, "experiment_file_list"):
@@ -6103,16 +7240,19 @@ class MainWindow(QMainWindow):
             and self._experiment_csv_path.is_file()
         )
         self.files_safe_events_button.setEnabled(
-            available and not self._experiment_active and (directory / "events.csv").is_file()
+            available and not self._experiment_active and self._safe_events_export_task is None
+            and (directory / "events.csv").is_file()
         )
         self.files_safe_measurements_button.setEnabled(
-            available and not self._experiment_active and (directory / "measurements.csv").is_file()
+            available and not self._experiment_active and self._safe_measurements_export_task is None
+            and (directory / "measurements.csv").is_file()
         )
         self.files_share_package_button.setEnabled(
-            available and not self._experiment_active
+            available and not self._experiment_active and self._share_export_task is None
             and (directory / "measurements.csv").is_file()
             and (directory / "config.json").is_file()
         )
+        self._update_export_action_tooltips(directory)
         if directory is None:
             self.experiment_file_list.addItem("尚无实验文件；完成一次测量后会在此列出原始数据和导出结果。")
             return
@@ -6211,6 +7351,9 @@ class MainWindow(QMainWindow):
             f"进行中快照已导出（{snapshot_time}，{copied_bytes} 字节完整记录）：{destination}；元数据：{sidecar}",
             20000,
         )
+        self._record_file_export_result("进行中 CSV 快照", destination)
+        self._record_file_export_result("快照时间元数据", sidecar)
+        self._refresh_file_workspace()
 
     def _plot_y_anchor_at_x(self, plot_x: float) -> float | None:
         """Return the linearly interpolated visible curve value at a plot time."""
@@ -6312,7 +7455,19 @@ class MainWindow(QMainWindow):
             return None
 
     def _refresh_curve(self) -> None:
-        if self._plot_y_origin is None:
+        is_voltage = descriptor(self._current_mode).quantity == "voltage"
+        if is_voltage:
+            limit = VOLTAGE_PLOT_ABSOLUTE_LIMIT_V
+            current_origin = self._plot_y_origin
+            if current_origin is None or not math.isfinite(current_origin) or abs(current_origin) > limit:
+                self._plot_y_origin = next(
+                    (
+                        float(value) for value in self._plot_y
+                        if math.isfinite(float(value)) and abs(float(value)) <= limit
+                    ),
+                    0.0,
+                )
+        elif self._plot_y_origin is None:
             self._plot_y_origin = next(
                 (float(value) for value in self._plot_y if math.isfinite(float(value))),
                 None,
@@ -6325,54 +7480,155 @@ class MainWindow(QMainWindow):
             self.y_axis.setToolTip(
                 "纵轴使用相对坐标保持高读数下的精细缩放；极窄跨度时刻度显示为参考读数 + 偏移量。"
             )
+        x_array = np.asarray(self._plot_x, dtype=float)
+        plot_count = min(len(x_array), len(self._plot_y))
+        measured_x = x_array[:plot_count]
+        x_steps = np.diff(measured_x)
+        self._plot_x_nondecreasing = bool(
+            np.all(np.isfinite(measured_x)) and np.all(x_steps >= 0.0)
+        )
+        break_values = list(self._plot_break_before)
+        break_values = break_values[:plot_count]
+        if len(break_values) < plot_count:
+            break_values.extend([False] * (plot_count - len(break_values)))
+        has_any_break = any(break_values)
+        self._plot_x_uniformly_spaced = bool(
+            self._plot_x_nondecreasing
+            and np.all(x_steps > 0.0)
+            and not has_any_break
+            and (
+                len(x_steps) < 2
+                or np.all(np.isclose(x_steps, x_steps[0], rtol=1e-3, atol=1e-9))
+            )
+        )
+
+        render_x = self._plot_x
+        render_y = self._plot_y
+        render_breaks = break_values
+        render_was_downsampled = (
+            plot_count + sum(bool(value) for value in break_values[1:])
+            > MAX_LIVE_RENDER_POINTS
+        )
+        if render_was_downsampled:
+            # Older synthetic callers and some partial history states may not
+            # carry cursor metadata for every point. Fill only those gaps so
+            # the shared peak-preserving helper can still bound the display.
+            source_x = list(self._plot_x)[:plot_count]
+            source_y = list(self._plot_y)[:plot_count]
+            source_breaks = break_values
+            source_metadata = list(self._plot_metadata)[:plot_count]
+            if len(source_metadata) != plot_count:
+                source_metadata.extend([{}] * (plot_count - len(source_metadata)))
+
+            render_limit = MAX_LIVE_RENDER_POINTS
+            for _attempt in range(16):
+                render_x, render_y, render_breaks, _render_metadata = downsample_plot_data(
+                    source_x,
+                    source_y,
+                    source_breaks,
+                    source_metadata,
+                    max_points=render_limit,
+                )
+                rendered_count = len(render_x) + sum(bool(value) for value in render_breaks[1:])
+                if rendered_count <= MAX_LIVE_RENDER_POINTS or render_limit <= 5:
+                    break
+                render_limit = max(5, render_limit - (rendered_count - MAX_LIVE_RENDER_POINTS))
+
+            if rendered_count > MAX_LIVE_RENDER_POINTS:
+                # A different point target can map to the same bucket size.
+                # Remove non-break samples first, then carry any omitted gaps
+                # forward so this final pass always enforces the display cap.
+                non_extrema: list[int] = []
+                extrema: list[int] = []
+                for index in range(1, len(render_x) - 1):
+                    if render_breaks[index]:
+                        continue
+                    previous_y = float(render_y[index - 1])
+                    current_y = float(render_y[index])
+                    next_y = float(render_y[index + 1])
+                    is_extremum = (
+                        math.isfinite(previous_y)
+                        and math.isfinite(current_y)
+                        and math.isfinite(next_y)
+                        and (
+                            (current_y < previous_y and current_y < next_y)
+                            or (current_y > previous_y and current_y > next_y)
+                        )
+                    )
+                    (extrema if is_extremum else non_extrema).append(index)
+                removable = non_extrema + extrema
+                excess = rendered_count - MAX_LIVE_RENDER_POINTS
+                if len(removable) >= excess:
+                    remove_positions = np.linspace(
+                        0, len(removable) - 1, num=excess, dtype=int,
+                    )
+                    removed = {removable[int(position)] for position in remove_positions}
+                    kept_indices = [
+                        index for index in range(len(render_x)) if index not in removed
+                    ]
+                else:
+                    # If nearly every retained point starts a new segment,
+                    # preserve endpoints and spread the remaining display
+                    # budget across the trace. The raw cache remains intact.
+                    point_budget = max(1, (MAX_LIVE_RENDER_POINTS + 1) // 2)
+                    kept_indices = np.linspace(
+                        0, len(render_x) - 1,
+                        num=min(point_budget, len(render_x)), dtype=int,
+                    ).tolist()
+
+                bounded_x: list[float] = []
+                bounded_y: list[float] = []
+                bounded_breaks: list[bool] = []
+                previous = -1
+                for index in kept_indices:
+                    bounded_x.append(float(render_x[index]))
+                    bounded_y.append(float(render_y[index]))
+                    bounded_breaks.append(any(render_breaks[previous + 1:index + 1]))
+                    previous = index
+                render_x, render_y, render_breaks = bounded_x, bounded_y, bounded_breaks
+
         x_values: list[float] = []
         y_values: list[float] = []
-        previous_x = None
-        reference_step = None
-        self._plot_x_nondecreasing = True
-        self._plot_x_uniformly_spaced = True
-        for index, (x, y) in enumerate(zip(self._plot_x, self._plot_y)):
-            current_x = float(x)
-            has_break = bool(index and index < len(self._plot_break_before) and self._plot_break_before[index])
-            if not math.isfinite(current_x):
-                self._plot_x_nondecreasing = False
-                self._plot_x_uniformly_spaced = False
-            elif previous_x is not None:
-                step = current_x - previous_x
-                if step < 0:
-                    self._plot_x_nondecreasing = False
-                    self._plot_x_uniformly_spaced = False
-                elif step == 0 or has_break:
-                    self._plot_x_uniformly_spaced = False
-                elif reference_step is None:
-                    reference_step = step
-                elif not math.isclose(step, reference_step, rel_tol=1e-3):
-                    self._plot_x_uniformly_spaced = False
-            elif has_break:
-                self._plot_x_uniformly_spaced = False
-            if math.isfinite(current_x):
-                previous_x = current_x
-            if has_break:
+        for index, (x, y) in enumerate(zip(render_x, render_y)):
+            if index and index < len(render_breaks) and render_breaks[index]:
                 # Keep X nondecreasing for pyqtgraph's clipToView bisect, and
-                # retain an explicit NaN in Y so finite-only connectivity never
-                # bridges a failed reading or a gap in imported history.
+                # retain an explicit NaN so the trace never bridges a gap.
                 x_values.append(float(x))
                 y_values.append(math.nan)
-            x_values.append(current_x)
-            y_values.append(float(y) - origin)
+            x_values.append(float(x))
+            raw_value = float(y)
+            if is_voltage and (not math.isfinite(raw_value) or abs(raw_value) > VOLTAGE_PLOT_ABSOLUTE_LIMIT_V):
+                y_values.append(math.nan)
+            else:
+                y_values.append(raw_value - origin)
         # PyQtGraph's clipToView bisects X, while autoDownsample assumes an
-        # evenly spaced X sequence. Preserve recorded samples/order whenever
-        # those assumptions do not hold for imported or event-marked data.
+        # evenly spaced X sequence. Live display points are already decimated
+        # above the render budget, while full-resolution samples remain in the
+        # plot cache and are still written to the raw CSV by the worker.
         self.curve.setData(
             x_values,
             y_values,
             connect="finite",
-            autoDownsample=self._plot_x_uniformly_spaced,
+            autoDownsample=self._plot_x_uniformly_spaced and not render_was_downsampled,
             downsampleMethod="peak",
             clipToView=self._plot_x_nondecreasing,
         )
-        self._plot_y_anchor_x = np.asarray(self._plot_x, dtype=float)
-        self._plot_y_anchor_values = np.asarray(self._plot_y, dtype=float)
+        self._plot_y_anchor_x = x_array
+        anchor_values = np.asarray(self._plot_y, dtype=float)
+        has_out_of_range_voltage = False
+        if is_voltage:
+            out_of_range = np.isfinite(anchor_values) & (np.abs(anchor_values) > VOLTAGE_PLOT_ABSOLUTE_LIMIT_V)
+            has_out_of_range_voltage = bool(np.any(out_of_range))
+            anchor_values[out_of_range] = np.nan
+        self._plot_y_anchor_values = anchor_values
+        if hasattr(self, "voltage_range_warning"):
+            if has_out_of_range_voltage:
+                self.voltage_range_warning.setText(
+                    "超出 −1000 至 +1000 V 的曲线点已隐藏；原始读数和 CSV 保留。"
+                )
+                self.voltage_range_warning.show()
+            else:
+                self.voltage_range_warning.hide()
         if self._baseline is not None:
             self.baseline_line.setValue(float(self._baseline) - origin)
             self.baseline_line.show()
@@ -6399,6 +7655,11 @@ class MainWindow(QMainWindow):
     def _rebase_plot_y_origin(self, new_origin: float) -> None:
         """Move the plot coordinate origin while preserving the visible range."""
         if not math.isfinite(new_origin):
+            return
+        if (
+            descriptor(self._current_mode).quantity == "voltage"
+            and abs(new_origin) > VOLTAGE_PLOT_ABSOLUTE_LIMIT_V
+        ):
             return
         old_origin = self._plot_y_origin or 0.0
         if new_origin == old_origin:
@@ -6542,23 +7803,34 @@ class MainWindow(QMainWindow):
         points = self._history_overview_data if self._history_mode and self._history_overview_data else None
         plot_x = points["x"] if points is not None else self._plot_x
         plot_y = points["y"] if points is not None else self._plot_y
+        if descriptor(self._current_mode).quantity == "voltage":
+            plot_y = [
+                float(value) for value in plot_y
+                if _voltage_plot_value_is_visible(float(value))
+            ]
+        origin = self._plot_y_origin or 0.0
         if not plot_x or not plot_y:
+            self.view_box.set_pan_x_data_bounds(None)
             self.view_box.set_pan_y_data_bounds(None)
+            y_view_min, y_view_max = _mode_plot_y_view_limits(self._current_mode, origin, 0.0, 0.0)
+            self.view_box.setLimits(yMin=y_view_min, yMax=y_view_max)
             return
         first_x = float(plot_x[0])
         last_x = float(plot_x[-1])
+        min_x = min(float(value) for value in plot_x)
+        max_x = max(float(value) for value in plot_x)
         min_y = min(float(value) for value in plot_y)
         max_y = max(float(value) for value in plot_y)
-        origin = self._plot_y_origin or 0.0
+        self.view_box.set_pan_x_data_bounds((min_x, max_x))
         min_y -= origin
         max_y -= origin
         self.view_box.set_pan_y_data_bounds((min_y, max_y))
-        x_margin = max((last_x - first_x) * 0.05, abs(first_x) * 1e-12, 1e-6)
+        x_margin = max((max_x - min_x) * 0.05, abs(min_x) * 1e-12, 1e-6)
         y_margin = _plot_y_margin(min_y + origin, max_y + origin)
-        y_view_min, y_view_max = _plot_y_view_limits(min_y, max_y)
+        y_view_min, y_view_max = _mode_plot_y_view_limits(self._current_mode, origin, min_y, max_y)
         self.view_box.setLimits(
-            xMin=0.0 if self.follow_check.isChecked() else first_x - x_margin,
-            xMax=last_x + max(x_margin, AUTO_FOLLOW_WINDOW_S) if self.follow_check.isChecked() else last_x + x_margin,
+            xMin=0.0 if self.follow_check.isChecked() else min_x - x_margin,
+            xMax=max_x + max(x_margin, AUTO_FOLLOW_WINDOW_S) if self.follow_check.isChecked() else max_x + x_margin,
             yMin=y_view_min,
             yMax=y_view_max,
         )
@@ -6571,6 +7843,12 @@ class MainWindow(QMainWindow):
         points = self._history_overview_data if self._history_mode and self._history_overview_data else None
         plot_x = points["x"] if points is not None else self._plot_x
         plot_y = points["y"] if points is not None else self._plot_y
+        is_voltage = descriptor(self._current_mode).quantity == "voltage"
+        if is_voltage:
+            plot_y = [
+                float(value) for value in plot_y
+                if _voltage_plot_value_is_visible(float(value))
+            ]
         if plot_x and plot_y:
             self.plot_widget.getPlotItem().enableAutoRange(x=False, y=False)
             first_x = float(plot_x[0])
@@ -6587,6 +7865,18 @@ class MainWindow(QMainWindow):
                 yRange=(min_y - y_margin, max_y + y_margin),
                 padding=0,
             )
+        elif plot_x and is_voltage:
+            self.plot_widget.getPlotItem().enableAutoRange(x=False, y=False)
+            first_x = float(plot_x[0])
+            last_x = float(plot_x[-1])
+            origin = self._plot_y_origin or 0.0
+            y_lower, y_upper = _mode_plot_y_view_limits(self._current_mode, origin, 0.0, 0.0)
+            x_margin = max((last_x - first_x) * 0.05, abs(first_x) * 1e-12, 1e-6)
+            self.view_box.setRange(
+                xRange=(first_x - x_margin, last_x + x_margin),
+                yRange=(y_lower, y_upper),
+                padding=0,
+            )
         else:
             self.plot_widget.getPlotItem().enableAutoRange(x=True, y=True)
             self.plot_widget.autoRange(padding=0.04)
@@ -6599,7 +7889,7 @@ class MainWindow(QMainWindow):
         self._history_mode = False
         self.chart_source_label.setText("实时数据")
         self.chart_source_label.setToolTip("当前图表数据来源：实时采集缓存")
-        self.return_live_button.setEnabled(bool(self._plot_x))
+        self._set_return_live_enabled(bool(self._plot_x))
         self.follow_check.setChecked(True)
         self._update_plot_data_limits()
         if self._plot_x and self._plot_y:
@@ -6702,7 +7992,7 @@ class MainWindow(QMainWindow):
             )
         self.chart_source_label.setText("实时数据")
         self.chart_source_label.setToolTip("当前图表数据来源：实时采集缓存")
-        self.return_live_button.setEnabled(bool(self._plot_x))
+        self._set_return_live_enabled(bool(self._plot_x))
         self._update_stats(self._global_stats)
 
     def _clear_plot(self, *, preserve_live_snapshot: bool = False) -> None:
@@ -6744,6 +8034,8 @@ class MainWindow(QMainWindow):
         self.latest_invalid_label.setVisible(not self._short_viewport_layout)
         self.latest_invalid_log_button.setEnabled(False)
         self.latest_invalid_log_button.setVisible(not self._short_viewport_layout)
+        self.display_loss_warning.clear()
+        self.display_loss_warning.hide()
         self._last_acquisition_issue = ""
         self.recovery_hint_label.clear()
         self.recovery_hint_label.setToolTip("")
@@ -6753,7 +8045,7 @@ class MainWindow(QMainWindow):
             self._history_mode = False
             self.chart_source_label.setText("实时数据")
             self.chart_source_label.setToolTip("当前图表数据来源：实时采集缓存")
-            self.return_live_button.setEnabled(False)
+            self._set_return_live_enabled(False)
         self._selected_plot_point = None
         self._selected_plot_metadata = None
         self._locked_cursor_marker.hide()
@@ -6768,6 +8060,9 @@ class MainWindow(QMainWindow):
         self.valid_sample_count_label.setText("有效样本 0")
         self.curve.setData([], [])
         self.plot_empty_overlay.show()
+        self.plot_empty_title.setText("等待采样")
+        self.plot_empty_hint.setText("连接 Fluke 8845A 后开始单次测量或连续采集")
+        self.plot_empty_new_measurement_button.hide()
         for item in self.plot_widget.items():
             if isinstance(item, pg.InfiniteLine) and item is not self.baseline_line:
                 self.plot_widget.removeItem(item)
@@ -6778,6 +8073,7 @@ class MainWindow(QMainWindow):
         self._update_stats()
 
     def _clear_event_markers(self) -> None:
+        self._cancel_pending_event_marker_load()
         for item in (*self._event_lines, *self._event_labels):
             self.plot_widget.removeItem(item)
         self._event_lines.clear()
@@ -6876,7 +8172,7 @@ class MainWindow(QMainWindow):
         self.chart_source_label.setText(f"历史：{Path(path).name}")
         self.chart_source_label.setToolTip(f"当前图表数据来源：历史文件 {path}")
         self.view_mode_label.setText("历史文件视图")
-        self.return_live_button.setEnabled(True)
+        self._set_return_live_enabled(True)
         self._add_event_markers(history_events)
         spec = descriptor(self._current_mode)
         self.plot_widget.setLabel("left", f"历史数据 · {spec.display_quantity}", units=spec.unit_si, color="#697470")
@@ -6968,6 +8264,8 @@ class MainWindow(QMainWindow):
             self._show_error("曲线截图保存失败")
         else:
             self.statusBar().showMessage(f"截图已保存：{path}", 8000)
+            self._record_file_export_result("曲线截图", path)
+            self._refresh_file_workspace()
 
     def _diagnose(self) -> None:
         if self._diagnostic_pending:
@@ -7162,7 +8460,8 @@ class MainWindow(QMainWindow):
             self._shutdown_file_errors_reported = True
         self.close()
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+    def _cancel_pending_view_tasks_on_close(self) -> None:
+        self._cancel_pending_event_marker_load()
         history_timer = getattr(self, "_history_range_timer", None)
         if history_timer is not None:
             history_timer.stop()
@@ -7175,7 +8474,10 @@ class MainWindow(QMainWindow):
         ):
             self._history_range_task.cancel()
         self._history_range_pending = False
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._shutdown_finished or not self._worker_thread.isRunning():
+            self._cancel_pending_view_tasks_on_close()
             self._save_profiles()
             self._shutdown_started = True
             self._shutdown_finished = True
@@ -7216,6 +8518,8 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        self._clear_pending_new_measurement()
+        self._cancel_pending_view_tasks_on_close()
         self._save_profiles()
         self._shutdown_started = True
         history_task = getattr(self, "_history_load_task", None)

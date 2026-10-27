@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
+from collections import deque
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -66,7 +68,14 @@ def test_worker_one_shot_persists_valid_or_failed_attempt_without_fabricating_va
     worker = MeasurementWorker()
     rows_seen = []
     finished = []
-    worker.sample_ready.connect(lambda: rows_seen.extend(worker.take_sample_update()[0]))
+    lifecycle = []
+
+    def collect_sample():
+        lifecycle.append("sample")
+        rows_seen.extend(worker.take_sample_update()[0])
+
+    worker.experiment_started.connect(lambda *_args: lifecycle.append("started"))
+    worker.sample_ready.connect(collect_sample)
     worker.experiment_finished.connect(finished.append)
 
     settings = ModeSettings(Mode.DCV)
@@ -79,6 +88,7 @@ def test_worker_one_shot_persists_valid_or_failed_attempt_without_fabricating_va
         pass
     assert len(finished) == 1
     assert len(rows_seen) == 1
+    assert lifecycle == ["started", "sample"]
     assert rows_seen[0]["status"] == expected_status
     assert (rows_seen[0]["value_si"] != "") is (expected_status == "ok")
 
@@ -126,6 +136,55 @@ def test_invalid_read_details_use_sample_mailbox_without_per_failure_log_signal(
     worker.shutdown()
 
 
+def test_worker_emits_typed_acquisition_state_and_single_shot_flag(tmp_path):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="typed state", read_latency_s=0))
+    transitions = []
+    worker.acquisition_state_changed.connect(
+        lambda state, one_shot: transitions.append((state, one_shot))
+    )
+
+    worker.start_experiment(settings, "typed state", str(tmp_path), 0, True)
+
+    assert transitions == [("running", True), ("stopped", False)]
+    worker.shutdown()
+
+
+def test_worker_emits_continuous_pause_resume_and_stop_states(tmp_path, monkeypatch):
+    from fluke8845a.storage import ExperimentRecorder
+
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="typed continuous state", read_latency_s=0))
+    transitions = []
+    state_during_finalization = []
+    worker.acquisition_state_changed.connect(
+        lambda state, one_shot: transitions.append((state, one_shot))
+    )
+    original_finish = ExperimentRecorder.finish
+
+    def track_state_during_finalization(recorder, status):
+        state_during_finalization.append(worker.state)
+        return original_finish(recorder, status)
+
+    monkeypatch.setattr(ExperimentRecorder, "finish", track_state_during_finalization)
+
+    worker.start_experiment(settings, "typed continuous state", str(tmp_path), 60, False)
+    worker.pause()
+    worker.resume()
+    worker.stop()
+
+    assert transitions == [
+        ("running", False),
+        ("paused", False),
+        ("running", False),
+        ("stopped", False),
+    ]
+    assert state_during_finalization == [AcquisitionState.RUNNING]
+    worker.shutdown()
+
+
 def test_run_log_excludes_per_read_range_queries_but_keeps_setup_and_faults(qt_core_application):
     worker = MeasurementWorker()
 
@@ -169,6 +228,109 @@ def test_worker_holds_experiment_name_lock_until_continuous_run_stops(tmp_path):
         pass
     worker.shutdown()
     worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "interval_s",
+    [True, False, float("nan"), float("inf"), float("-inf"), -0.001, 86400.001],
+)
+def test_start_experiment_rejects_invalid_interval_before_device_or_storage_changes(
+    tmp_path, monkeypatch, interval_s,
+):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="invalid start interval", read_latency_s=0))
+    output_root = tmp_path / "experiments"
+    errors = []
+    configure_calls = []
+    worker.error.connect(errors.append)
+
+    def record_configure(instrument, requested):
+        configure_calls.append(requested)
+        return {"range_readback_si": None}
+
+    monkeypatch.setattr(Mock8845A, "configure", record_configure)
+
+    try:
+        worker.start_experiment(settings, "invalid interval", str(output_root), interval_s, False)
+
+        assert configure_calls == []
+        assert not output_root.exists()
+        assert worker._recorder is None
+        assert worker.state is AcquisitionState.STOPPED
+        assert errors and "采样间隔" in errors[-1]
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("interval_s", [None, 0.0, 86400.0])
+def test_start_experiment_accepts_supported_interval_boundaries(tmp_path, interval_s):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="valid interval boundaries", read_latency_s=0))
+    finished = []
+    errors = []
+    worker.experiment_finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    try:
+        worker.start_experiment(
+            settings, "valid interval boundary", str(tmp_path), interval_s, True,
+        )
+
+        assert errors == []
+        assert worker.state is AcquisitionState.STOPPED
+        assert len(finished) == 1
+        metadata = json.loads((Path(finished[0]) / "config.json").read_text(encoding="utf-8"))
+        assert metadata["target_interval_s"] == interval_s
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("interval_s", [True, False, 86400.001])
+def test_live_target_interval_rejects_invalid_values_without_changing_run(tmp_path, interval_s):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="live interval upper bound", read_latency_s=0))
+    worker.start_experiment(settings, "live interval upper bound", str(tmp_path), 1.0, False)
+    worker._timer.stop()
+    recorder = worker._recorder
+    assert recorder is not None
+
+    try:
+        result = worker.set_target_interval(interval_s)
+
+        assert result["success"] is False
+        assert result["changed"] is False
+        assert worker._target_interval_s == 1.0
+        assert recorder.metadata["target_interval_s"] == 1.0
+        assert worker.state is AcquisitionState.RUNNING
+    finally:
+        worker.stop()
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("interval_s", [None, 0.0, 86400.0])
+def test_live_target_interval_accepts_supported_boundaries(tmp_path, interval_s):
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="live interval boundaries", read_latency_s=0))
+    worker.start_experiment(settings, "live interval boundaries", str(tmp_path), 1.0, False)
+    worker._timer.stop()
+    recorder = worker._recorder
+    assert recorder is not None
+
+    try:
+        result = worker.set_target_interval(interval_s)
+
+        assert result["success"] is True
+        assert result["changed"] is True
+        assert worker._target_interval_s == interval_s
+        assert recorder.metadata["target_interval_s"] == interval_s
+        assert worker.state is AcquisitionState.RUNNING
+    finally:
+        worker.stop()
+        worker.shutdown()
 
 
 def test_worker_reserves_output_directory_before_instrument_configuration(tmp_path, monkeypatch):
@@ -487,9 +649,11 @@ def test_startup_log_failure_stops_worker_and_marks_record_incomplete(tmp_path, 
     settings = ModeSettings(Mode.DCV)
     worker.connect_mock(settings, MockScenario(name="startup storage failure", read_latency_s=0))
     finished = []
+    started = []
     statuses = []
     save_results = []
     worker.experiment_finished.connect(finished.append)
+    worker.experiment_started.connect(started.append)
     worker.status_changed.connect(statuses.append)
     worker.experiment_save_result.connect(
         lambda directory, complete, detail: save_results.append((directory, complete, detail))
@@ -500,6 +664,7 @@ def test_startup_log_failure_stops_worker_and_marks_record_incomplete(tmp_path, 
     assert worker.state is AcquisitionState.STOPPED
     assert worker._recorder is None
     assert len(finished) == 1
+    assert started == []
     assert len(save_results) == 1
     assert save_results[0][1] is False
     assert "启动失败" in save_results[0][2]
@@ -697,11 +862,13 @@ def test_csv_fsync_failure_stops_worker_and_marks_experiment_incomplete(
     assert worker.state is AcquisitionState.STOPPED
     assert worker._recorder is None
     assert not worker._timer.isActive()
+    assert not worker._storage_sync_timer.isActive()
     assert len(finished) == 1
     assert len(save_results) == 1
     assert save_results[0][1] is False
-    assert "不完整" in save_results[0][2]
-    assert statuses[-1].startswith("实验已停止；数据记录可能不完整")
+    assert "CSV持久化同步失败" in save_results[0][2]
+    assert "未完成" in save_results[0][2]
+    assert statuses[-1].startswith("CSV持久化同步失败")
     assert errors and "simulated CSV fsync failure" in errors[-1]
     assert all(stream.closed for stream in (recorder._data_stream, recorder._event_stream, recorder._log_stream))
 
@@ -712,8 +879,8 @@ def test_csv_fsync_failure_stops_worker_and_marks_experiment_incomplete(
     assert len(rows) == 1
     assert rows[0]["status"] == "ok"
     assert rows[0]["raw_reading"]
-    assert metadata["completion_status"] == "storage_error"
-    assert metadata["sample_count"] == 1
+    assert metadata["completion_status"] == "running"
+    assert metadata["sample_count"] == 0
     worker.shutdown()
 
 
@@ -957,6 +1124,131 @@ def test_worker_coalesces_notifications_and_bounds_gui_mailbox():
     worker.shutdown()
 
 
+def test_worker_mock_100k_sample_stress_preserves_csv_and_bounds_display_mailbox(tmp_path):
+    target_attempts = 100_000
+    persisted_checkpoint = 1_000
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    scenario = MockScenario(
+        name="bounded-display-stress",
+        noise_fraction=1e-5,
+        drift_fraction_per_minute=1e-4,
+        step_at_s=0.01,
+        recovery_at_s=0.05,
+        read_latency_s=0,
+    )
+    loop = QEventLoop()
+    finished = []
+    timed_out = []
+    persisted_while_running: list[tuple[AcquisitionState, int]] = []
+
+    def on_finished(directory):
+        finished.append(directory)
+        loop.quit()
+
+    def stop_when_target_is_reached():
+        recorder = worker._recorder
+        if (
+            recorder is not None
+            and recorder.sample_count >= persisted_checkpoint
+            and not persisted_while_running
+        ):
+            with recorder._csv_sync_lock:
+                with (recorder.directory / "measurements.csv").open(
+                    newline="", encoding="utf-8-sig",
+                ) as stream:
+                    persisted_while_running.append((
+                        worker.state,
+                        sum(1 for _row in csv.DictReader(stream)),
+                    ))
+        if recorder is not None and recorder.sample_count >= target_attempts:
+            worker.stop()
+
+    def stop_after_watchdog():
+        timed_out.append(worker._recorder.sample_count if worker._recorder else 0)
+        worker.stop()
+
+    poll = QTimer()
+    poll.setInterval(5)
+    poll.timeout.connect(stop_when_target_is_reached)
+    watchdog = QTimer()
+    watchdog.setSingleShot(True)
+    watchdog.timeout.connect(stop_after_watchdog)
+    worker.experiment_finished.connect(on_finished)
+    worker.connect_mock(settings, scenario)
+
+    try:
+        watchdog.start(55_000)
+        worker.start_experiment(settings, "bounded display stress", str(tmp_path), 0, False)
+        poll.start()
+        loop.exec()
+        poll.stop()
+        watchdog.stop()
+
+        assert not timed_out, f"Mock acquisition did not reach {target_attempts} samples"
+        assert worker.state is AcquisitionState.STOPPED
+        assert len(finished) == 1
+        directory = Path(finished[0])
+        sample_indexes = []
+        all_rows_valid = True
+        with (directory / "measurements.csv").open(
+            newline="", encoding="utf-8-sig",
+        ) as stream:
+            for row in csv.DictReader(stream):
+                sample_indexes.append(int(row["sample_index"]))
+                try:
+                    value = float(row["value_si"])
+                except (TypeError, ValueError):
+                    all_rows_valid = False
+                else:
+                    all_rows_valid = all_rows_valid and (
+                        row["status"] == "ok"
+                        and bool(row["raw_reading"])
+                        and math.isfinite(value)
+                    )
+        metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        display_rows, _rate, stats = worker.take_sample_update(
+            include_display_dropped_rows=True,
+        )
+
+        assert persisted_while_running
+        assert persisted_while_running[0][0] is AcquisitionState.RUNNING
+        assert persisted_while_running[0][1] >= persisted_checkpoint
+        assert len(sample_indexes) >= target_attempts
+        assert sample_indexes == list(range(1, len(sample_indexes) + 1))
+        assert all_rows_valid
+        assert len(worker._ui_pending_rows) == 0
+        assert len(display_rows) <= MAX_PENDING_GUI_ROWS
+        assert len(display_rows) + stats["display_dropped_rows"] == len(sample_indexes)
+        assert stats["attempt_count"] == len(sample_indexes)
+        assert stats["valid_count"] == len(sample_indexes)
+        assert metadata["simulation"] is True
+        assert metadata["sample_count"] == len(sample_indexes)
+        assert metadata["completion_status"] == "stopped"
+    finally:
+        poll.stop()
+        watchdog.stop()
+        worker.shutdown()
+
+
+def test_worker_reports_gui_rows_dropped_before_first_mailbox_drain(monkeypatch):
+    monkeypatch.setattr(worker_module, "MAX_PENDING_GUI_ROWS", 3)
+    worker = MeasurementWorker()
+    worker._ui_pending_rows = deque(maxlen=3)
+    worker._pending_rows.extend(
+        {"sample_index": index} for index in range(1, 6)
+    )
+
+    worker._flush_ui_rows()
+    rows, _rate, stats = worker.take_sample_update(
+        include_display_dropped_rows=True,
+    )
+
+    assert [row["sample_index"] for row in rows] == [3, 4, 5]
+    assert stats["display_dropped_rows"] == 2
+    worker.shutdown()
+
+
 def test_take_sample_update_reports_attempt_counts_and_recent_valid_intervals(tmp_path, monkeypatch):
     worker = MeasurementWorker()
     settings = ModeSettings(Mode.DCV)
@@ -970,7 +1262,7 @@ def test_take_sample_update_reports_attempt_counts_and_recent_valid_intervals(tm
     valid_index = 0
     valid_offsets_ns = (0, 100_000_000, 400_000_000, 450_000_000)
     request_offsets_ns = (-100_000_000, -50_000_000, -10_000_000, 440_000_000)
-    base_ns = time.monotonic_ns() + 2_000_000_000
+    base_ns = time.perf_counter_ns() + 2_000_000_000
 
     def read_with_one_timeout():
         nonlocal attempt, valid_index
@@ -1894,6 +2186,9 @@ def test_scpi_read_timeout_is_saved_once_then_session_closes(tmp_path, monkeypat
             rows = list(csv.DictReader(stream))
         metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
         assert len(rows) == 1
+        assert metadata["host_monotonic_clock"]["api"] == "time.perf_counter_ns"
+        assert metadata["host_monotonic_clock"]["implementation"]
+        assert metadata["host_monotonic_clock"]["resolution_s"] > 0
         assert rows[0]["status"] == "timeout"
         assert rows[0]["value_si"] == ""
         assert rows[0]["raw_reading"] == "partial"
@@ -2382,6 +2677,63 @@ def test_live_measurement_speed_change_is_logged_and_each_row_keeps_active_nplc(
         worker.shutdown()
 
 
+@pytest.mark.parametrize("mode", [Mode.ACV, Mode.ACI])
+def test_live_ac_bandwidth_change_records_effective_sample_and_timestamps(mode, tmp_path):
+    worker = MeasurementWorker()
+    initial = ModeSettings(mode, ac_bandwidth_hz=20)
+    worker.connect_mock(
+        initial,
+        MockScenario(name=f"live {mode.value} bandwidth", read_latency_s=0.005, step_at_s=1e9, recovery_at_s=None),
+    )
+    finished = []
+    results = []
+    loop = QEventLoop()
+    worker.experiment_finished.connect(lambda directory: (finished.append(directory), loop.quit()))
+    worker.measurement_speed_result.connect(lambda success, message: results.append((success, message)))
+
+    QTimer.singleShot(80, lambda: worker.set_measurement_speed(replace(initial, ac_bandwidth_hz=3)))
+    QTimer.singleShot(300, worker.stop)
+    worker.start_experiment(initial, f"live {mode.value} bandwidth", str(tmp_path), 0.01, False)
+    loop.exec()
+
+    try:
+        assert worker.state is AcquisitionState.STOPPED
+        assert len(finished) == 1
+        assert results and results[0][0] is True
+
+        directory = Path(finished[0])
+        metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        with (directory / "events.csv").open(newline="", encoding="utf-8-sig") as stream:
+            events = list(csv.DictReader(stream))
+        with (directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
+            rows = list(csv.DictReader(stream))
+
+        changes = metadata["measurement_speed_changes"]
+        assert metadata["mode_settings"]["ac_bandwidth_hz"] == 3
+        assert len(changes) == 1
+        change = changes[0]
+        assert change["previous_ac_bandwidth_hz"] == 20
+        assert change["ac_bandwidth_hz"] == 3
+        assert change["effective_sample_index"] >= 2
+        assert change["timestamp_local"] and change["timestamp_utc"]
+        assert metadata["actual_device_configuration"]["ac_bandwidth_response"] == "3"
+
+        assert rows[0]["ac_bandwidth_hz"] == "20"
+        effective_row = next(
+            row for row in rows if int(row["sample_index"]) == change["effective_sample_index"]
+        )
+        assert effective_row["ac_bandwidth_hz"] == "3"
+        assert len(events) == 1
+        assert "交流带宽 20→3 Hz" in events[0]["event"]
+        assert f"从样本 {change['effective_sample_index']} 起生效" in events[0]["event"]
+        # An event row points to the last sample already observed at its timestamp;
+        # config metadata and the next measurement row carry the effective sample.
+        assert int(events[0]["sample_index"]) == change["effective_sample_index"] - 1
+        assert events[0]["timestamp_local"] and events[0]["timestamp_utc"]
+    finally:
+        worker.shutdown()
+
+
 def test_rejected_live_speed_validation_keeps_acquisition_running(tmp_path):
     worker = MeasurementWorker()
     initial = ModeSettings(Mode.DCV, nplc=1)
@@ -2480,37 +2832,31 @@ def test_live_speed_serial_failure_closes_connection_and_finalizes_run(tmp_path,
         worker.shutdown()
 
 
-def test_live_speed_rejects_digital_filter_without_stopping_acquisition(tmp_path):
+def test_live_speed_applies_digital_filter_change_and_logs_it(tmp_path):
     worker = MeasurementWorker()
     initial = ModeSettings(Mode.DCV, nplc=1)
     worker.connect_mock(
         initial,
-        MockScenario(name="filter speed rejection", read_latency_s=0.005, step_at_s=1e9, recovery_at_s=None),
+        MockScenario(name="filter speed change", read_latency_s=0.005, step_at_s=1e9, recovery_at_s=None),
     )
     finished = []
     results = []
-    states_after_rejection = []
-    samples_at_rejection = []
     loop = QEventLoop()
     worker.experiment_finished.connect(lambda directory: (finished.append(directory), loop.quit()))
     worker.measurement_speed_result.connect(lambda success, message: results.append((success, message)))
 
     def request_filter_speed():
         worker.set_measurement_speed(replace(initial, nplc=10, digital_filter=True))
-        states_after_rejection.append(worker.state)
-        samples_at_rejection.append(
-            worker._recorder.sample_count if worker._recorder is not None else -1
-        )
 
     QTimer.singleShot(80, request_filter_speed)
     QTimer.singleShot(300, worker.stop)
     QTimer.singleShot(3000, loop.quit)
-    worker.start_experiment(initial, "filter speed rejection", str(tmp_path), 0.01, False)
+    worker.start_experiment(initial, "filter speed change", str(tmp_path), 0.01, False)
     loop.exec()
 
     try:
-        assert states_after_rejection == [AcquisitionState.RUNNING]
-        assert results and results[0][0] is False
+        assert worker.state == AcquisitionState.STOPPED
+        assert results and results[0][0] is True
         assert "数字滤波" in results[0][1]
         assert len(finished) == 1
         directory = Path(finished[0])
@@ -2518,7 +2864,12 @@ def test_live_speed_rejects_digital_filter_without_stopping_acquisition(tmp_path
         with (directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
             rows = list(csv.DictReader(stream))
         assert metadata["completion_status"] == "stopped"
-        assert len(rows) > samples_at_rejection[0]
+        assert metadata["mode_settings"]["digital_filter"] is True
+        change = metadata["measurement_speed_changes"][0]
+        assert change["previous_digital_filter"] is False
+        assert change["digital_filter"] is True
+        assert any(row["digital_filter"] == "False" for row in rows)
+        assert any(row["digital_filter"] == "True" for row in rows)
     finally:
         worker.shutdown()
 
@@ -2676,6 +3027,328 @@ def test_pause_resume_halts_scheduled_samples_and_records_both_transitions(tmp_p
         sample_gap_s = float(resumed_rows[0]["elapsed_s"]) - float(pre_pause_rows[-1]["elapsed_s"])
         assert sample_gap_s >= paused_for_s - 0.05
         assert all(row["status"] == "ok" for row in rows)
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("transition", ["pause", "resume"])
+def test_pause_resume_event_write_failure_stops_incomplete_experiment(
+    request, tmp_path, monkeypatch, transition
+):
+    worker = MeasurementWorker()
+    request.addfinalizer(worker.shutdown)
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="pause resume event failure", read_latency_s=0))
+    finished = []
+    errors = []
+    save_results = []
+    worker.experiment_finished.connect(finished.append)
+    worker.error.connect(errors.append)
+    worker.experiment_save_result.connect(
+        lambda directory, complete, detail: save_results.append((directory, complete, detail))
+    )
+
+    worker.start_experiment(settings, "pause resume event failure", str(tmp_path), 3600, False)
+    recorder = worker._recorder
+    assert recorder is not None
+    worker._timer.stop()
+    if transition == "resume":
+        worker.pause()
+        assert worker.state is AcquisitionState.PAUSED
+
+    def fail_event_write(*_args, **_kwargs):
+        raise RuntimeError("simulated event serializer failure")
+
+    monkeypatch.setattr(recorder, "append_event", fail_event_write)
+    getattr(worker, transition)()
+
+    assert worker.state is AcquisitionState.STOPPED
+    assert worker._recorder is None
+    assert not worker._timer.isActive()
+    assert not worker._storage_sync_timer.isActive()
+    assert len(finished) == 1
+    assert len(save_results) == 1
+    assert save_results[0][1] is False
+    assert "不完整" in save_results[0][2]
+    assert errors and "simulated event serializer failure" in errors[-1]
+    metadata = json.loads((Path(finished[0]) / "config.json").read_text(encoding="utf-8"))
+    assert metadata["completion_status"] == "storage_error"
+
+
+@pytest.mark.parametrize("transition", ["pause", "resume"])
+def test_pause_resume_metadata_write_failure_preserves_event_and_stops_incomplete_experiment(
+    request, tmp_path, monkeypatch, transition
+):
+    worker = MeasurementWorker()
+    request.addfinalizer(worker.shutdown)
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="pause resume metadata failure", read_latency_s=0))
+    finished = []
+    errors = []
+    save_results = []
+    worker.experiment_finished.connect(finished.append)
+    worker.error.connect(errors.append)
+    worker.experiment_save_result.connect(
+        lambda directory, complete, detail: save_results.append((directory, complete, detail))
+    )
+
+    worker.start_experiment(settings, "pause resume metadata failure", str(tmp_path), 3600, False)
+    recorder = worker._recorder
+    assert recorder is not None
+    worker._timer.stop()
+    if transition == "resume":
+        worker.pause()
+        assert worker.state is AcquisitionState.PAUSED
+
+    event_count_after_failure = recorder.event_count + 1
+    write_metadata = recorder._write_metadata
+    failure_injected = False
+
+    def fail_event_metadata_once():
+        nonlocal failure_injected
+        if not failure_injected and recorder.event_count == event_count_after_failure:
+            failure_injected = True
+            raise ValueError("simulated event metadata serialization failure")
+        write_metadata()
+
+    monkeypatch.setattr(recorder, "_write_metadata", fail_event_metadata_once)
+    getattr(worker, transition)()
+
+    assert failure_injected
+    assert worker.state is AcquisitionState.STOPPED
+    assert worker._recorder is None
+    assert not worker._timer.isActive()
+    assert len(finished) == 1
+    assert len(save_results) == 1
+    assert save_results[0][1] is False
+    assert "不完整" in save_results[0][2]
+    assert errors and "simulated event metadata serialization failure" in errors[-1]
+    with (Path(finished[0]) / "events.csv").open(newline="", encoding="utf-8-sig") as stream:
+        event_rows = list(csv.DictReader(stream))
+    assert len(event_rows) == event_count_after_failure
+    expected_events = ["暂停采集"] if transition == "pause" else ["暂停采集", "继续采集"]
+    assert [row["event"] for row in event_rows] == expected_events
+    assert [row["event_index"] for row in event_rows] == [
+        str(index) for index in range(1, event_count_after_failure + 1)
+    ]
+    metadata = json.loads((Path(finished[0]) / "config.json").read_text(encoding="utf-8"))
+    assert metadata["event_count"] == event_count_after_failure
+    assert metadata["completion_status"] == "storage_error"
+
+
+def test_worker_periodically_fsyncs_csv_while_paused_without_new_samples(tmp_path, monkeypatch):
+    import fluke8845a.storage as storage_module
+
+    monkeypatch.setattr(worker_module, "STORAGE_SYNC_INTERVAL_MS", 5, raising=False)
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 0)
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="paused periodic sync", read_latency_s=0.001))
+    try:
+        worker.start_experiment(settings, "paused periodic sync", str(tmp_path), 60, False)
+        loop = QEventLoop()
+        QTimer.singleShot(50, loop.quit)
+        loop.exec()
+
+        recorder = worker._recorder
+        assert recorder is not None
+        assert recorder.sample_count >= 1
+        worker.pause()
+        sample_count = recorder.sample_count
+        csv_fds = {recorder._data_stream.fileno(), recorder._event_stream.fileno()}
+        synced_csv_fds = []
+        real_fsync = storage_module.os.fsync
+
+        def capture_csv_fsync(fd):
+            if fd in csv_fds:
+                synced_csv_fds.append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(storage_module.os, "fsync", capture_csv_fsync)
+        loop = QEventLoop()
+        QTimer.singleShot(45, loop.quit)
+        loop.exec()
+
+        assert synced_csv_fds
+        assert recorder.sample_count == sample_count
+    finally:
+        worker.shutdown()
+
+
+def test_worker_periodic_csv_fsync_runs_while_read_blocks_worker_thread(tmp_path, monkeypatch):
+    import threading
+
+    import fluke8845a.storage as storage_module
+
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 20_000_000)
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="blocking read durability", read_latency_s=0))
+    assert worker.instrument is not None
+
+    read_started = threading.Event()
+    release_read = threading.Event()
+    synced_during_read = threading.Event()
+    sync_threads = []
+    original_read = worker.instrument.read
+    original_sync = storage_module.ExperimentRecorder._sync_csv_streams
+
+    def capture_sync_during_read(recorder, *, force=False):
+        previous_sync_ns = recorder._last_csv_fsync_ns
+        result = original_sync(recorder, force=force)
+        if recorder._csv_sync_thread is not None:
+            sync_threads.append(recorder._csv_sync_thread)
+        if (
+            recorder._last_csv_fsync_ns != previous_sync_ns
+            and read_started.is_set()
+            and not release_read.is_set()
+        ):
+            synced_during_read.set()
+        return result
+
+    def blocking_read():
+        read_started.set()
+        if not release_read.wait(2):
+            raise TimeoutError("test did not release the simulated blocking read")
+        return original_read()
+
+    def release_after_sync_window():
+        if read_started.wait(1):
+            synced_during_read.wait(0.5)
+            release_read.set()
+
+    monkeypatch.setattr(
+        storage_module.ExperimentRecorder,
+        "_sync_csv_streams",
+        capture_sync_during_read,
+    )
+    monkeypatch.setattr(worker.instrument, "read", blocking_read)
+    release_thread = threading.Thread(target=release_after_sync_window, daemon=True)
+    release_thread.start()
+
+    try:
+        worker.start_experiment(settings, "blocking read durability", str(tmp_path), 0, True)
+        release_thread.join(timeout=1)
+        assert not release_thread.is_alive()
+        assert synced_during_read.is_set(), "periodic CSV fsync did not run while READ? was blocked"
+        assert sync_threads and not sync_threads[-1].is_alive()
+        assert worker.state is AcquisitionState.STOPPED
+    finally:
+        release_read.set()
+        release_thread.join(timeout=1)
+        worker.shutdown()
+
+
+def test_periodic_csv_fsync_failure_stops_paused_worker_as_incomplete(tmp_path, monkeypatch):
+    import fluke8845a.storage as storage_module
+
+    monkeypatch.setattr(worker_module, "STORAGE_SYNC_INTERVAL_MS", 5)
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 0)
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="periodic sync failure", read_latency_s=0.001))
+    finished = []
+    saved = []
+    errors = []
+    statuses = []
+    loop = QEventLoop()
+    worker.experiment_finished.connect(lambda directory: (finished.append(directory), loop.quit()))
+    worker.experiment_save_result.connect(
+        lambda directory, success, message: saved.append((directory, success, message))
+    )
+    worker.error.connect(errors.append)
+    worker.status_changed.connect(statuses.append)
+
+    try:
+        worker.start_experiment(settings, "periodic sync failure", str(tmp_path), 3600, False)
+        initial_loop = QEventLoop()
+        QTimer.singleShot(35, initial_loop.quit)
+        initial_loop.exec()
+        recorder = worker._recorder
+        assert recorder is not None
+        assert recorder.sample_count >= 1
+        worker.pause()
+        # Exercise the background sync thread's error delivery rather than the Qt timer path.
+        worker._storage_sync_timer.stop()
+
+        csv_fds = {recorder._data_stream.fileno(), recorder._event_stream.fileno()}
+        real_fsync = storage_module.os.fsync
+
+        def fail_csv_fsync(fd):
+            if fd in csv_fds:
+                raise OSError("simulated periodic CSV fsync failure")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(storage_module.os, "fsync", fail_csv_fsync)
+        QTimer.singleShot(500, loop.quit)
+        loop.exec()
+
+        assert worker.state is AcquisitionState.STOPPED
+        assert worker._recorder is None
+        assert not worker._storage_sync_timer.isActive()
+        assert len(finished) == 1
+        assert len(saved) == 1 and saved[0][1] is False
+        assert "simulated periodic CSV fsync failure" in " ".join(errors)
+        assert "持久化同步失败" in statuses[-1] and "未完成" in statuses[-1]
+        assert all(stream.closed for stream in (recorder._data_stream, recorder._event_stream))
+    finally:
+        worker.shutdown()
+
+
+def test_background_csv_sync_failure_is_not_lost_when_stop_precedes_queued_signal(
+    tmp_path, monkeypatch
+):
+    import json
+    import threading
+
+    import fluke8845a.storage as storage_module
+
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 0)
+    worker = MeasurementWorker()
+    settings = ModeSettings(Mode.DCV)
+    worker.connect_mock(settings, MockScenario(name="queued sync failure", read_latency_s=0.001))
+    saved = []
+    worker.experiment_save_result.connect(
+        lambda directory, success, message: saved.append((directory, success, message))
+    )
+
+    try:
+        worker.start_experiment(settings, "queued sync failure", str(tmp_path), 3600, False)
+        initial_loop = QEventLoop()
+        QTimer.singleShot(30, initial_loop.quit)
+        initial_loop.exec()
+        recorder = worker._recorder
+        assert recorder is not None and recorder.sample_count >= 1
+        worker.pause()
+        worker._storage_sync_timer.stop()
+
+        csv_fds = {recorder._data_stream.fileno(), recorder._event_stream.fileno()}
+        real_fsync = storage_module.os.fsync
+        failed_once = threading.Event()
+
+        def fail_only_first_csv_sync(fd):
+            if fd in csv_fds and not failed_once.is_set():
+                failed_once.set()
+                raise OSError("simulated one-time background CSV fsync failure")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(storage_module.os, "fsync", fail_only_first_csv_sync)
+        assert failed_once.wait(1), "background CSV sync did not fail"
+
+        # Do not pump Qt events between the background emission and stop().
+        # The queued worker slot therefore sees _recorder=None after finalization.
+        worker.stop()
+        from PySide6.QtCore import QCoreApplication
+
+        QCoreApplication.processEvents()
+
+        assert len(saved) == 1
+        directory, success, message = saved[0]
+        assert success is False
+        assert "fsync" in message.lower() or "同步" in message
+        metadata = json.loads((Path(directory) / "config.json").read_text(encoding="utf-8"))
+        assert metadata["completion_status"] == "running"
+        assert all(stream.closed for stream in (recorder._data_stream, recorder._event_stream))
     finally:
         worker.shutdown()
 

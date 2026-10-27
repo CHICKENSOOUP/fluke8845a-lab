@@ -100,6 +100,8 @@ def test_aci_mode_description_includes_frequency_ranges():
         assert detail in description
     assert "软件版本 ≥ 1.0.700.18" in description
     assert "未说明对应哪个软件字段" in description
+    assert "本软件不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档" in description
+    assert "使用前请在仪表面板核对软件版本" in description
     assert "OutG SW ≥ 1.0.700.18" not in description
 
 

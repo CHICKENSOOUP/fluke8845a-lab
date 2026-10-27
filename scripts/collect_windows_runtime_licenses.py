@@ -148,9 +148,18 @@ def collect_runtime_license_materials(
         "docs/licenses/LGPL-3.0.txt (planned path; not a legal clearance)",
         records,
     )
+    qt_for_python_gpl = licenses_root / "qt-for-python" / "GPL-3.0.txt"
+    _copy_file(
+        project_root / "docs" / "licenses" / "GPL-3.0.txt",
+        qt_for_python_gpl,
+        "Qt for Python planned LGPLv3 path",
+        "docs/licenses/GPL-3.0.txt (GNU GPL version 3 text referenced by LGPLv3)",
+        records,
+    )
     for name in ("PySide6_Essentials", "shiboken6"):
         distribution, metadata = _distribution(site_packages, name)
         copied = _copy_license_tree(distribution, licenses_root / name.casefold(), name, records)
+        copied.append(qt_for_python_gpl.as_posix())
         copied.append(qt_for_python_license.as_posix())
         components.append({
             "name": metadata["name"],

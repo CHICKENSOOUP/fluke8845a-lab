@@ -2,33 +2,29 @@ import pytest
 
 from fluke8845a import modes, scpi
 from fluke8845a.filter_policy import (
+    DIGITAL_FILTER_INFO,
     digital_filter_firmware_support,
     digital_filter_nplc_is_slow,
+    digital_filter_enable_error,
     digital_filter_setting_error,
 )
 from fluke8845a.versioning import compare_firmware
 
 
 @pytest.mark.parametrize("mode", tuple(modes.Mode))
-def test_digital_filter_enable_rejection_uses_one_mode_aware_policy(mode):
-    policy = getattr(scpi, "digital_filter_enable_error", None)
-    assert callable(policy), "数字滤波开启策略应由核心模块统一提供"
-
-    reason = policy(mode)
+def test_digital_filter_policy_allows_slow_dc_modes_only(mode):
+    reason = digital_filter_enable_error(mode, nplc=10)
 
     if modes.descriptor(mode).digital_filter:
-        assert reason == scpi.DIGITAL_FILTER_DISABLED_REASON
+        assert reason is None
     else:
         assert reason == f"{modes.descriptor(mode).label}不支持直流数字滤波"
 
 
-def test_digital_filter_policy_explains_legacy_support_and_readback_gate():
-    reason = scpi.DIGITAL_FILTER_DISABLED_REASON
-
-    assert "OutG SW 早于 2.0 不支持该功能" in reason
-    assert "跳过数字滤波命令和回读" in reason
-    assert "版本未知" in reason
-    assert "无法确认关闭时会拒绝应用 NPLC" in reason
+def test_digital_filter_information_explains_firmware_and_variable_response_time():
+    assert "OutG SW 早于 2.0 不支持该功能" in DIGITAL_FILTER_INFO
+    assert "平均数量随功能和量程变化" in DIGITAL_FILTER_INFO
+    assert "以实际采样间隔为准" in DIGITAL_FILTER_INFO
 
 
 @pytest.mark.parametrize(
@@ -45,14 +41,21 @@ def test_filter_policy_owns_documented_firmware_support(mode, firmware, expected
 
 
 def test_filter_policy_validates_requested_and_readback_filter_states():
-    assert digital_filter_setting_error(modes.Mode.DCV, True) == scpi.DIGITAL_FILTER_DISABLED_REASON
+    assert digital_filter_setting_error(modes.Mode.DCV, True, nplc=10) is None
+    assert "NPLC" in digital_filter_setting_error(modes.Mode.DCV, True, nplc=1)
+    assert "NPLC" in digital_filter_setting_error(modes.Mode.DCV, True)
     assert digital_filter_setting_error(
-        modes.Mode.DCV, True, allow_device_readback=True
+        modes.Mode.DCV, True, nplc=1, allow_device_readback=True
     ) is None
     assert digital_filter_setting_error(
-        modes.Mode.ACV, True, allow_device_readback=True
+        modes.Mode.ACV, True, nplc=10, allow_device_readback=True
     ) == f"{modes.descriptor(modes.Mode.ACV).label}不支持直流数字滤波"
-    assert digital_filter_setting_error(modes.Mode.DCV, False) is None
+    assert digital_filter_setting_error(modes.Mode.DCV, False, nplc=1) is None
+
+
+def test_mode_settings_rejects_non_boolean_digital_filter_values():
+    with pytest.raises(ValueError, match="数字滤波设置必须是布尔值"):
+        scpi.ModeSettings(modes.Mode.DCV, nplc=10, digital_filter="ON").validate()
 
 
 def test_firmware_version_comparison_lives_in_neutral_versioning_module():

@@ -1,6 +1,7 @@
 import ast
 import re
 import subprocess
+import tomllib
 
 import pytest
 
@@ -62,6 +63,46 @@ def test_default_pytest_artifacts_are_outside_the_checkout(tmp_path, monkeypatch
     monkeypatch.setattr(test_runner.tempfile, "gettempdir", lambda: str(tmp_path))
 
     assert test_runner.default_output_root() == tmp_path / "Fluke8845A_Test_Artifacts" / "pytest-shards"
+
+
+def test_pytest_cache_is_configured_under_ignored_build_artifacts():
+    configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert configuration["tool"]["pytest"]["ini_options"]["cache_dir"] == (
+        "build/test-artifacts/pytest-cache"
+    )
+
+
+def test_shard_runner_uses_an_isolated_pytest_cache_per_shard(tmp_path, monkeypatch):
+    import sys
+    from pathlib import Path
+
+    import scripts.run_tests_sharded as test_runner
+
+    commands = []
+
+    class CompletedProcess:
+        pid = 1
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **_kwargs):
+        commands.append(command)
+        return CompletedProcess()
+
+    monkeypatch.setattr(test_runner, "SHARDS", {"sample": ("tests/test_gui.py",)})
+    monkeypatch.setattr(test_runner, "validate_shard_coverage", lambda _root: None)
+    monkeypatch.setattr(test_runner.subprocess, "Popen", fake_popen)
+
+    assert test_runner.run_shards(python=Path(sys.executable), output_root=tmp_path) == 0
+
+    command = commands[0]
+    assert "no:cacheprovider" not in command
+    cache_override = command[command.index("-o") + 1]
+    basetemp = Path(command[command.index("--basetemp") + 1])
+    assert cache_override == f"cache_dir={basetemp.parent / 'cache'}"
 
 
 def test_shard_runner_escapes_unencodable_log_characters(monkeypatch):

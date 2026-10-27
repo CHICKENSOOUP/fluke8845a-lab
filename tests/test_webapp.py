@@ -15,9 +15,9 @@ import pytest
 from PySide6.QtCore import QCoreApplication
 
 from fluke8845a.modes import Mode
-from fluke8845a.filter_policy import digital_filter_enable_error
 from fluke8845a.scpi import FlowControl
 from fluke8845a import webapp as webapp_module
+from fluke8845a import path_security as path_security_module
 from fluke8845a.webapp import _complete_csv_prefix_size, create_server
 from fluke8845a import webservice as webservice_module
 from fluke8845a import worker as worker_module
@@ -300,6 +300,39 @@ def test_csv_snapshot_prefix_omits_a_partial_trailing_record(tmp_path):
     assert path.read_bytes()[:size] == b"header\r\nrow-one\r\n"
 
 
+@pytest.mark.parametrize(
+    ("route", "filename", "contents"),
+    [
+        ("/api/latest.csv", "measurements.csv", b"sample_index,value_si\r\n1,1.0\r\n"),
+        ("/api/latest-events-safe.csv", "events.csv", b"event_index,event\r\n1,normal\r\n"),
+        ("/api/latest-measurements-safe.csv", "measurements.csv", b"sample_index,value_si\r\n1,1.0\r\n"),
+    ],
+)
+def test_web_csv_exports_reject_linked_source_files(
+    tmp_path, local_service, monkeypatch, route, filename, contents,
+):
+    app, runtime, server = local_service
+    run_dir = tmp_path / "linked-run"
+    run_dir.mkdir()
+    source = run_dir / filename
+    source.write_bytes(contents)
+    runtime.store.update(experiment_dir="", last_experiment_dir=str(run_dir))
+    original_check = path_security_module.is_symlink_or_junction
+
+    def treat_source_as_linked(path):
+        candidate = Path(path)
+        return candidate == source or original_check(candidate)
+
+    monkeypatch.setattr(path_security_module, "is_symlink_or_junction", treat_source_as_linked)
+
+    status, _headers, body = _main_thread_wait(
+        app, lambda: _http(f"http://127.0.0.1:{server.server_port}{route}")
+    )
+
+    assert status == 404
+    assert b"CSV" in body
+
+
 def test_safe_event_export_streams_source_without_reading_it_all_into_memory(
     tmp_path, local_service, monkeypatch,
 ):
@@ -518,13 +551,26 @@ def test_web_settings_accept_only_8845a_applicable_parameters():
         mode_settings_from_payload({"mode": "ACV", "autorange": True, "ac_bandwidth_hz": 10})
     with pytest.raises(ValueError, match="NPLC"):
         mode_settings_from_payload({"mode": "ACI", "autorange": True, "nplc": 1})
-    for mode, nplc in ((Mode.ACV, None), (Mode.DCV, 1), (Mode.DCV, 10)):
-        with pytest.raises(ValueError) as error:
-            mode_settings_from_payload({
-                "mode": mode.value, "autorange": True, "nplc": nplc,
-                "digital_filter": True,
-            })
-        assert str(error.value) == digital_filter_enable_error(mode)
+    with pytest.raises(ValueError, match="不支持直流数字滤波"):
+        mode_settings_from_payload({
+            "mode": Mode.ACV.value, "autorange": True,
+            "digital_filter": True,
+        })
+    with pytest.raises(ValueError, match="NPLC"):
+        mode_settings_from_payload({
+            "mode": Mode.DCV.value, "autorange": True, "nplc": 1,
+            "digital_filter": True,
+        })
+    with pytest.raises(ValueError, match="digital_filter 必须是布尔值"):
+        mode_settings_from_payload({
+            "mode": Mode.DCV.value, "autorange": True, "nplc": 10,
+            "digital_filter": "true",
+        })
+    slow_filter = mode_settings_from_payload({
+        "mode": Mode.DCV.value, "autorange": True, "nplc": 10,
+        "digital_filter": True,
+    })
+    assert slow_filter.digital_filter is True
     with pytest.raises(ValueError, match="整数"):
         mode_settings_from_payload({"mode": "ACV", "autorange": True, "ac_bandwidth_hz": 3.5})
 
@@ -549,6 +595,17 @@ def test_web_payload_accepts_each_supported_nplc_value(nplc):
         "mode": "DCV", "autorange": True, "nplc": nplc,
     })
 
+    assert settings.nplc == nplc
+
+
+@pytest.mark.parametrize("nplc", [10, 100])
+def test_web_payload_accepts_digital_filter_at_supported_slow_nplc(nplc):
+    settings = mode_settings_from_payload({
+        "mode": "RES2", "autorange": True, "nplc": nplc,
+        "digital_filter": True,
+    })
+
+    assert settings.digital_filter is True
     assert settings.nplc == nplc
 
 
@@ -1089,6 +1146,9 @@ def test_localhost_mock_api_enforces_origin_and_records_one_shot(tmp_path, local
     status, _headers, metadata = _main_thread_wait(app, lambda: _http(base_url + "/api/meta"))
     assert status == 200
     modes = json.loads(metadata)["modes"]
+    meta_payload = json.loads(metadata)
+    assert "OutG SW 早于 2.0 不支持该功能" in meta_payload["digital_filter_info"]
+    assert "最大READ?响应时间" in meta_payload["digital_filter_info"]
     assert {mode["value"] for mode in modes} == {mode.value for mode in Mode}
     assert {mode["value"] for mode in modes if mode["digital_filter"]} == {
         "DCV", "DCI", "RES2", "RES4"
@@ -1100,6 +1160,9 @@ def test_localhost_mock_api_enforces_origin_and_records_one_shot(tmp_path, local
     }
     assert "440 mA" in mode_by_name["DCI"]["safety_limits"]
     assert "1.0.700.18" in mode_by_name["ACI"]["safety_limits"]
+    assert "未说明对应哪个软件字段" in mode_by_name["ACI"]["safety_limits"]
+    assert "本软件不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档" in mode_by_name["ACI"]["safety_limits"]
+    assert "使用前请在仪表面板核对软件版本" in mode_by_name["ACI"]["safety_limits"]
     assert "100 MΩ" in mode_by_name["RES2"]["safety_limits"]
     assert "100 MΩ" in mode_by_name["RES4"]["safety_limits"]
 
@@ -1666,6 +1729,87 @@ def test_web_configure_aggregates_cached_firmware_and_terminal_conflicts_before_
     assert result["readback_basis"]["input_terminals"] == "REAR"
     assert "最近一次仪器回读" in result["message"]
     assert transport.commands == commands_before
+
+    status, _headers, body = _api_command(app, base_url, "firmware_versions", {
+        "outguard_sw": "1.0.700.17", "inguard_sw": "ad300210",
+    })
+    assert status == 200, body
+    status, _headers, body = _api_command(app, base_url, "configure", {
+        "safety_confirmed": True,
+        "settings": {
+            "mode": "ACI", "autorange": False, "range_si": 0.4,
+            "nplc": None, "ac_bandwidth_hz": 20,
+        },
+    })
+    assert status == 200, body
+    result = json.loads(body)
+    assert result["success"] is True
+    assert "SENS:CURR:AC:RANG 0.4" in transport.commands
+    commands_after_aci_400ma = list(transport.commands)
+
+    status, _headers, body = _api_command(app, base_url, "configure", {
+        "safety_confirmed": True,
+        "settings": {"mode": "ACI", "autorange": True, "nplc": None, "ac_bandwidth_hz": 20},
+    })
+    assert status == 400
+    result = json.loads(body)
+    assert any(
+        "自动量程" in item
+        and "REAR" in item
+        and "前面板" in item
+        for item in result["conflicts"]
+    )
+    assert all("固件" not in item for item in result["conflicts"])
+    assert transport.commands == commands_after_aci_400ma
+
+    status, _headers, body = _api_command(app, base_url, "disconnect")
+    assert status == 200, body
+
+
+def test_web_aci_range_and_autorange_do_not_gate_on_unmapped_outguard_version(local_service, monkeypatch):
+    app, runtime, server = local_service
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    transport = FakeTransport("FLUKE,8845A,TEST8845A001,02/14/08-08:54", terminals="FRONT")
+    from fluke8845a import worker as worker_module
+    from fluke8845a.scpi import Serial8845A
+
+    real_instrument_type = Serial8845A
+    monkeypatch.setattr(
+        worker_module,
+        "Serial8845A",
+        lambda port, serial_settings, callback: real_instrument_type(
+            port, serial_settings, callback, transport_factory=lambda *_: transport
+        ),
+    )
+    status, _headers, body = _api_command(app, base_url, "connect_real", {
+        "port": "COM3", "serial": {},
+        "settings": {"mode": "DCV", "autorange": True, "nplc": 1},
+    })
+    assert status == 200, body
+    status, _headers, body = _api_command(app, base_url, "firmware_versions", {
+        "outguard_sw": "1.0.700.17", "inguard_sw": "ad300210",
+    })
+    assert status == 200, body
+
+    status, _headers, body = _api_command(app, base_url, "configure", {
+        "safety_confirmed": True,
+        "settings": {
+            "mode": "ACI", "autorange": False, "range_si": 0.4,
+            "nplc": None, "ac_bandwidth_hz": 20,
+        },
+    })
+    assert status == 200, body
+    assert json.loads(body)["success"] is True
+    assert "SENS:CURR:AC:RANG 0.4" in transport.commands
+
+    status, _headers, body = _api_command(app, base_url, "configure", {
+        "safety_confirmed": True,
+        "settings": {"mode": "ACI", "autorange": True, "nplc": None, "ac_bandwidth_hz": 20},
+    })
+    assert status == 200, body
+    assert json.loads(body)["success"] is True
+    assert "SENS:CURR:AC:RANG:AUTO ON" in transport.commands
+    assert not any("1.0.700.17" in str(command) for command in transport.commands)
 
     status, _headers, body = _api_command(app, base_url, "disconnect")
     assert status == 200, body

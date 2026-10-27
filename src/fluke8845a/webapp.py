@@ -20,8 +20,9 @@ from urllib.parse import parse_qs, quote, urlsplit
 from PySide6.QtCore import QCoreApplication, QStandardPaths
 
 from . import __version__
-from .filter_policy import DIGITAL_FILTER_DISABLED_REASON
+from .filter_policy import DIGITAL_FILTER_INFO
 from .modes import DESCRIPTORS
+from .path_security import resolve_safe_child_file
 from .share_export import export_share_package
 from .storage import (
     complete_csv_prefix_size,
@@ -160,7 +161,7 @@ class LocalWebHandler(BaseHTTPRequestHandler):
                 documents = str(Path.home() / "Documents")
             self._send_json(200, {
                 "version": __version__, "modes": modes, "server": "loopback",
-                "digital_filter_disabled_reason": DIGITAL_FILTER_DISABLED_REASON,
+                "digital_filter_info": DIGITAL_FILTER_INFO,
                 "default_root": str(Path(documents) / "Fluke8845A_Experiments"),
             })
             return
@@ -265,8 +266,8 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         if not directory:
             self._send_json(404, {"error": "当前还没有实验 CSV"})
             return
-        path = (Path(directory) / "measurements.csv").resolve()
-        if path.name != "measurements.csv" or not path.is_file():
+        path = resolve_safe_child_file(directory, "measurements.csv")
+        if path is None:
             self._send_json(404, {"error": "实验 CSV 不可读取"})
             return
         try:
@@ -307,8 +308,8 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         if not directory:
             self._send_json(404, {"error": "当前还没有已完成实验的事件 CSV"})
             return
-        path = (Path(directory) / "events.csv").resolve()
-        if path.name != "events.csv" or not path.is_file():
+        path = resolve_safe_child_file(directory, "events.csv")
+        if path is None:
             self._send_json(404, {"error": "实验事件 CSV 不可读取"})
             return
         try:
@@ -343,8 +344,8 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         if not directory:
             self._send_json(404, {"error": "当前还没有已完成实验的测量 CSV"})
             return
-        path = (Path(directory) / "measurements.csv").resolve()
-        if path.name != "measurements.csv" or not path.is_file():
+        path = resolve_safe_child_file(directory, "measurements.csv")
+        if path is None:
             self._send_json(404, {"error": "实验测量 CSV 不可读取"})
             return
         try:

@@ -12,14 +12,15 @@
 
 ## Windows 二进制发布材料
 
-当前本地便携包候选的审查状态见 [2026-10-20 审查记录](licenses/windows-portable-review-2026-10-20.md)。此前的 2026-10-15 Qt CSV 和包审查是历史快照，不能作为新候选的精确清单：
+2026-10-20 工程审查记录了当时的审查范围和仍未关闭的发布条件，不是 2026-10-21 或之后生成候选包的逐包许可证审查或批准。此后每个包都必须根据自身 `BUILD-PROVENANCE.json`、运行时清单和 Qt 子清单单独复核。此前的 2026-10-15 Qt CSV 和包审查是历史快照，不能作为新候选的精确清单：
 
 - [历史 Qt/PySide 清单](licenses/windows-qt-runtime-inventory-2026-10-15.csv)
-- [当前候选包审查与未关闭事项](licenses/windows-portable-review-2026-10-20.md)
+- [2026-10-20 工程审查与未关闭事项](licenses/windows-portable-review-2026-10-20.md)
 - [2026-10-15 候选包第三方声明草稿](licenses/windows-third-party-notices.md)
 - [Qt/PySide 对应源码登记表和源码提供声明草稿](licenses/windows-source-offer.md)
 - [Qt 动态库替换和运行步骤草稿](licenses/windows-replace-qt.md)
-- LGPLv3 完整文本：`docs/licenses/LGPL-3.0.txt`
+- GPLv3 完整文本：`licenses/GPL-3.0.txt`
+- LGPLv3 完整文本：`licenses/LGPL-3.0.txt`
 
 每个便携构建会生成 `windows-runtime-license-manifest.json`，记录许可文件哈希以及冻结目录中 DLL、PYD、EXE 的大小和 SHA-256；同时生成 `windows-qt-runtime-inventory.csv` 作为 Qt/PySide/Shiboken 子清单。ZIP 校验要求清单与归档完全一致；家族标签仅用于审查定位，不代表许可证结论。2026-10-20 的桌面构建排除 pyqtgraph 可选导入的 QtTest，并在打包校验中拒绝残留的 QtTest 二进制。Microsoft Visual C++ 再分发资格、Qt 模块/嵌入式第三方声明、对应源码及 Qt 库替换后运行验证仍未完成；因此 Windows 包仍是本地候选，不得当作已获准发布。源码归档和校验值见源码登记表；在核对 wheel 补丁来源并建立稳定源码交付方式前，不把它视为已完成源码提供要约。
 
@@ -54,14 +55,15 @@ The project plans to use the community LGPLv3 path for Qt/PySide6 components tha
 
 ## Windows binary release materials
 
-The current local portable candidate review is [dated 2026-10-20](licenses/windows-portable-review-2026-10-20.md). The 2026-10-15 Qt CSV and package review are historical snapshots, not the exact inventory for a newer candidate:
+The 2026-10-20 engineering review records its review scope and release gates that remained open at that time. It is not a package-specific license review or approval of candidates built on or after 2026-10-21. Each later package must be reviewed against its own `BUILD-PROVENANCE.json`, runtime manifest, and Qt inventory. The 2026-10-15 Qt CSV and package review are historical snapshots, not the exact inventory for a newer candidate:
 
 - [Historical Qt/PySide inventory](licenses/windows-qt-runtime-inventory-2026-10-15.csv)
-- [Current candidate review and open items](licenses/windows-portable-review-2026-10-20.md)
+- [2026-10-20 engineering review and open items](licenses/windows-portable-review-2026-10-20.md)
 - [2026-10-15 draft third-party notices](licenses/windows-third-party-notices.md)
 - [Qt/PySide corresponding-source register and draft source offer](licenses/windows-source-offer.md)
 - [Draft Qt library replacement and launch procedure](licenses/windows-replace-qt.md)
-- Full LGPLv3 text: `docs/licenses/LGPL-3.0.txt`
+- Full GPLv3 text: `licenses/GPL-3.0.txt`
+- Full LGPLv3 text: `licenses/LGPL-3.0.txt`
 
 Each Windows build generates a `windows-runtime-license-manifest.json` with license-file hashes and sizes/SHA-256 hashes for every DLL, PYD, and EXE in the frozen directory, plus `windows-qt-runtime-inventory.csv` for the Qt/PySide/Shiboken subset. ZIP verification requires those inventories to match the archive exactly; family labels are review hints, not license conclusions. The 2026-10-20 desktop build excludes pyqtgraph's optional QtTest import and rejects leftover QtTest binaries during packaging. Microsoft Visual C++ redistribution eligibility, exact Qt module/embedded third-party notices, corresponding source and wheel provenance, and a modified/relinked Qt library replacement-and-run check remain open. Source archive URLs and checksums are listed in the source register, but wheel build patches/provenance and a durable recipient source offer have not been verified.
 
@@ -73,7 +75,7 @@ Each Windows build generates a `windows-runtime-license-manifest.json` with lice
 4. Keep Qt libraries replaceable, document how to replace/relink and run the application, and verify the procedure before release.
 5. Exclude unverified or unnecessary modules. If a GPL-only component is included, determine a compatible licensing path for the distribution.
 
-This source repository does not claim that the current Windows portable candidate meets these requirements. Do not publish a Windows binary until the source offer, accurate third-party notices, and replacement/run verification are complete.
+This source repository does not claim that any Windows portable candidate meets these requirements. Do not publish a Windows binary until each package's source offer, accurate third-party notices, and replacement/run verification are complete.
 
 ## Official references
 

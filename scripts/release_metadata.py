@@ -10,7 +10,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SEMVER = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\Z")
+_SEMVER_CORE_NUMBER = r"(?:0|[1-9][0-9]*)"
+_SEMVER_PRERELEASE_IDENTIFIER = (
+    r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+)
+SEMVER = re.compile(
+    rf"{_SEMVER_CORE_NUMBER}\.{_SEMVER_CORE_NUMBER}\.{_SEMVER_CORE_NUMBER}"
+    rf"(?:-{_SEMVER_PRERELEASE_IDENTIFIER}(?:\.{_SEMVER_PRERELEASE_IDENTIFIER})*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z"
+)
 
 
 def project_version(project_file: Path = ROOT / "pyproject.toml") -> str:
@@ -32,7 +40,7 @@ def release_identity(version: str, ref_type: str, ref_name: str, sha: str = "") 
             "tag": expected_tag,
             "title": f"Fluke 8845A Lab {expected_tag}",
             "version": version,
-            "prerelease": False,
+            "prerelease": "-" in version.split("+", 1)[0],
         }
     if ref_type != "branch":
         raise ValueError(f"Unsupported release ref type: {ref_type}")

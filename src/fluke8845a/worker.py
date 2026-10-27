@@ -6,13 +6,14 @@ import logging
 import math
 import statistics
 import time
+from collections.abc import Callable
 from collections import deque
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 
 from .analysis import RunningStats
 from .filter_policy import digital_filter_firmware_support, digital_filter_nplc_is_slow
@@ -37,10 +38,26 @@ ACTUAL_RATE_WINDOW_POINTS = 21
 MAX_PENDING_GUI_ROWS = 10_000
 MAX_PENDING_GUI_SCPI_LOG_LINES = 5_000
 CONNECTION_WATCH_INTERVAL_MS = 10_000
+STORAGE_SYNC_INTERVAL_MS = 1_000
+MAX_TARGET_INTERVAL_S = 86_400.0
+
+
+def _validate_target_interval(interval_s: float | None) -> float | None:
+    if interval_s is None:
+        return None
+    if isinstance(interval_s, bool):
+        raise ValueError("目标采样间隔须为 0 至 86400 秒的有限数")
+    try:
+        interval = float(interval_s)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("目标采样间隔须为 0 至 86400 秒的有限数") from exc
+    if not math.isfinite(interval) or not 0 <= interval <= MAX_TARGET_INTERVAL_S:
+        raise ValueError("目标采样间隔须为 0 至 86400 秒的有限数")
+    return interval
 
 
 def _host_clock_values() -> tuple[int, str, str]:
-    monotonic_ns = time.monotonic_ns()
+    monotonic_ns = time.perf_counter_ns()
     now = datetime.now(timezone.utc)
     return (
         monotonic_ns,
@@ -56,6 +73,7 @@ class MeasurementWorker(QObject):
     control_mode_changed = Signal(str)
     control_mode_result = Signal(bool, str)
     status_changed = Signal(str)
+    acquisition_state_changed = Signal(str, bool)
     log_line = Signal(str)
     scpi_logs_ready = Signal()
     configuration_ready = Signal(object)
@@ -69,6 +87,7 @@ class MeasurementWorker(QObject):
     diagnostic_ready = Signal(str)
     measurement_speed_result = Signal(bool, str)
     zero_result = Signal(str)
+    background_storage_sync_failed = Signal(object, object)
     error = Signal(str)
 
     def __init__(self) -> None:
@@ -88,6 +107,11 @@ class MeasurementWorker(QObject):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._take_sample)
+        self._storage_sync_timer = QTimer(self)
+        self._storage_sync_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._storage_sync_timer.setInterval(STORAGE_SYNC_INTERVAL_MS)
+        self._storage_sync_timer.timeout.connect(self._sync_storage_if_due)
+        self.background_storage_sync_failed.connect(self._handle_background_storage_sync_failure)
         self._connection_watch_timer = QTimer(self)
         self._connection_watch_timer.setInterval(CONNECTION_WATCH_INTERVAL_MS)
         self._connection_watch_timer.timeout.connect(self._check_idle_connection)
@@ -101,6 +125,7 @@ class MeasurementWorker(QObject):
         self._running_stats = RunningStats()
         self._ui_mailbox_lock = Lock()
         self._ui_pending_rows: deque[dict] = deque(maxlen=MAX_PENDING_GUI_ROWS)
+        self._ui_dropped_rows = 0
         self._ui_notification_pending = False
         self._ui_pending_scpi_logs: deque[tuple[str, str]] = deque(maxlen=MAX_PENDING_GUI_SCPI_LOG_LINES)
         self._ui_dropped_scpi_logs = 0
@@ -125,6 +150,13 @@ class MeasurementWorker(QObject):
     @property
     def state(self) -> AcquisitionState:
         return self._machine.state
+
+    def _transition_acquisition_state(self, transition: Callable[[], None]) -> None:
+        previous = self.state
+        transition()
+        if self.state != previous:
+            one_shot_running = self._one_shot and self.state == AcquisitionState.RUNNING
+            self.acquisition_state_changed.emit(self.state.value, one_shot_running)
 
     def _write_log(self, line: str) -> None:
         timestamp = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
@@ -639,13 +671,12 @@ class MeasurementWorker(QObject):
         reserved_directory: Path | None = None
         self.last_experiment_backup_path = None
         try:
+            interval_s = _validate_target_interval(interval_s)
             mode_settings.validate()
             if not self._require_wiring_confirmation(
                 mode_settings, confirmed_settings, starting_experiment=True,
             ):
                 return
-            if interval_s is not None and interval_s < 0:
-                raise ValueError("目标采样间隔不能为负数")
             name = validate_experiment_name(name)
             if duplicate_name_action not in {"", "create-copy", "overwrite"}:
                 raise ValueError("同名实验操作无效；请重新预检并选择覆盖、独立目录或取消")
@@ -685,6 +716,7 @@ class MeasurementWorker(QObject):
             self._consecutive_timeouts = 0
             self._running_stats = RunningStats()
             with self._ui_mailbox_lock:
+                self._ui_dropped_rows = 0
                 self._ui_latest_stats = self._measurement_stats()
             self._pending_rows.clear()
             self._last_gui_emit_ns = 0
@@ -723,7 +755,12 @@ class MeasurementWorker(QObject):
                 "initial_target_interval_s": interval_s,
                 "target_interval_changes": [],
                 "actual_interval_method": "actual_interval_s and desktop/Web interval telemetry use the difference between consecutive valid host READ? response-end monotonic timestamps; invalid attempts have no interval value.",
-                "timestamp_definition": "timestamp_local/timestamp_utc and elapsed_s retain host READ? request-start semantics. host_read_request_start_* and host_read_response_end_* record host wall-clock and monotonic boundaries around READ? only; response end is captured as the query receives a response or raises. read_duration_s is that READ? request/response duration and excludes the later range query. The instrument conversion is not hardware-timestamped.",
+                "host_monotonic_clock": {
+                    "api": "time.perf_counter_ns",
+                    "implementation": time.get_clock_info("perf_counter").implementation,
+                    "resolution_s": time.get_clock_info("perf_counter").resolution,
+                },
+                "timestamp_definition": "timestamp_local/timestamp_utc and elapsed_s retain host READ? request-start semantics. host_read_request_start_* and host_read_response_end_* record host wall-clock and time.perf_counter_ns boundaries around READ? only; response end is captured as the query receives a response or raises. read_duration_s is that READ? request/response duration and excludes the later range query. The instrument conversion is not hardware-timestamped.",
                 "acquisition_method": "one READ? per point; the host reads every response before sending the next query.",
                 "mock_scenario": asdict(self.instrument.scenario) if self.simulation else None,
             }
@@ -742,13 +779,23 @@ class MeasurementWorker(QObject):
             self._emit_active_settings(
                 confirmed_mode_settings, filter_readback_confirmed=not self.simulation,
             )
-            self.experiment_started.emit(str(self._recorder.directory))
-            self._machine.start()
+            self._transition_acquisition_state(self._machine.start)
             self.status_changed.emit("单次测量中（MOCK模拟）" if self.simulation and one_shot else
                                      "连续采集中（MOCK模拟）" if self.simulation else
                                      "单次测量中" if one_shot else "连续采集中")
             self.log_line.emit(f"实验已启动：{self._recorder.directory}")
             self._recorder.log("INFO", f"采集目标间隔={interval_s}; 实际频率由时间戳计算")
+            active_recorder = self._recorder
+            active_recorder.start_periodic_sync(
+                lambda exc, recorder=active_recorder: self.background_storage_sync_failed.emit(
+                    recorder, exc
+                )
+            )
+            self._storage_sync_timer.start()
+            # This is the GUI's commit point for replacing the previous plot.
+            # Emit only after synchronous startup work has succeeded, but before
+            # either the first one-shot sample or the continuous timer can run.
+            self.experiment_started.emit(str(self._recorder.directory))
             if one_shot:
                 self._take_sample()
             else:
@@ -790,16 +837,14 @@ class MeasurementWorker(QObject):
         interval = self._target_interval_s
         if interval is None or last_attempt_ns is None:
             return 0
-        elapsed_s = (time.monotonic_ns() - last_attempt_ns) / 1e9
+        elapsed_s = (time.perf_counter_ns() - last_attempt_ns) / 1e9
         return max(0, int((interval - elapsed_s) * 1000))
 
     @Slot(object)
     def set_target_interval(self, interval_s: float | None) -> dict:
         """Apply an interval edit and report its effective sample and host time."""
         try:
-            interval = None if interval_s is None else float(interval_s)
-            if interval is not None and (not math.isfinite(interval) or interval < 0):
-                raise ValueError("目标采样间隔必须为非负有限数")
+            interval = _validate_target_interval(interval_s)
             if self.state not in (AcquisitionState.RUNNING, AcquisitionState.PAUSED) or self._recorder is None:
                 return {
                     "success": True,
@@ -817,7 +862,7 @@ class MeasurementWorker(QObject):
 
             previous = self._target_interval_s
             self._target_interval_s = interval
-            now_ns = time.monotonic_ns()
+            now_ns = time.perf_counter_ns()
             now_utc = datetime.now(timezone.utc)
             now_local = now_utc.astimezone()
             change = {
@@ -863,7 +908,7 @@ class MeasurementWorker(QObject):
 
     @Slot(object)
     def set_measurement_speed(self, requested: ModeSettings) -> None:
-        """Apply NPLC/bandwidth only; range, function, filter and zero stay fixed."""
+        """Apply live NPLC/bandwidth/filter changes between serialized readings."""
         if self.state not in (AcquisitionState.RUNNING, AcquisitionState.PAUSED):
             self.measurement_speed_result.emit(False, "请在连续采集或暂停期间调整测量速度")
             return
@@ -888,7 +933,15 @@ class MeasurementWorker(QObject):
             return
         try:
             current = self._recorder.settings
-            if (requested.nplc, requested.ac_bandwidth_hz) == (current.nplc, current.ac_bandwidth_hz):
+            if (
+                requested.nplc,
+                requested.ac_bandwidth_hz,
+                requested.digital_filter,
+            ) == (
+                current.nplc,
+                current.ac_bandwidth_hz,
+                current.digital_filter,
+            ):
                 self.measurement_speed_result.emit(True, "当前测量速度已经是所选值")
                 return
 
@@ -898,22 +951,36 @@ class MeasurementWorker(QObject):
             self._recorder.record_measurement_speed_change(
                 nplc=requested.nplc,
                 ac_bandwidth_hz=requested.ac_bandwidth_hz,
+                digital_filter=requested.digital_filter,
                 device_configuration=configuration,
             )
             stored = self._settings_by_mode.get(requested.mode, current)
             applied_settings = replace(
-                stored, nplc=requested.nplc, ac_bandwidth_hz=requested.ac_bandwidth_hz
+                stored,
+                nplc=requested.nplc,
+                ac_bandwidth_hz=requested.ac_bandwidth_hz,
+                digital_filter=requested.digital_filter,
             )
             self._settings_by_mode[requested.mode] = applied_settings
             self._emit_active_settings(
                 applied_settings,
-                filter_readback_confirmed=not self.simulation and requested.nplc is not None,
+                filter_readback_confirmed=(
+                    not self.simulation
+                    and (
+                        not descriptor(requested.mode).digital_filter
+                        or actual.get("digital_filter_response") is not None
+                    )
+                ),
             )
             parts = []
             if requested.nplc is not None:
                 parts.append(f"NPLC={requested.nplc:g}")
             if requested.ac_bandwidth_hz is not None:
                 parts.append(f"交流带宽={requested.ac_bandwidth_hz} Hz")
+            if descriptor(requested.mode).digital_filter and (
+                requested.digital_filter != current.digital_filter
+            ):
+                parts.append(f"数字滤波={'开' if requested.digital_filter else '关'}")
             self.measurement_speed_result.emit(True, f"测量速度已回读确认：{'，'.join(parts)}；从下一读数起生效")
         except UnsupportedRange as exc:
             self.log_line.emit(f"~ 实时调速未应用：{exc}")
@@ -936,8 +1003,6 @@ class MeasurementWorker(QObject):
             self.log_line.emit(f"! 实时调速失败，采集已停止：{exc}")
             self.error.emit(f"实时调速失败：{exc}。{reconnect}为避免数据条件不明，当前采集已停止。")
             try:
-                if self.state != AcquisitionState.STOPPED:
-                    self._machine.stop()
                 self._finish_experiment(
                     "instrument_local" if local_mode_failure else "speed_update_error"
                 )
@@ -950,37 +1015,42 @@ class MeasurementWorker(QObject):
     @Slot()
     def pause(self) -> None:
         try:
-            self._machine.pause()
-            self._timer.stop()
-            self.status_changed.emit("已暂停")
-            if self._recorder:
-                self._recorder.append_event("暂停采集")
+            self._transition_acquisition_state(self._machine.pause)
         except InvalidTransition as exc:
             self.error.emit(str(exc))
-        except OSError as exc:
-            self._storage_fault(exc)
+            return
+
+        self._timer.stop()
+        self.status_changed.emit("已暂停")
+        if self._recorder:
+            try:
+                self._recorder.append_event("暂停采集")
+            except Exception as exc:
+                self._storage_fault(exc)
 
     @Slot()
     def resume(self) -> None:
         try:
-            self._machine.resume()
-            self.status_changed.emit("连续采集中（MOCK模拟）" if self.simulation else "连续采集中")
-            if self._recorder:
-                self._recorder.append_event("继续采集")
-            last_attempt_ns = self._recorder.last_attempt_ns if self._recorder else None
-            self._timer.start(self._delay_to_next_attempt_ms(last_attempt_ns))
+            self._transition_acquisition_state(self._machine.resume)
         except InvalidTransition as exc:
             self.error.emit(str(exc))
-        except OSError as exc:
-            self._storage_fault(exc)
+            return
+
+        self.status_changed.emit("连续采集中（MOCK模拟）" if self.simulation else "连续采集中")
+        if self._recorder:
+            try:
+                self._recorder.append_event("继续采集")
+            except Exception as exc:
+                self._storage_fault(exc)
+                return
+        last_attempt_ns = self._recorder.last_attempt_ns if self._recorder else None
+        self._timer.start(self._delay_to_next_attempt_ms(last_attempt_ns))
 
     @Slot()
     def stop(self) -> None:
         self._stop_requested.clear()
         self._timer.stop()
-        try:
-            self._machine.stop()
-        except InvalidTransition:
+        if self.state == AcquisitionState.STOPPED:
             return
         self._finish_experiment("stopped")
 
@@ -1212,8 +1282,6 @@ class MeasurementWorker(QObject):
 
     def _finish_idle_connection_failure(self, completion_status: str, message: str) -> None:
         if self._recorder is not None:
-            if self.state != AcquisitionState.STOPPED:
-                self._machine.stop()
             self._finish_experiment(completion_status)
         self.status_changed.emit(message)
 
@@ -1224,24 +1292,30 @@ class MeasurementWorker(QObject):
 
     def _queue_ui_row(self, row: dict) -> None:
         self._pending_rows.append(row)
-        now = time.monotonic_ns()
+        now = time.perf_counter_ns()
         if self._last_gui_emit_ns == 0 or now - self._last_gui_emit_ns >= 100_000_000 or row.get("status") != "ok":
             self._flush_ui_rows()
 
     def _flush_ui_rows(self, *, attempt_count: int | None = None) -> None:
         if self._pending_rows:
             rows, self._pending_rows = self._pending_rows, []
-            latest_stats = self._measurement_stats(attempt_count=attempt_count)
             with self._ui_mailbox_lock:
+                mailbox_limit = self._ui_pending_rows.maxlen or MAX_PENDING_GUI_ROWS
+                dropped_rows = max(
+                    0, len(self._ui_pending_rows) + len(rows) - mailbox_limit,
+                )
+                self._ui_dropped_rows += dropped_rows
                 self._ui_pending_rows.extend(rows)
                 self._ui_latest_hz = self._actual_hz()
-                self._ui_latest_stats = latest_stats
+                self._ui_latest_stats = self._measurement_stats(
+                    attempt_count=attempt_count,
+                )
                 notify = not self._ui_notification_pending
                 if notify:
                     self._ui_notification_pending = True
             if notify:
                 self.sample_ready.emit()
-        self._last_gui_emit_ns = time.monotonic_ns()
+        self._last_gui_emit_ns = time.perf_counter_ns()
 
     def _measurement_stats(self, *, attempt_count: int | None = None) -> dict:
         """Build a bounded telemetry snapshot without changing recorded readings."""
@@ -1278,7 +1352,9 @@ class MeasurementWorker(QObject):
             })
         return stats
 
-    def take_sample_update(self) -> tuple[list[dict], float, dict]:
+    def take_sample_update(
+        self, *, include_display_dropped_rows: bool = False,
+    ) -> tuple[list[dict], float, dict]:
         """Atomically drain the bounded display mailbox from the GUI thread.
 
         The worker writes every attempt to disk before it reaches this mailbox.
@@ -1289,7 +1365,10 @@ class MeasurementWorker(QObject):
             rows = list(self._ui_pending_rows)
             self._ui_pending_rows.clear()
             self._ui_notification_pending = False
-            return rows, self._ui_latest_hz, dict(self._ui_latest_stats)
+            stats = dict(self._ui_latest_stats)
+            if include_display_dropped_rows:
+                stats["display_dropped_rows"] = self._ui_dropped_rows
+            return rows, self._ui_latest_hz, stats
 
     def _actual_hz(self) -> float:
         if len(self._valid_response_ends_ns) < 2:
@@ -1298,24 +1377,42 @@ class MeasurementWorker(QObject):
         return (len(self._valid_response_ends_ns) - 1) / span if span > 0 else 0.0
 
     def _storage_fault(self, exc: Exception) -> None:
+        source = "实验数据文件"
         if self._recorder is not None:
+            if self._recorder.csv_sync_error is exc:
+                source = "CSV"
+            elif self._recorder.log_sync_error is exc:
+                source = "run.log"
             try:
                 self._recorder.log("ERROR", f"采集存储失败：{exc}")
             except Exception:
                 # A full or failing disk may also reject the diagnostic log;
                 # preserve the original failure and continue best-effort cleanup.
                 log.exception("could not write storage failure to experiment run log")
-        self.log_line.emit(f"! CSV写入失败，已停止采集：{exc}")
+        self.log_line.emit(f"! {source}持久化失败，已停止采集：{exc}")
         log.exception("experiment storage failed")
         self._timer.stop()
-        if self.state != AcquisitionState.STOPPED:
-            try:
-                self._machine.stop()
-            except InvalidTransition:
-                pass
-        self.status_changed.emit("数据写入失败，采集已停止；检查磁盘空间和文件权限")
-        self.error.emit(f"测量数据无法写入磁盘：{exc}")
+        self.error.emit(f"实验记录无法安全保存：{exc}")
         self._finish_experiment("storage_error")
+
+    @Slot()
+    def _sync_storage_if_due(self) -> None:
+        recorder = self._recorder
+        if recorder is None:
+            self._storage_sync_timer.stop()
+            return
+        try:
+            recorder.sync_csv_if_due()
+        except Exception as exc:
+            self._storage_fault(exc)
+
+    @Slot(object, object)
+    def _handle_background_storage_sync_failure(self, recorder, exc) -> None:
+        if self._recorder is not recorder:
+            return
+        if not isinstance(exc, Exception):
+            exc = OSError(str(exc))
+        self._storage_fault(exc)
 
     @Slot(str)
     def mark_event(self, text: str) -> dict | None:
@@ -1462,6 +1559,7 @@ class MeasurementWorker(QObject):
 
     def _finish_experiment(self, status: str) -> None:
         self._timer.stop()
+        self._storage_sync_timer.stop()
         recorder, self._recorder = self._recorder, None
         finalization_error: Exception | None = None
         result_message = ""
@@ -1472,7 +1570,18 @@ class MeasurementWorker(QObject):
                 recorder.finish(status)
             except Exception as exc:
                 finalization_error = exc
-                result_message = f"实验文件关闭或元数据写入失败：{exc}；记录可能不完整：{directory}"
+                if recorder.csv_sync_error is not None:
+                    result_message = (
+                        f"CSV持久化同步失败，实验已标记为未完成：{recorder.csv_sync_error}；"
+                        f"请检查记录文件：{directory}"
+                    )
+                elif recorder.log_sync_error is not None:
+                    result_message = (
+                        f"run.log持久化同步失败，实验已标记为未完成：{recorder.log_sync_error}；"
+                        f"请检查记录文件：{directory}"
+                    )
+                else:
+                    result_message = f"实验文件关闭或元数据写入失败：{exc}；记录可能不完整：{directory}"
                 self.log_line.emit(f"! {result_message}")
                 log.exception("could not finalize experiment storage")
                 self.error.emit(result_message)
@@ -1487,7 +1596,7 @@ class MeasurementWorker(QObject):
                     result_message = f"实验数据已保存：{directory}"
                     self.log_line.emit(f"实验保存完成：{directory}")
         if self.state != AcquisitionState.STOPPED:
-            self._machine.stop()
+            self._transition_acquisition_state(self._machine.stop)
         if recorder is not None:
             self.experiment_finished.emit(directory)
             saved_ok = finalization_error is None and status not in {"storage_error", "start_error"}
@@ -1505,10 +1614,9 @@ class MeasurementWorker(QObject):
     @Slot()
     def shutdown(self) -> None:
         self._timer.stop()
+        self._storage_sync_timer.stop()
         self._connection_watch_timer.stop()
         if self._recorder is not None:
-            if self.state != AcquisitionState.STOPPED:
-                self._machine.stop()
             self._finish_experiment("application_exit")
         if self.instrument is not None:
             try:

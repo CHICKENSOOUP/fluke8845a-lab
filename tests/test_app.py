@@ -1,17 +1,32 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from fluke8845a import app as app_module
+from fluke8845a import probe_provenance as probe_provenance_module
 from fluke8845a.modes import Mode
 from fluke8845a.scpi import InstrumentInfo, ModeSettings, Reading
+
+
+def _delay_fake_read_responses(monkeypatch, transport):
+    read_until = transport.read_until
+
+    def delayed_read_until(terminator, timeout_s=None):
+        response = read_until(terminator, timeout_s)
+        if transport.last_command.upper() == "READ?":
+            time.sleep(0.025)
+        return response
+
+    monkeypatch.setattr(transport, "read_until", delayed_read_until)
 
 
 def test_probe_restore_can_reuse_confirmation_only_for_same_mode_and_range():
@@ -118,6 +133,7 @@ def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transp
     transport.range_value = 100e-3
     transport.autorange = "0"
     transport.nplc = "0.02"
+    _delay_fake_read_responses(monkeypatch, transport)
     serial_type = Serial8845A
 
     def serial_factory(port, settings, callback):
@@ -344,7 +360,7 @@ def test_probe_cli_requires_report_and_explicit_wiring_confirmation(tmp_path, ca
 
     assert exit_info.value.code == 2
     error = capsys.readouterr().err
-    assert "--confirm-front-2w-30mohm" in error
+    assert "--confirm-front-2w-30-megaohm" in error
     assert "--confirm-front-2w-short" in error
 
 
@@ -377,6 +393,36 @@ def test_short_wiring_cli_uses_explicit_confirmation_and_baudrate(tmp_path, monk
     }
 
 
+def test_real_probe_cli_accepts_unambiguous_30_megaohm_confirmation_alias(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_probe(port, report_path, *, wiring_confirmed, shorted_leads_confirmed, baudrate):
+        captured.update(
+            port=port,
+            report_path=report_path,
+            wiring_confirmed=wiring_confirmed,
+            shorted_leads_confirmed=shorted_leads_confirmed,
+            baudrate=baudrate,
+        )
+        return 0
+
+    monkeypatch.setattr(app_module, "run_real_hardware_probe", fake_probe)
+    report = tmp_path / "30-megaohm.json"
+    result = app_module.main([
+        "--probe-real", "--port", "COM3", "--report", str(report),
+        "--confirm-front-2w-30-megaohm",
+    ])
+
+    assert result == 0
+    assert captured == {
+        "port": "COM3",
+        "report_path": report,
+        "wiring_confirmed": True,
+        "shorted_leads_confirmed": False,
+        "baudrate": 9600,
+    }
+
+
 def test_gui_probe_cli_requires_explicit_wiring_confirmation(tmp_path, capsys):
     with pytest.raises(SystemExit) as exit_info:
         app_module.main([
@@ -385,7 +431,7 @@ def test_gui_probe_cli_requires_explicit_wiring_confirmation(tmp_path, capsys):
 
     assert exit_info.value.code == 2
     error = capsys.readouterr().err
-    assert "--confirm-front-2w-30mohm" in error
+    assert "--confirm-front-2w-30-megaohm" in error
     assert "--confirm-front-2w-short" in error
 
 
@@ -647,17 +693,213 @@ def test_real_dci_gui_probe_refuses_to_switch_a_different_live_instrument_mode(m
 
 
 @pytest.mark.parametrize(
+    ("mode", "function", "initial_range", "source_options", "expected_range"),
+    [
+        (
+            Mode.ACV, "VOLT:AC", 10.0,
+            {
+                "acv_voltage_source_confirmed": True,
+                "acv_source_vrms": 1.0,
+                "acv_source_vpeak": 1.41421356,
+                "acv_source_frequency_hz": 50.0,
+                "acv_range_v": 10.0,
+                "ac_bandwidth_hz": 20,
+            },
+            10.0,
+        ),
+        (
+            Mode.RES4, "FRES", 100e6,
+            {"res4_four_wire_confirmed": True, "res4_range_ohm": 100e6},
+            100e6,
+        ),
+    ],
+)
+def test_acv_and_res4_gui_probe_complete_with_fake_8845a(
+    monkeypatch, tmp_path, mode, function, initial_range, source_options, expected_range,
+):
+    from fluke8845a import worker as worker_module
+    from fluke8845a.scpi import Serial8845A
+    from tests.fakes import FakeTransport
+
+    transport = FakeTransport()
+    transport.function = function
+    transport.range_value = initial_range
+    transport.autorange = "0"
+    transport.nplc = "0.02"
+    transport.bandwidth = 20
+    _delay_fake_read_responses(monkeypatch, transport)
+    serial_type = Serial8845A
+
+    def serial_factory(port, settings, callback):
+        return serial_type(
+            port, settings, callback,
+            transport_factory=lambda *_args: transport,
+        )
+
+    monkeypatch.setattr(app_module, "Serial8845A", serial_factory)
+    monkeypatch.setattr(worker_module, "Serial8845A", serial_factory)
+    monkeypatch.setattr(app_module, "MIN_HARDWARE_PROBE_DURATION_S", 0.1)
+    monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 4.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 8.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_CLEANUP_RESERVE_S", 1.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_GUI_DRAIN_RESERVE_S", 0.1)
+    report_path = tmp_path / f"{mode.value.lower()}-fake-probe.json"
+
+    result = app_module.run_real_gui_speed_probe(
+        "COM3", report_path, wiring_confirmed=False, duration_s=3.0,
+        measurement_mode=mode, **source_options,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert result == 0, report
+    assert report["simulation"] is False
+    assert report["status"] == "ok"
+    assert report["mode"] == mode.value
+    assert report["initial_configuration_readback"]["input_terminals"] == "FRONT"
+    assert float(report["initial_configuration_readback"]["range_response"]) == expected_range
+    assert report["sample_count"] >= 3
+    assert report["invalid_count"] == 0
+    assert any(line.strip().upper() == "> SYST:LOC" for line in report["communication_log"])
+    if mode == Mode.ACV:
+        assert report["operator_wiring_confirmation"] == "front_panel_acv_voltage_source"
+        assert report["acv_source"]["waveform_independently_verified"] is False
+    else:
+        assert report["operator_wiring_confirmation"] == "front_panel_res4_four_wire_unpowered_dut"
+        assert report["res4_dut"]["four_wire_topology_independently_verified"] is False
+
+
+@pytest.mark.parametrize(
     ("mode", "bandwidth", "expected"),
     [
         (Mode.DCV, None, (0.2, 1)),
         (Mode.DCI, None, (0.2, 1)),
         (Mode.RES2, None, (0.2, 1)),
+        (Mode.RES4, None, (0.2, 1)),
         (Mode.ACI, 3, (200, 3)),
         (Mode.ACI, 200, (20, 200)),
     ],
 )
 def test_hardware_probe_speed_changes_use_documented_parameters(mode, bandwidth, expected):
     assert app_module._probe_speed_change_values(mode, bandwidth) == expected
+
+
+@pytest.mark.parametrize(
+    ("mode_flag", "confirmation", "mode", "extra_args", "expected_kwargs"),
+    [
+        (
+            "--probe-real-gui-acv", "--confirm-front-acv-voltage-source", Mode.ACV,
+            ["--acv-source-vrms", "120", "--acv-source-vpeak", "170",
+             "--acv-frequency-hz", "1000", "--acv-range-v", "750",
+             "--ac-bandwidth-hz", "20"],
+            {
+                "acv_voltage_source_confirmed": True,
+                "acv_source_vrms": 120.0,
+                "acv_source_vpeak": 170.0,
+                "acv_source_frequency_hz": 1000.0,
+                "acv_range_v": 750.0,
+                "ac_bandwidth_hz": 20,
+            },
+        ),
+        (
+            "--probe-real-gui-res4", "--confirm-front-res4-four-wire", Mode.RES4,
+            ["--res4-range-ohm", "100000000"],
+            {"res4_four_wire_confirmed": True, "res4_range_ohm": 100000000.0},
+        ),
+    ],
+)
+def test_gui_probe_cli_routes_acv_and_res4(
+    tmp_path, monkeypatch, mode_flag, confirmation, mode, extra_args, expected_kwargs,
+):
+    captured = {}
+
+    def fake_probe(port, report_path, **kwargs):
+        captured.update(port=port, report_path=report_path, **kwargs)
+        return 29
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", fake_probe)
+    report = tmp_path / f"{mode.value.lower()}-probe.json"
+
+    assert app_module.main([
+        mode_flag, "--port", "COM3", "--baudrate", "115200", "--duration", "8",
+        "--report", str(report), confirmation, *extra_args,
+    ]) == 29
+
+    assert captured["measurement_mode"] is mode
+    assert captured["report_path"] == report
+    for key, value in expected_kwargs.items():
+        assert captured[key] == value
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--confirm-front-acv-voltage-source"],
+        ["--confirm-front-acv-voltage-source", "--acv-source-vrms", "12",
+         "--acv-source-vpeak", "17", "--acv-frequency-hz", "50",
+         "--acv-range-v", "10", "--ac-bandwidth-hz", "20"],
+        ["--confirm-front-acv-voltage-source", "--acv-source-vrms", "12",
+         "--acv-source-vpeak", "1001", "--acv-frequency-hz", "1000",
+         "--acv-range-v", "100", "--ac-bandwidth-hz", "20"],
+        ["--confirm-front-acv-voltage-source", "--acv-source-vrms", "120",
+         "--acv-source-vpeak", "170", "--acv-frequency-hz", "1000",
+         "--acv-range-v", "100", "--ac-bandwidth-hz", "20"],
+        ["--confirm-front-acv-voltage-source", "--acv-source-vrms", "300",
+         "--acv-source-vpeak", "425", "--acv-frequency-hz", "300000",
+         "--acv-range-v", "750", "--ac-bandwidth-hz", "200"],
+        ["--confirm-front-acv-voltage-source", "--acv-source-vrms", "1",
+         "--acv-source-vpeak", "1.5", "--acv-frequency-hz", "10",
+         "--acv-range-v", "10", "--ac-bandwidth-hz", "20"],
+    ],
+)
+def test_acv_gui_probe_rejects_missing_or_unsafe_source_before_connect(
+    tmp_path, monkeypatch, extra_args,
+):
+    def forbidden_probe(*_args, **_kwargs):
+        pytest.fail("invalid ACV request must be rejected before opening the serial port")
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", forbidden_probe)
+    with pytest.raises(SystemExit) as exit_info:
+        app_module.main([
+            "--probe-real-gui-acv", "--report", str(tmp_path / "acv.json"),
+            "--duration", "8", *extra_args,
+        ])
+    assert exit_info.value.code == 2
+
+
+def test_res4_gui_probe_requires_four_wire_confirmation_and_supported_range(tmp_path, monkeypatch):
+    def forbidden_probe(*_args, **_kwargs):
+        pytest.fail("invalid RES4 request must be rejected before opening the serial port")
+
+    monkeypatch.setattr(app_module, "run_real_gui_speed_probe", forbidden_probe)
+    for args in (
+        ["--confirm-front-res4-four-wire", "--res4-range-ohm", "10"],
+        ["--res4-range-ohm", "100"],
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            app_module.main([
+                "--probe-real-gui-res4", "--report", str(tmp_path / "res4.json"),
+                "--duration", "8", *args,
+            ])
+        assert exit_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "bandwidth", "frequency", "expected"),
+    [
+        (Mode.ACV, 20, 50, (3, 20)),
+        (Mode.ACV, 200, 1000, (20, 200)),
+        (Mode.ACI, 20, 60, (3, 20)),
+    ],
+)
+def test_ac_speed_probe_uses_only_bands_within_declared_signal_frequency(
+    mode, bandwidth, frequency, expected,
+):
+    assert app_module._probe_speed_change_values(mode, bandwidth, frequency) == expected
+
+
+def test_ac_speed_probe_refuses_signal_frequency_that_cannot_support_two_bands():
+    with pytest.raises(ValueError, match="两个交流带宽档"):
+        app_module._probe_speed_change_values(Mode.ACV, 3, 10)
 
 
 def test_mock_e2e_cli_requires_report(capsys):
@@ -820,3 +1062,155 @@ def test_gui_rate_reconstruction_uses_the_last_21_visible_valid_receipts():
 
     assert window_count == 21
     assert rate == pytest.approx(2.0)
+
+
+def test_gui_rate_reconstruction_rejects_nonmonotonic_receipt_timestamps():
+    rows = [
+        {"status": "ok", "value_si": "1", "elapsed_s": "0", "read_duration_s": "0.02"},
+        {"status": "ok", "value_si": "1", "elapsed_s": "0.2", "read_duration_s": "1.0"},
+        {"status": "ok", "value_si": "1", "elapsed_s": "0.4", "read_duration_s": "0.02"},
+    ]
+
+    with pytest.raises(ValueError, match="receipt timestamps"):
+        app_module._reconstruct_gui_rate_from_rows(rows, visible_sample_count=3)
+
+
+def test_capture_runtime_source_identity_records_source_files(tmp_path):
+    for source in probe_provenance_module.PROBE_SOURCE_FILES:
+        path = tmp_path / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"source: {source}\n", encoding="utf-8")
+
+    identity = probe_provenance_module.capture_runtime_source_identity(
+        executable_path=tmp_path / "python.exe", source_root=tmp_path,
+    )
+
+    assert identity["kind"] == "source_tree_files"
+    assert set(identity["source_file_sha256"]) == set(probe_provenance_module.PROBE_SOURCE_FILES)
+    for source, digest in identity["source_file_sha256"].items():
+        assert digest == hashlib.sha256((tmp_path / source).read_bytes()).hexdigest().upper()
+
+
+def test_probe_source_identity_covers_every_python_module_in_the_package():
+    repository_root = Path(__file__).resolve().parents[1]
+    package_root = repository_root / "src" / "fluke8845a"
+    package_python_files = {
+        f"src/fluke8845a/{path.name}" for path in package_root.glob("*.py")
+    }
+
+    assert set(probe_provenance_module.PROBE_SOURCE_FILES) == package_python_files
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    [
+        "src/fluke8845a/filter_policy.py",
+        "src/fluke8845a/versioning.py",
+        "src/fluke8845a/state.py",
+        "src/fluke8845a/path_security.py",
+    ],
+)
+def test_capture_runtime_source_identity_detects_probe_dependency_changes(tmp_path, dependency):
+    required_sources = set(probe_provenance_module.PROBE_SOURCE_FILES) | {dependency}
+    for source in required_sources:
+        path = tmp_path / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"source: {source}\n", encoding="utf-8")
+
+    kwargs = {"executable_path": tmp_path / "python.exe", "source_root": tmp_path}
+    before = probe_provenance_module.capture_runtime_source_identity(**kwargs)
+    dependency_path = tmp_path / dependency
+    dependency_path.write_text(dependency_path.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
+    after = probe_provenance_module.capture_runtime_source_identity(**kwargs)
+
+    assert before != after
+
+
+def test_capture_runtime_source_identity_supports_installed_package_layout(tmp_path):
+    package_dir = tmp_path / "site-packages" / "fluke8845a"
+    package_dir.mkdir(parents=True)
+    for source in probe_provenance_module.PROBE_SOURCE_FILES:
+        (package_dir / Path(source).name).write_text(f"installed: {source}\n", encoding="utf-8")
+
+    identity = probe_provenance_module.capture_runtime_source_identity(
+        executable_path=tmp_path / "python.exe",
+        source_root=tmp_path / "site-packages",
+        package_file=package_dir / "probe_provenance.py",
+    )
+
+    assert identity["kind"] == "source_tree_files"
+    for source, digest in identity["source_file_sha256"].items():
+        assert digest == hashlib.sha256((package_dir / Path(source).name).read_bytes()).hexdigest().upper()
+
+
+def test_capture_runtime_source_identity_binds_frozen_executable(tmp_path):
+    executable = tmp_path / "Fluke8845A.exe"
+    executable.write_bytes(b"frozen executable bytes")
+    executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest().upper()
+    provenance = {
+        "format_version": 1,
+        "head_commit": "a" * 40,
+        "worktree_dirty": False,
+        "source_tree_sha256": "B" * 64,
+        "executables": {"desktop": {"sha256": executable_digest}},
+    }
+    (tmp_path / "BUILD-PROVENANCE.json").write_text(json.dumps(provenance), encoding="utf-8")
+
+    identity = probe_provenance_module.capture_runtime_source_identity(executable_path=executable)
+
+    assert identity == {
+        "kind": "frozen_executable",
+        "head_commit": "a" * 40,
+        "worktree_dirty": False,
+        "source_tree_sha256": "B" * 64,
+        "executable_sha256": executable_digest,
+    }
+
+
+def test_capture_runtime_source_identity_accepts_nuitka_dist_build_identity(tmp_path):
+    dist_directory = tmp_path / "Fluke8845A.dist"
+    dist_directory.mkdir()
+    executable = dist_directory / "Fluke8845A.exe"
+    executable.write_bytes(b"Nuitka standalone executable bytes")
+    executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest().upper()
+    build_identity = {
+        "format_version": 1,
+        "head_commit": "d" * 40,
+        "worktree_dirty": True,
+        "source_tree_sha256": "E" * 64,
+        "executables": {"desktop": {"sha256": executable_digest}},
+    }
+    (dist_directory / "BUILD-IDENTITY.json").write_text(json.dumps(build_identity), encoding="utf-8")
+
+    identity = probe_provenance_module.capture_runtime_source_identity(executable_path=executable)
+
+    assert identity["kind"] == "frozen_executable"
+    assert identity["head_commit"] == "d" * 40
+    assert identity["source_tree_sha256"] == "E" * 64
+    assert identity["executable_sha256"] == executable_digest
+
+
+@pytest.mark.parametrize("marker_json", ["null", "[]"])
+def test_capture_runtime_source_identity_rejects_non_object_build_marker(tmp_path, marker_json):
+    executable = tmp_path / "Fluke8845A.exe"
+    executable.write_bytes(b"frozen executable bytes")
+    (tmp_path / "BUILD-PROVENANCE.json").write_text(marker_json, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="必须是 JSON 对象"):
+        probe_provenance_module.capture_runtime_source_identity(executable_path=executable)
+
+
+def test_capture_runtime_source_identity_rejects_frozen_binary_mismatch(tmp_path):
+    executable = tmp_path / "Fluke8845A.exe"
+    executable.write_bytes(b"changed executable bytes")
+    provenance = {
+        "format_version": 1,
+        "head_commit": "a" * 40,
+        "worktree_dirty": False,
+        "source_tree_sha256": "b" * 64,
+        "executables": {"desktop": {"sha256": "c" * 64}},
+    }
+    (tmp_path / "BUILD-PROVENANCE.json").write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="EXE与BUILD-PROVENANCE"):
+        probe_provenance_module.capture_runtime_source_identity(executable_path=executable)

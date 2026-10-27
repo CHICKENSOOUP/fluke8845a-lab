@@ -1,4 +1,5 @@
-# Exact environment snapshot: Windows 11, CPython 3.12.14 x64.
+# Pinned Windows x64 dependency set, verified with CPython 3.12.10.
+# Build provenance records the actual Python patch version and installed packages.
 # This is not a cross-version lock: NumPy 2.5.4 requires Python >=3.12.
 # Python 3.11 CI uses the separate requirements-lock-python311.txt snapshot.
 colorama==0.4.6

@@ -1,17 +1,20 @@
 ﻿param(
     [switch]$SideBySide,
+    [switch]$DesktopOnly,
     [string]$BuildName,
     [string]$PythonPath,
     [string]$PortablePythonPath
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "scripts\build_path_helpers.ps1")
 $previousLocation = Get-Location
 $previousPythonPath = $env:PYTHONPATH
 $previousNuitkaCache = $env:NUITKA_CACHE_DIR
 $previousConfigDir = $env:FLUKE8845A_CONFIG_DIR
 $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
+$smokeConfigDirectory = $null
 
 function Wait-SoftwareSmokeProcess {
     param(
@@ -90,7 +93,13 @@ try {
     if (-not (Test-Path -LiteralPath $python)) {
         throw "The selected Python environment was not found: $python"
     }
-    $pythonSitePackages = (& $python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])").Trim()
+    & $python (Join-Path $PSScriptRoot "scripts\validate_build_environment.py") `
+        --lock (Join-Path $PSScriptRoot "requirements-lock.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "The selected Python environment does not match requirements-lock.txt; install the locked dependencies before packaging."
+    }
+    $pythonSitePackagesHex = (& $python -c "import sysconfig; print(sysconfig.get_paths()['purelib'].encode('utf-8').hex())").Trim()
+    $pythonSitePackages = ConvertFrom-FlukeUtf8Hex -Hex $pythonSitePackagesHex
     $env:PYTHONPATH = (Join-Path $PSScriptRoot "src") + ";" + $pythonSitePackages
 
     & $python (Join-Path $PSScriptRoot "scripts\create_app_icon_ico.py")
@@ -111,8 +120,10 @@ try {
     $pytestRunner = Join-Path $PSScriptRoot "scripts\run_tests_sharded.py"
     & $python $pytestRunner --python $python --timeout-seconds 600 --output-root (Join-Path $pytestRunDirectory "pytest-shards")
     if ($LASTEXITCODE -ne 0) { throw "pytest failed with exit code $LASTEXITCODE; EXE packaging stopped." }
-    & $python (Join-Path $PSScriptRoot "scripts\run_web_tests.py")
-    if ($LASTEXITCODE -ne 0) { throw "Web frontend JavaScript tests failed with exit code $LASTEXITCODE; EXE packaging stopped." }
+    if (-not $DesktopOnly) {
+        & $python (Join-Path $PSScriptRoot "scripts\run_web_tests.py")
+        if ($LASTEXITCODE -ne 0) { throw "Web frontend JavaScript tests failed with exit code $LASTEXITCODE; EXE packaging stopped." }
+    }
     $env:NUITKA_CACHE_DIR = $nuitkaCacheDirectory
     & $python -m nuitka --version
     if ($LASTEXITCODE -ne 0) { throw 'Install build dependencies with: python -m pip install -e ".[dev,build]"' }
@@ -159,7 +170,8 @@ try {
 
     $env:PYTHONPATH = (Join-Path $PSScriptRoot "src") + ";" + $pythonSitePackages
     $env:NUITKA_CACHE_DIR = $nuitkaCacheDirectory
-    $env:FLUKE8845A_CONFIG_DIR = Join-Path $PSScriptRoot "build\smoke-config"
+    $smokeConfigDirectory = New-FlukeSmokeConfigDirectory -SmokeConfigParent $env:TEMP
+    $env:FLUKE8845A_CONFIG_DIR = $smokeConfigDirectory
     $entryPoint = Join-Path $PSScriptRoot "Fluke8845A.py"
 
     & $portableExecutable -m nuitka $entryPoint `
@@ -179,6 +191,7 @@ try {
         --include-module=PySide6.QtOpenGLWidgets
     if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed." }
 
+    if (-not $DesktopOnly) {
     $webEntryPoint = Join-Path $PSScriptRoot "Fluke8845A_Web.py"
     $webAssetsDirectory = Join-Path $PSScriptRoot "src\fluke8845a\web"
     & $portableExecutable -m nuitka $webEntryPoint `
@@ -202,6 +215,7 @@ try {
     if (-not (Test-Path -LiteralPath $webExecutable)) { throw "Nuitka did not create $webExecutable" }
     $webReleaseDist = Join-Path $exeDist "Fluke8845A-Web.dist"
     Copy-Item -LiteralPath $webDist -Destination $webReleaseDist -Recurse -Force
+    }
 
     # The desktop app never reads PDF files; Qt's default plugin set includes this unused plugin.
     $unusedQtPdfPlugin = Join-Path $exeDist "PySide6\qt-plugins\imageformats\qpdf.dll"
@@ -234,12 +248,18 @@ try {
     Wait-SoftwareSmokeProcess -Process $serialSmoke -Description "Frozen pyserial import/port enumeration check"
     $env:PYTHONPATH = $buildPythonPath
 
+    $provenanceScopeArguments = @()
+    if ($DesktopOnly) {
+        $provenanceScopeArguments = @("--desktop-only")
+    } else {
+        $provenanceScopeArguments = @("--web-exe", $webExecutable)
+    }
     & $python (Join-Path $PSScriptRoot "scripts\build_provenance.py") create `
         --root $PSScriptRoot `
         --candidate-build-name $candidateBuildName `
         --expected-source-digest $sourceDigestPath `
         --desktop-exe $exe `
-        --web-exe $webExecutable `
+        @provenanceScopeArguments `
         --output $provenancePath
     if ($LASTEXITCODE -ne 0) { throw "Build provenance creation failed; sources may have changed during compilation." }
     Copy-Item -LiteralPath $provenancePath -Destination (Join-Path $exeDist "BUILD-IDENTITY.json") -Force
@@ -251,12 +271,14 @@ try {
     $mockE2E = Start-Process -FilePath $exe -ArgumentList @("--mock-e2e", "--report", $mockE2EReport) -PassThru -WindowStyle Hidden
     Wait-SoftwareSmokeProcess -Process $mockE2E -Description "Frozen six-mode Mock GUI verification"
     if (-not (Test-Path -LiteralPath $mockE2EReport)) { throw "Frozen six-mode Mock GUI verification did not create its report: $mockE2EReport" }
+    & $python (Join-Path $PSScriptRoot "scripts\update_mock_report.py") `
+        --report $mockE2EReport `
+        --executable $exe
+    if ($LASTEXITCODE -ne 0) { throw "Frozen six-mode Mock GUI report identity update failed." }
     $mockE2EData = Get-Content -LiteralPath $mockE2EReport -Raw | ConvertFrom-Json
     if ($mockE2EData.status -ne "ok" -or $mockE2EData.simulation -ne $true -or $mockE2EData.mode_count -ne 6) {
         throw "Frozen six-mode Mock GUI verification returned an invalid report: $mockE2EReport"
     }
-    $mockE2EData | Add-Member -MemberType NoteProperty -Name executable_sha256 -Value ((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash) -Force
-    $mockE2EData | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $mockE2EReport -Encoding utf8
     $mockValidationDirectory = Join-Path $PSScriptRoot "output\mock_validation"
     New-Item -ItemType Directory -Path $mockValidationDirectory -Force | Out-Null
     if ($SideBySide) {
@@ -270,11 +292,14 @@ try {
     Copy-Item -LiteralPath $mockE2EReport -Destination $releaseMockE2EReport -Force
     $env:PYTHONPATH = $buildPythonPath
 
+    $packageScopeArguments = @()
+    if ($DesktopOnly) { $packageScopeArguments = @("--desktop-only") }
     & $python (Join-Path $PSScriptRoot "scripts\package_windows_release.py") `
         --app-dist $exeDist `
         --archive $portableArchive `
         --mock-report $releaseMockE2EReport `
-        --provenance $provenancePath
+        --provenance $provenancePath `
+        @packageScopeArguments
     if ($LASTEXITCODE -ne 0) { throw "Portable Windows package creation or verification failed." }
 
     & $python (Join-Path $PSScriptRoot "scripts\package_source.py") `
@@ -297,6 +322,13 @@ try {
     Write-Host "Created source project package $sourceArchive"
 }
 finally {
+    if ($null -ne $smokeConfigDirectory) {
+        try {
+            Remove-FlukeSmokeConfigDirectory -Path $smokeConfigDirectory -SmokeConfigParent $env:TEMP
+        } catch {
+            Write-Warning "Could not remove this build's temporary smoke config directory: $smokeConfigDirectory. $($_.Exception.Message)"
+        }
+    }
     if ($null -eq $previousPythonPath) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue }
     else { $env:PYTHONPATH = $previousPythonPath }
     if ($null -eq $previousNuitkaCache) { Remove-Item Env:\NUITKA_CACHE_DIR -ErrorAction SilentlyContinue }

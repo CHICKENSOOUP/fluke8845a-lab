@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import math
+import csv
 import json
+import math
 from datetime import datetime
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from fluke8845a.modes import DESCRIPTORS, Mode
 from fluke8845a.mock import Mock8845A, MockScenario
 from fluke8845a.scpi import ModeSettings
+from fluke8845a.storage import EVENT_FIELDS, SAMPLE_FIELDS, ExperimentRecorder
 from scripts.generate_demo import generate
 
 
@@ -42,6 +44,38 @@ def test_mock_timeout_and_disconnect_are_injected_without_values():
     with pytest.raises(ConnectionError):
         disconnected.read()
     assert not disconnected.connected
+
+
+def test_mock_read_duration_and_recorded_interval_use_high_resolution_clock(tmp_path, monkeypatch):
+    import fluke8845a.mock as mock_module
+
+    clock_ns = [1_000_000_000]
+
+    def sleep(seconds):
+        clock_ns[0] += round(seconds * 1_000_000_000)
+
+    monkeypatch.setattr(mock_module.time, "monotonic_ns", lambda: 1_000_000_000)
+    monkeypatch.setattr(mock_module.time, "perf_counter_ns", lambda: clock_ns[0])
+    monkeypatch.setattr(mock_module.time, "sleep", sleep)
+
+    mock = Mock8845A(MockScenario(read_latency_s=0.01))
+    mock.connect()
+    mock.configure(ModeSettings(Mode.DCV))
+    recorder = ExperimentRecorder.create(
+        tmp_path, "high resolution clock", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    try:
+        first = mock.read()
+        first_row = recorder.append_reading(first, mode=Mode.DCV)
+        second = mock.read()
+        second_row = recorder.append_reading(second, mode=Mode.DCV)
+
+        assert first.read_duration_s == pytest.approx(0.01)
+        assert first_row["read_duration_s"] == repr(0.01)
+        assert second_row["actual_interval_s"] == repr(0.01)
+    finally:
+        recorder.finish("test")
+        mock.close()
 
 
 def test_mock_labels_input_impedance_as_simulated_and_preserves_it_during_speed_change():
@@ -91,4 +125,18 @@ def test_demo_generator_writes_explicit_six_mode_experiment_bundles(tmp_path):
         assert "不是8845A实测数据" in config["example_data_notice"]
         for filename in ("measurements.csv", "events.csv", "run.log"):
             assert (experiment / filename).is_file()
+        with (experiment / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            measurements = list(reader)
+            assert reader.fieldnames == list(SAMPLE_FIELDS)
+        with (experiment / "events.csv").open(newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            events = list(reader)
+            assert reader.fieldnames == list(EVENT_FIELDS)
+        assert config["software_version"] == "1.1.0"
+        assert config["sample_count"] == len(measurements) == 30
+        assert config["event_count"] == len(events) == 4
+        assert all(row["experiment_id"] == config["experiment_id"] for row in measurements + events)
+        assert all(float(row["read_duration_s"]) > 0 for row in measurements)
+        assert all(float(row["actual_interval_s"]) > 0 for row in measurements[1:])
 

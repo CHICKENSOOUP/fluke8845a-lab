@@ -32,4 +32,5 @@ fluke8845a = ["web/*.html", "web/*.css", "web/*.js"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+cache_dir = "build/test-artifacts/pytest-cache"
 

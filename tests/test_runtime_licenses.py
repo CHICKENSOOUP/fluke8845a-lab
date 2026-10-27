@@ -1,3 +1,4 @@
+import hashlib
 import json
 import csv
 from pathlib import Path
@@ -59,6 +60,7 @@ def make_license_sources(tmp_path: Path) -> tuple[Path, Path, Path]:
     (vendor_sources / "pyserial-3.5-LICENSE.txt").write_text("pySerial BSD license", encoding="utf-8")
     (vendor_sources / "Apache-2.0.txt").write_text("Apache license", encoding="utf-8")
     (project_root / "docs" / "licenses" / "LGPL-3.0.txt").write_text("LGPLv3 license", encoding="utf-8")
+    (project_root / "docs" / "licenses" / "GPL-3.0.txt").write_text("GPLv3 license", encoding="utf-8")
     return python_root, site_packages, project_root
 
 
@@ -85,6 +87,7 @@ def test_collect_runtime_licenses_copies_exact_materials_and_hash_manifest(tmp_p
     assert (output_root / "third-party" / "nuitka-runtime" / "LICENSE-RUNTIME.txt").is_file()
     assert (output_root / "third-party" / "pyside6_essentials" / "LicenseRef-Qt-Commercial.txt").read_text(encoding="utf-8") == "Qt commercial terms reference"
     assert (output_root / "third-party" / "qt-for-python" / "LGPL-3.0.txt").read_text(encoding="utf-8") == "LGPLv3 license"
+    assert (output_root / "third-party" / "qt-for-python" / "GPL-3.0.txt").read_text(encoding="utf-8") == "GPLv3 license"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["python_runtime_version"] == "3.12.10"
     assert manifest["review_status"] == (
@@ -96,6 +99,14 @@ def test_collect_runtime_licenses_copies_exact_materials_and_hash_manifest(tmp_p
         "Qt/PySide library replacement and relaunch have not been verified against this exact package.",
         "Microsoft Visual C++ runtime source and applicable redistribution terms require confirmation.",
     ]
+    gpl_record = next(
+        record for record in manifest["license_files"]
+        if record["path"] == "third-party/qt-for-python/GPL-3.0.txt"
+    )
+    gpl_text = (output_root / gpl_record["path"]).read_bytes()
+    assert gpl_record["component"] == "Qt for Python planned LGPLv3 path"
+    assert gpl_record["bytes"] == len(gpl_text)
+    assert gpl_record["sha256"] == hashlib.sha256(gpl_text).hexdigest().upper()
     assert {component["name"] for component in manifest["components"]} == {
         "CPython", "numpy", "pyqtgraph", "PySide6_Essentials", "shiboken6", "pyserial", "OpenSSL", "Nuitka runtime library",
     }

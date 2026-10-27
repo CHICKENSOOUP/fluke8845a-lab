@@ -11,12 +11,15 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import uuid
+import weakref
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, RLock, Thread, current_thread
 from typing import Any, Callable
 
 from . import __version__
@@ -34,7 +37,8 @@ MINIMUM_FREE_SPACE_BYTES = 10 * 1024 * 1024
 # Forecast only: real rows vary with the instrument response and error text.
 ESTIMATED_SAMPLE_BYTES = 4 * 1024
 STORAGE_SPACE_CHECK_INTERVAL_NS = 5_000_000_000
-CSV_FSYNC_INTERVAL_NS = 5_000_000_000
+CSV_FSYNC_INTERVAL_NS = 1_000_000_000
+LOG_FSYNC_INTERVAL_NS = 1_000_000_000
 EXPERIMENT_NAME_LOCK_PROTOCOL = 1
 _INVALID_EXPERIMENT_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _FINAL_EXPERIMENT_STATUSES = frozenset({
@@ -43,6 +47,15 @@ _FINAL_EXPERIMENT_STATUSES = frozenset({
     "rs232_terminal_mode", "scpi_timeout", "speed_update_error", "start_error",
     "stopped", "storage_error",
 })
+_RAW_CSV_SPREADSHEET_NOTICE = (
+    "实验 CSV 打开说明\n\n"
+    "measurements.csv 和 events.csv 保留原始记录，不会为电子表格软件改写。\n"
+    "不要直接用 Excel 等电子表格软件打开原始 events.csv；measurements.csv 中的原始读数和错误文本也可能以 =、+、- 或 @ 开头，"
+    "表格软件可能将其解释为公式。\n"
+    "需要用表格软件查看时，请在软件中导出并打开 events_excel_safe.csv 或 measurements_excel_safe.csv 安全副本；"
+    "原始 CSV 不会被修改。\n"
+    "科研计算请优先使用原始 CSV；若直接导入原始 CSV，请将事件、原始读数和错误列指定为文本。\n"
+)
 
 SAMPLE_FIELDS = (
     "experiment_id", "sample_index", "timestamp_local", "timestamp_utc",
@@ -51,7 +64,7 @@ SAMPLE_FIELDS = (
     "elapsed_s", "read_duration_s",
     "actual_interval_s", "mode", "quantity", "value_si", "unit_si", "raw_reading",
     "voltage_v", "current_a", "resistance_ohm", "range_si", "nplc", "ac_bandwidth_hz",
-    "analog_filter", "autozero", "input_impedance_auto", "measurement_basis", "status", "error",
+    "analog_filter", "digital_filter", "autozero", "input_impedance_auto", "measurement_basis", "status", "error",
 )
 EVENT_FIELDS = ("experiment_id", "event_index", "timestamp_local", "timestamp_utc", "elapsed_s", "sample_index", "mode", "value_si", "unit_si", "event")
 EVENT_NUMERIC_FIELDS = frozenset({"event_index", "elapsed_s", "sample_index", "value_si"})
@@ -418,27 +431,104 @@ class ExperimentNameLock:
         self.release()
 
 
-def _recovery_csv_snapshot(directory: Path, filename: str) -> dict[str, Any]:
+class _LimitedBinaryReader(io.RawIOBase):
+    """Read at most a known complete prefix without loading a long CSV into memory."""
+
+    def __init__(self, stream, limit: int) -> None:
+        super().__init__()
+        self._stream = stream
+        self._remaining = limit
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        if self._remaining <= 0:
+            return 0
+        chunk = self._stream.read(min(len(buffer), self._remaining))
+        if not chunk:
+            return 0
+        buffer[: len(chunk)] = chunk
+        self._remaining -= len(chunk)
+        return len(chunk)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._stream.close()
+            finally:
+                super().close()
+
+
+def _count_complete_csv_records(path: Path, prefix_bytes: int, index_field: str) -> int:
+    """Count data records in a previously validated complete CSV byte prefix."""
+    if prefix_bytes <= 0:
+        raise ValueError("CSV 没有完整表头，无法确认记录数量")
+    limited = _LimitedBinaryReader(path.open("rb"), prefix_bytes)
+    text = io.TextIOWrapper(
+        io.BufferedReader(limited), encoding="utf-8-sig", newline=""
+    )
+    try:
+        rows = csv.reader(text, strict=True)
+        header = next(rows, None)
+        if header is None or header.count(index_field) != 1:
+            raise ValueError(f"CSV 表头缺少唯一的 {index_field} 列")
+        index_position = header.index(index_field)
+        count = 0
+        for row in rows:
+            if len(row) != len(header):
+                raise ValueError("CSV 记录的列数与表头不一致")
+            try:
+                record_index = int(row[index_position])
+            except ValueError as exc:
+                raise ValueError(f"{index_field} 列索引不是整数") from exc
+            if record_index != count + 1:
+                raise ValueError(f"{index_field} 列索引不连续")
+            count += 1
+        return count
+    finally:
+        text.close()
+
+
+def _recovery_csv_snapshot(
+    directory: Path, filename: str, *, index_field: str
+) -> dict[str, Any]:
     path = directory / filename
     if _is_symlink_or_junction(path):
         raise OSError(f"异常退出实验的 {filename} 不能是符号链接或 junction：{path}")
     if not path.exists():
-        return {"present": False, "size_bytes": None, "complete_prefix_bytes": None, "partial_tail_bytes": None}
+        return {
+            "present": False,
+            "size_bytes": None,
+            "complete_prefix_bytes": None,
+            "partial_tail_bytes": None,
+            "complete_record_count": None,
+        }
     if not path.is_file():
         raise OSError(f"异常退出实验的 {filename} 不是普通文件：{path}")
     before = path.stat()
     prefix_bytes = complete_csv_prefix_size(path)
+    count_error = None
+    try:
+        record_count = _count_complete_csv_records(path, prefix_bytes, index_field)
+    except (csv.Error, UnicodeError, ValueError) as exc:
+        record_count = None
+        count_error = f"{type(exc).__name__}: {exc}"
     after = path.stat()
     before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
     if before_signature != after_signature:
         raise OSError(f"恢复检查期间 {filename} 发生变化；未修改实验元数据：{path}")
-    return {
+    snapshot = {
         "present": True,
         "size_bytes": after.st_size,
         "complete_prefix_bytes": prefix_bytes,
         "partial_tail_bytes": after.st_size - prefix_bytes,
+        "complete_record_count": record_count,
     }
+    if count_error is not None:
+        snapshot["record_count_error"] = count_error
+    return snapshot
 
 
 def mark_stale_experiment_interrupted(
@@ -499,8 +589,12 @@ def mark_stale_experiment_interrupted(
         )
 
     csv_snapshots = {
-        "measurements_csv": _recovery_csv_snapshot(candidate, "measurements.csv"),
-        "events_csv": _recovery_csv_snapshot(candidate, "events.csv"),
+        "measurements_csv": _recovery_csv_snapshot(
+            candidate, "measurements.csv", index_field="sample_index"
+        ),
+        "events_csv": _recovery_csv_snapshot(
+            candidate, "events.csv", index_field="event_index"
+        ),
     }
     if _is_symlink_or_junction(config_path) or config_path.read_bytes() != original_config:
         raise OSError(f"恢复检查期间 config.json 发生变化；未修改实验元数据：{config_path}")
@@ -521,9 +615,15 @@ def mark_stale_experiment_interrupted(
         "original_config_backup": backup_name,
         "sample_count_checkpoint": metadata.get("sample_count"),
         "event_count_checkpoint": metadata.get("event_count"),
+        "recovered_sample_count": csv_snapshots["measurements_csv"]["complete_record_count"],
+        "recovered_event_count": csv_snapshots["events_csv"]["complete_record_count"],
         **csv_snapshots,
     }
     updated_metadata = dict(metadata)
+    if recovery["recovered_sample_count"] is not None:
+        updated_metadata["sample_count"] = recovery["recovered_sample_count"]
+    if recovery["recovered_event_count"] is not None:
+        updated_metadata["event_count"] = recovery["recovered_event_count"]
     updated_metadata["completion_status"] = "interrupted"
     updated_metadata["recovery"] = recovery
     encoded_metadata = (
@@ -730,11 +830,150 @@ def complete_csv_prefix_size(
     return complete_end
 
 
+def _close_windows_handle_for_gc(kernel32, handle) -> None:
+    """Best-effort fallback for a directory handle whose owner was abandoned."""
+    try:
+        kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+class _WindowsDirectoryLease:
+    """Prevent a Windows experiment directory from being renamed while it is in use."""
+
+    def __init__(self, directory: Path) -> None:
+        self._handle = None
+        self._kernel32 = None
+        if os.name != "nt":
+            return
+
+        import ctypes
+        from ctypes import wintypes
+
+        class _FileTime(ctypes.Structure):
+            _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+        class _ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("file_attributes", wintypes.DWORD),
+                ("creation_time", _FileTime),
+                ("last_access_time", _FileTime),
+                ("last_write_time", _FileTime),
+                ("volume_serial_number", wintypes.DWORD),
+                ("file_size_high", wintypes.DWORD),
+                ("file_size_low", wintypes.DWORD),
+                ("number_of_links", wintypes.DWORD),
+                ("file_index_high", wintypes.DWORD),
+                ("file_index_low", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        file_read_attributes = 0x0080
+        delete_access = 0x00010000
+        share_read = 0x00000001
+        share_write = 0x00000002
+        open_existing = 3
+        file_flag_open_reparse_point = 0x00200000
+        file_flag_backup_semantics = 0x02000000
+        invalid_handle = ctypes.c_void_p(-1).value
+        handle = kernel32.CreateFileW(
+            str(directory),
+            file_read_attributes | delete_access,
+            share_read | share_write,
+            None,
+            open_existing,
+            file_flag_backup_semantics | file_flag_open_reparse_point,
+            None,
+        )
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            raise OSError(
+                f"无法锁定实验目录，拒绝在可能被替换的路径中保存数据：{directory}："
+                f"{ctypes.WinError(error)}"
+            )
+
+        try:
+            information = _ByHandleFileInformation()
+            if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                error = ctypes.get_last_error()
+                raise OSError(
+                    f"无法核对实验目录句柄：{directory}：{ctypes.WinError(error)}"
+                )
+            file_attribute_directory = 0x00000010
+            file_attribute_reparse_point = 0x00000400
+            if information.file_attributes & file_attribute_reparse_point:
+                raise OSError(f"实验目录不能是符号链接或 junction：{directory}")
+            if not information.file_attributes & file_attribute_directory:
+                raise OSError(f"实验路径不是文件夹：{directory}")
+
+            path_stat = directory.stat(follow_symlinks=False)
+            handle_file_id = (
+                information.file_index_high << 32
+            ) | information.file_index_low
+            # CPython exposes the Windows file index as st_ino and the volume
+            # serial in the low 32 bits of st_dev. Compare both to detect a path
+            # replacement that races the handle acquisition.
+            if (
+                path_stat.st_ino != handle_file_id
+                or (path_stat.st_dev & 0xFFFFFFFF)
+                != information.volume_serial_number
+            ):
+                raise OSError(f"实验目录在安全锁定期间发生变化：{directory}")
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+
+        self._kernel32 = kernel32
+        self._handle = handle
+        self._finalizer = weakref.finalize(
+            self, _close_windows_handle_for_gc, kernel32, handle
+        )
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        if not self._kernel32.CloseHandle(handle):
+            import ctypes
+
+            error = ctypes.get_last_error()
+            raise OSError(f"无法释放实验目录锁：{ctypes.WinError(error)}")
+        self._handle = None
+        self._finalizer.detach()
+
+
 class ExperimentRecorder:
     """Create a fresh run folder and periodically sync appended CSV records."""
 
     def __init__(self, directory: Path, metadata: dict[str, Any], settings: ModeSettings) -> None:
-        self.directory = directory
+        requested_directory = Path(directory).expanduser()
+        if _is_symlink_or_junction(requested_directory):
+            raise OSError(f"实验目录不能是符号链接或 junction：{requested_directory}")
+        try:
+            resolved_directory = requested_directory.resolve(strict=True)
+        except OSError as exc:
+            raise OSError(f"实验目录不存在或不可访问：{requested_directory}：{exc}") from exc
+        if not resolved_directory.is_dir():
+            raise OSError(f"实验路径不是文件夹：{requested_directory}")
+        self.directory = resolved_directory
         self.metadata = dict(metadata)
         self.experiment_id = uuid.uuid4().hex
         self.settings = settings
@@ -746,16 +985,30 @@ class ExperimentRecorder:
         self.sample_count = 0
         self._pending_sample_index: int | None = None
         self.event_count = 0
+        self._pending_event_index: int | None = None
         self._last_space_check_ns = 0
-        self._last_csv_fsync_ns = time.monotonic_ns()
+        self._last_csv_fsync_ns = time.perf_counter_ns()
+        self._last_log_fsync_ns = time.perf_counter_ns()
+        self._csv_sync_lock = RLock()
+        self._log_sync_lock = RLock()
+        self._csv_sync_error: Exception | None = None
+        self._log_sync_error: Exception | None = None
+        self._csv_sync_stop = Event()
+        self._csv_sync_thread: Thread | None = None
+        self._config_file_identity: tuple[int, int] | None = None
+        self._directory_lease: _WindowsDirectoryLease | None = None
         self._data_stream = None
         self._event_stream = None
         self._log_stream = None
         self._opened_streams = []
         try:
-            self._data_stream = self._open_stream(directory / "measurements.csv", "w", newline="", encoding="utf-8-sig")
-            self._event_stream = self._open_stream(directory / "events.csv", "w", newline="", encoding="utf-8-sig")
-            self._log_stream = self._open_stream(directory / "run.log", "w", encoding="utf-8")
+            self._directory_lease = _WindowsDirectoryLease(self.directory)
+            self._assert_output_directory()
+            for filename in ("measurements.csv", "events.csv", "run.log", "config.json"):
+                self._assert_output_path(self.directory / filename, must_not_exist=True)
+            self._data_stream = self._open_stream(self.directory / "measurements.csv", "x", newline="", encoding="utf-8-sig")
+            self._event_stream = self._open_stream(self.directory / "events.csv", "x", newline="", encoding="utf-8-sig")
+            self._log_stream = self._open_stream(self.directory / "run.log", "x", encoding="utf-8")
             self._writer = csv.DictWriter(self._data_stream, fieldnames=SAMPLE_FIELDS, extrasaction="ignore")
             self._events = csv.DictWriter(self._event_stream, fieldnames=EVENT_FIELDS, extrasaction="ignore")
             self._writer.writeheader()
@@ -794,17 +1047,158 @@ class ExperimentRecorder:
             })
             self._write_metadata()
             self.log("INFO", f"实验开始；数据仿真={self.metadata['simulation']}；模式={self.spec.label}")
+            self._write_csv_spreadsheet_notice()
         except BaseException:
             self._close_open_streams(suppress_errors=True)
+            self._close_directory_lease(suppress_errors=True)
             raise
 
+    def start_periodic_sync(self, on_error: Callable[[Exception], None]) -> None:
+        """Run due CSV and run-log fsyncs independently of acquisition."""
+        thread = self._csv_sync_thread
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("实验文件持久化线程已在运行")
+        self._csv_sync_stop = Event()
+        interval_ns = min(CSV_FSYNC_INTERVAL_NS, LOG_FSYNC_INTERVAL_NS)
+        interval_s = max(0.01, interval_ns / 1_000_000_000)
+
+        def sync_loop() -> None:
+            while not self._csv_sync_stop.wait(interval_s):
+                try:
+                    self.sync_csv_if_due()
+                    self.sync_log_if_due()
+                except Exception as exc:
+                    try:
+                        on_error(exc)
+                    except Exception:
+                        log.exception("could not report background storage sync failure")
+                    return
+
+        thread = Thread(
+            target=sync_loop,
+            name=f"Fluke8845A-storage-sync-{self.experiment_id[:8]}",
+            daemon=True,
+        )
+        self._csv_sync_thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            self._csv_sync_stop.set()
+            if getattr(thread, "ident", None) is None:
+                self._csv_sync_thread = None
+            else:
+                try:
+                    if thread is not current_thread():
+                        thread.join()
+                except Exception:
+                    # Keep the reference so finish() can retry the join before
+                    # it closes any stream that the thread may still be syncing.
+                    log.exception("could not join CSV sync thread after start failure")
+                if not thread.is_alive():
+                    self._csv_sync_thread = None
+            raise
+
+    def stop_periodic_sync(self) -> None:
+        """Stop and join the independent CSV sync thread before closing streams."""
+        thread = self._csv_sync_thread
+        if thread is None:
+            return
+        self._csv_sync_stop.set()
+        try:
+            if thread is not current_thread() and getattr(thread, "ident", None) is not None:
+                thread.join()
+        finally:
+            if not thread.is_alive():
+                self._csv_sync_thread = None
+
+    def _write_csv_spreadsheet_notice(self) -> None:
+        """Place a visible warning next to raw CSV files without changing them."""
+        path = self.directory / "CSV_打开说明.txt"
+        temporary = self.directory / f"{path.name}.{uuid.uuid4().hex}.partial"
+        created = False
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                created = True
+                stream.write(_RAW_CSV_SPREADSHEET_NOTICE)
+                stream.flush()
+            if path.exists():
+                raise FileExistsError(f"实验目录中已存在 {path.name}")
+            temporary.rename(path)
+        except FileExistsError:
+            self._remove_partial_csv_spreadsheet_notice(temporary, created)
+            self.log("WARNING", "未覆盖实验目录中已存在的 CSV_打开说明.txt")
+        except OSError as exc:
+            self._remove_partial_csv_spreadsheet_notice(temporary, created)
+            self.log("WARNING", f"无法创建 CSV_打开说明.txt；原始 CSV 保持不变：{exc}")
+
+    @staticmethod
+    def _remove_partial_csv_spreadsheet_notice(path: Path, created: bool) -> None:
+        if not created:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            log.exception("failed to remove incomplete CSV spreadsheet notice")
+
     def _open_stream(self, path: Path, *args: Any, **kwargs: Any):
+        self._assert_output_path(path, must_not_exist=True)
         stream = path.open(*args, **kwargs)
+        try:
+            self._assert_output_directory()
+            self._assert_output_path(path, must_not_exist=False)
+            opened = os.fstat(stream.fileno())
+            named = path.stat()
+            if self._file_identity(opened) != self._file_identity(named):
+                raise OSError(f"输出文件在打开期间被替换：{path}")
+        except BaseException:
+            stream.close()
+            raise
         self._opened_streams.append(stream)
         return stream
 
+    def _assert_output_directory(self) -> None:
+        directory = self.directory
+        if _is_symlink_or_junction(directory):
+            raise OSError(f"实验目录不能是符号链接或 junction：{directory}")
+        try:
+            if not directory.is_dir() or directory.resolve(strict=True) != directory:
+                raise OSError(f"实验目录已变化或不可访问：{directory}")
+        except OSError as exc:
+            raise OSError(f"实验目录已变化或不可访问：{directory}：{exc}") from exc
+
+    def _assert_output_path(
+        self,
+        path: Path,
+        *,
+        must_not_exist: bool,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> tuple[int, int] | None:
+        self._assert_output_directory()
+        if path.parent != self.directory:
+            raise OSError(f"输出文件不在实验目录中：{path}")
+        if _is_symlink_or_junction(path):
+            raise OSError(f"实验输出不能是符号链接或 junction：{path}")
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            if expected_identity is not None:
+                raise OSError(f"实验输出在写入期间被移除：{path}")
+            return None
+        if not stat.S_ISREG(details.st_mode):
+            raise OSError(f"实验输出不是普通文件：{path}")
+        identity = self._file_identity(details)
+        if must_not_exist:
+            raise FileExistsError(f"实验目录中已存在输出文件，拒绝覆盖：{path}")
+        if expected_identity is not None and identity != expected_identity:
+            raise OSError(f"实验输出在写入期间被替换：{path}")
+        return identity
+
+    @staticmethod
+    def _file_identity(details: os.stat_result) -> tuple[int, int]:
+        return details.st_dev, details.st_ino
+
     def check_storage_reserve(self) -> None:
-        now_ns = time.monotonic_ns()
+        now_ns = time.perf_counter_ns()
         if self._last_space_check_ns and now_ns - self._last_space_check_ns < STORAGE_SPACE_CHECK_INTERVAL_NS:
             return
         try:
@@ -818,6 +1212,12 @@ class ExperimentRecorder:
                 "已停止继续写入；请先释放磁盘空间并另开新实验。"
             )
 
+    def _ensure_no_pending_csv_record(self) -> None:
+        if self._pending_sample_index is not None:
+            raise OSError("前一条测量记录的CSV写入状态未确认，必须结束当前实验后恢复")
+        if self._pending_event_index is not None:
+            raise OSError("前一条事件记录的CSV写入状态未确认，必须结束当前实验后恢复")
+
     def _close_open_streams(self, *, suppress_errors: bool) -> None:
         for stream in reversed(self._opened_streams):
             if stream.closed:
@@ -828,6 +1228,19 @@ class ExperimentRecorder:
                 if not suppress_errors:
                     raise
                 log.exception("failed to close partially initialized experiment file")
+
+    def _close_directory_lease(self, *, suppress_errors: bool) -> None:
+        lease = self._directory_lease
+        if lease is None:
+            return
+        try:
+            lease.close()
+        except Exception:
+            if not suppress_errors:
+                raise
+            log.exception("failed to release experiment directory lease")
+        else:
+            self._directory_lease = None
 
     @classmethod
     def create(
@@ -846,10 +1259,14 @@ class ExperimentRecorder:
         else:
             root = Path(root).expanduser()
             directory = Path(reserved_directory).expanduser()
+            if _is_symlink_or_junction(directory):
+                raise OSError(f"预留的实验目录不能是符号链接或 junction：{directory}")
             try:
-                if directory.parent.resolve() != root.resolve() or not directory.is_dir():
+                resolved_root = root.resolve(strict=True)
+                resolved_directory = directory.resolve(strict=True)
+                if resolved_directory.parent != resolved_root or not resolved_directory.is_dir():
                     raise ValueError("预留的实验目录不在指定保存根目录中")
-                if any(directory.iterdir()):
+                if any(resolved_directory.iterdir()):
                     raise FileExistsError("预留的实验目录已包含文件，拒绝覆盖")
             except OSError as exc:
                 raise OSError(f"预留的实验目录不可用：{directory}：{exc}") from exc
@@ -859,8 +1276,9 @@ class ExperimentRecorder:
 
     def log(self, level: str, message: str) -> None:
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        self._log_stream.write(f"{timestamp} [{level.upper()}] {message}\n")
-        self._log_stream.flush()
+        with self._log_sync_lock:
+            self._log_stream.write(f"{timestamp} [{level.upper()}] {message}\n")
+            self._log_stream.flush()
 
     def append_reading(
         self,
@@ -883,8 +1301,7 @@ class ExperimentRecorder:
     ) -> dict[str, Any]:
         if mode != self.mode:
             raise ValueError("一个实验数据段中不能混合不同测量模式")
-        if self._pending_sample_index is not None:
-            raise OSError("前一条测量记录的CSV写入状态未确认，必须结束当前实验后恢复")
+        self._ensure_no_pending_csv_record()
         self.check_storage_reserve()
         if reading is not None:
             started_monotonic_ns = reading.read_request_start_monotonic_ns
@@ -900,7 +1317,7 @@ class ExperimentRecorder:
             status = reading.status
         if started_monotonic_ns is None:
             import time
-            started_monotonic_ns = time.monotonic_ns()
+            started_monotonic_ns = time.perf_counter_ns()
         if not timestamp_local or not timestamp_utc:
             if timestamp_utc:
                 sample_time = datetime.fromisoformat(timestamp_utc)
@@ -976,6 +1393,7 @@ class ExperimentRecorder:
             "nplc": "" if self.settings.nplc is None else repr(float(self.settings.nplc)),
             "ac_bandwidth_hz": "" if self.settings.ac_bandwidth_hz is None else self.settings.ac_bandwidth_hz,
             "analog_filter": self.settings.analog_filter if self.spec.analog_filter else "",
+            "digital_filter": self.settings.digital_filter if self.spec.digital_filter else "",
             "autozero": self.settings.autozero,
             "input_impedance_auto": (
                 self.settings.input_impedance_auto if self.spec.input_impedance_auto else ""
@@ -984,25 +1402,25 @@ class ExperimentRecorder:
             "status": status,
             "error": error,
         }
-        self._writer.writerow(row)
+        self._pending_sample_index = sample_index
         try:
-            self._data_stream.flush()
+            with self._csv_sync_lock:
+                self._writer.writerow(row)
+                self._data_stream.flush()
+                self.sync_csv_if_due()
         except Exception:
-            # writerow completed, but the flush result is ambiguous. The worker
-            # stops on this error; finish() can reconcile this single pending
-            # row if its final CSV flush and fsync succeed.
-            self._pending_sample_index = sample_index
+            # A failed write, flush, log flush, or fsync leaves persistence ambiguous. The
+            # worker stops; finish() reconciles against complete CSV records.
             raise
         # Count only a complete CSV record accepted by the stream. A failed or
         # partial writerow must not inflate the persisted-row checkpoint.
         if self.started_monotonic_ns is None:
             self.started_monotonic_ns = started_monotonic_ns
         self.sample_count = sample_index
+        self._pending_sample_index = None
         self.last_attempt_ns = started_monotonic_ns
         if reading is not None and reading.status == "ok":
             self.last_valid_response_end_ns = response_end_ns
-        self._log_stream.flush()
-        self._sync_csv_streams()
         if self.sample_count % 100 == 0:
             self.metadata["sample_count"] = self.sample_count
             self._write_metadata()
@@ -1011,11 +1429,12 @@ class ExperimentRecorder:
     def append_event(self, event: str, *, value_si: float | None = None) -> dict[str, Any]:
         if not event.strip():
             raise ValueError("事件内容不能为空")
+        self._ensure_no_pending_csv_record()
         self.check_storage_reserve()
         import time
         from datetime import datetime, timezone
 
-        now_ns = time.monotonic_ns()
+        now_ns = time.perf_counter_ns()
         if self.started_monotonic_ns is None:
             self.started_monotonic_ns = now_ns
         event_time_utc = datetime.now(timezone.utc)
@@ -1032,10 +1451,13 @@ class ExperimentRecorder:
             "unit_si": self.spec.unit_si,
             "event": event.strip(),
         }
-        self._events.writerow(row)
-        self.event_count += 1
-        self._event_stream.flush()
-        self._sync_csv_streams(force=True)
+        self._pending_event_index = row["event_index"]
+        with self._csv_sync_lock:
+            self._events.writerow(row)
+            self._event_stream.flush()
+            self.sync_csv_if_due(force=True)
+        self.event_count = row["event_index"]
+        self._pending_event_index = None
         self.metadata["event_count"] = self.event_count
         self._write_metadata()
         self.log("EVENT", event.strip())
@@ -1046,21 +1468,28 @@ class ExperimentRecorder:
         *,
         nplc: float | None,
         ac_bandwidth_hz: int | None,
+        digital_filter: bool,
         device_configuration: dict[str, Any],
     ) -> dict[str, Any]:
-        """Persist an acknowledged speed change before any subsequent sample."""
+        """Persist acknowledged integration, bandwidth, or digital-filter changes."""
+        self._ensure_no_pending_csv_record()
         previous_nplc = self.settings.nplc
         previous_band = self.settings.ac_bandwidth_hz
+        previous_digital_filter = self.settings.digital_filter if self.spec.digital_filter else None
         self.settings = replace(
-            self.settings, nplc=nplc, ac_bandwidth_hz=ac_bandwidth_hz
+            self.settings,
+            nplc=nplc,
+            ac_bandwidth_hz=ac_bandwidth_hz,
+            digital_filter=digital_filter if self.spec.digital_filter else False,
         )
         active_settings = self.metadata.setdefault("mode_settings", {})
         active_settings["nplc"] = nplc
         active_settings["ac_bandwidth_hz"] = ac_bandwidth_hz
+        active_settings["digital_filter"] = digital_filter if self.spec.digital_filter else None
         self.metadata["actual_device_configuration"] = dict(device_configuration)
         now_utc = datetime.now(timezone.utc)
         now_local = now_utc.astimezone()
-        now_ns = time.monotonic_ns()
+        now_ns = time.perf_counter_ns()
         change = {
             "timestamp_local": now_local.isoformat(timespec="microseconds"),
             "timestamp_utc": now_utc.isoformat(timespec="microseconds"),
@@ -1070,6 +1499,8 @@ class ExperimentRecorder:
             "nplc": nplc,
             "previous_ac_bandwidth_hz": previous_band,
             "ac_bandwidth_hz": ac_bandwidth_hz,
+            "previous_digital_filter": previous_digital_filter,
+            "digital_filter": digital_filter if self.spec.digital_filter else None,
         }
         self.metadata.setdefault("measurement_speed_changes", []).append(change)
         self._write_metadata()
@@ -1078,30 +1509,90 @@ class ExperimentRecorder:
             pieces.append(f"NPLC {previous_nplc:g}→{nplc:g}")
         if ac_bandwidth_hz is not None:
             pieces.append(f"交流带宽 {previous_band}→{ac_bandwidth_hz} Hz")
+        if self.spec.digital_filter and previous_digital_filter != digital_filter:
+            pieces.append(
+                "直流数字滤波 "
+                f"{'开' if previous_digital_filter else '关'}→{'开' if digital_filter else '关'}"
+            )
         description = "、".join(pieces) or "测量速度参数无变化"
         message = f"测量速度已应用：{description}；从样本 {change['effective_sample_index']} 起生效"
         return self.append_event(message)
 
     def finish(self, status: str = "stopped") -> None:
+        try:
+            self._finish_experiment(status)
+        finally:
+            streams = (self._data_stream, self._event_stream, self._log_stream)
+            sync_thread = self._csv_sync_thread
+            sync_stopped = sync_thread is None or not sync_thread.is_alive()
+            if sync_stopped and not all(stream is None or stream.closed for stream in streams):
+                # A transient close failure must not strand the directory lease
+                # after the worker drops its recorder reference.
+                self._close_open_streams(suppress_errors=True)
+                streams = (self._data_stream, self._event_stream, self._log_stream)
+            if all(stream is None or stream.closed for stream in streams):
+                self._close_directory_lease(suppress_errors=True)
+
+    def _finish_experiment(self, status: str) -> None:
+        self.stop_periodic_sync()
         streams = (self._data_stream, self._event_stream, self._log_stream)
         if all(stream is None or stream.closed for stream in streams):
             return
-        first_error: Exception | None = None
+        # Preserve asynchronous sync failures even if their queued Qt notification
+        # has not reached the worker before a user stop/finalization.
+        first_error: Exception | None = self.csv_sync_error or self.log_sync_error
         log_succeeded = False
-        try:
-            self.log("INFO", f"实验结束；状态={status}；测量尝试={self.sample_count}；事件={self.event_count}")
-            log_succeeded = True
-        except Exception as exc:
-            first_error = exc
 
         csv_sync_succeeded = False
         try:
-            self._sync_csv_streams(force=True)
-            csv_sync_succeeded = True
+            self.sync_csv_if_due(force=True)
             if self._pending_sample_index is not None:
-                self.sample_count = self._pending_sample_index
+                self.sample_count = self._reconcile_pending_csv_record(
+                    "measurements.csv",
+                    current_count=self.sample_count,
+                    pending_index=self._pending_sample_index,
+                    index_field="sample_index",
+                )
                 self.metadata["sample_count"] = self.sample_count
                 self._pending_sample_index = None
+            if self._pending_event_index is not None:
+                self.event_count = self._reconcile_pending_csv_record(
+                    "events.csv",
+                    current_count=self.event_count,
+                    pending_index=self._pending_event_index,
+                    index_field="event_index",
+                )
+                self.metadata["event_count"] = self.event_count
+                self._pending_event_index = None
+            # A later successful final sync cannot erase a prior interval sync
+            # failure: the promised periodic persistence was already interrupted.
+            csv_sync_succeeded = self.csv_sync_error is None
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+
+        unresolved = []
+        if self._pending_sample_index is not None:
+            unresolved.append("测量记录")
+        if self._pending_event_index is not None:
+            unresolved.append("事件记录")
+        csv_sync_error = self.csv_sync_error
+        log_sync_error = self.log_sync_error
+        ending_status = (
+            "storage_error"
+            if csv_sync_error is not None or log_sync_error is not None
+            else status
+        )
+        ending = f"实验结束；状态={ending_status}；测量尝试={self.sample_count}；事件={self.event_count}"
+        if csv_sync_error is not None:
+            ending += f"；CSV同步失败={csv_sync_error}"
+        if log_sync_error is not None:
+            ending += f"；run.log同步失败={log_sync_error}"
+        if unresolved:
+            ending += f"；以下记录写入状态未确认：{'、'.join(unresolved)}"
+        try:
+            self.log("INFO", ending)
+            log_succeeded = True
         except Exception as exc:
             if first_error is None:
                 first_error = exc
@@ -1109,7 +1600,7 @@ class ExperimentRecorder:
         log_sync_succeeded = False
         try:
             self._sync_log_stream()
-            log_sync_succeeded = True
+            log_sync_succeeded = self.log_sync_error is None
         except Exception as exc:
             if first_error is None:
                 first_error = exc
@@ -1162,33 +1653,139 @@ class ExperimentRecorder:
         if first_error is not None:
             raise first_error
 
+    def _reconcile_pending_csv_record(
+        self,
+        filename: str,
+        *,
+        current_count: int,
+        pending_index: int,
+        index_field: str,
+    ) -> int:
+        """Reconcile an ambiguous last write using only complete CSV records."""
+        if pending_index != current_count + 1:
+            raise ValueError(f"{filename} 的待确认记录序号不连续；拒绝猜测持久化数量")
+        path = self.directory / filename
+        if _is_symlink_or_junction(path):
+            raise OSError(f"待确认的 {filename} 不能是符号链接或 junction：{path}")
+        before = path.stat()
+        prefix_bytes = complete_csv_prefix_size(path)
+        persisted_count = _count_complete_csv_records(path, prefix_bytes, index_field)
+        after = path.stat()
+        before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if before_signature != after_signature:
+            raise OSError(f"核对待确认记录期间 {filename} 发生变化；拒绝猜测持久化数量：{path}")
+        if persisted_count not in (current_count, pending_index):
+            raise ValueError(
+                f"{filename} 中完整记录数 {persisted_count} 与待确认序号不符；拒绝猜测持久化数量"
+            )
+        return persisted_count
+
     def _write_metadata(self) -> None:
-        temp = self.directory / "config.json.tmp"
-        with temp.open("w", encoding="utf-8") as stream:
-            json.dump(self.metadata, stream, ensure_ascii=False, indent=2, default=_json_default, allow_nan=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        temp.replace(self.directory / "config.json")
+        target = self.directory / "config.json"
+        temp = self.directory / f"config.json.{uuid.uuid4().hex}.tmp"
+        created_identity: tuple[int, int] | None = None
+        expected_identity = self._config_file_identity
+        try:
+            self._assert_output_path(
+                target,
+                must_not_exist=expected_identity is None,
+                expected_identity=expected_identity,
+            )
+            self._assert_output_path(temp, must_not_exist=True)
+            with temp.open("x", encoding="utf-8") as stream:
+                created_identity = self._file_identity(os.fstat(stream.fileno()))
+                json.dump(
+                    self.metadata,
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=_json_default,
+                    allow_nan=False,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            self._assert_output_path(
+                temp, must_not_exist=False, expected_identity=created_identity
+            )
+            self._assert_output_path(
+                target,
+                must_not_exist=expected_identity is None,
+                expected_identity=expected_identity,
+            )
+            os.replace(temp, target)
+            self._assert_output_path(
+                target, must_not_exist=False, expected_identity=created_identity
+            )
+            self._config_file_identity = created_identity
+        except BaseException:
+            try:
+                if created_identity is not None and temp.exists():
+                    self._assert_output_path(
+                        temp, must_not_exist=False, expected_identity=created_identity
+                    )
+                    temp.unlink()
+            except OSError:
+                log.exception("failed to remove incomplete experiment metadata temp file")
+            raise
 
     def _flush_streams(self) -> None:
         for stream in (getattr(self, "_data_stream", None), getattr(self, "_event_stream", None), getattr(self, "_log_stream", None)):
             if stream is not None and not stream.closed:
                 stream.flush()
 
+    def sync_csv_if_due(self, *, force: bool = False) -> None:
+        """Synchronize open CSV streams when due, including during idle periods."""
+        self._sync_csv_streams(force=force)
+
+    @property
+    def csv_sync_error(self) -> Exception | None:
+        """Return the first CSV sync failure, retained through finalization."""
+        with self._csv_sync_lock:
+            return self._csv_sync_error
+
+    @property
+    def log_sync_error(self) -> Exception | None:
+        """Return the first run.log sync failure, retained through finalization."""
+        with self._log_sync_lock:
+            return self._log_sync_error
+
     def _sync_csv_streams(self, *, force: bool = False) -> None:
-        now_ns = time.monotonic_ns()
-        if not force and now_ns - self._last_csv_fsync_ns < CSV_FSYNC_INTERVAL_NS:
-            return
-        for stream in (self._data_stream, self._event_stream):
-            if stream is not None and not stream.closed:
-                stream.flush()
-                os.fsync(stream.fileno())
-        self._last_csv_fsync_ns = now_ns
+        with self._csv_sync_lock:
+            now_ns = time.perf_counter_ns()
+            if not force and now_ns - self._last_csv_fsync_ns < CSV_FSYNC_INTERVAL_NS:
+                return
+            try:
+                for stream in (self._data_stream, self._event_stream):
+                    if stream is not None and not stream.closed:
+                        stream.flush()
+                        os.fsync(stream.fileno())
+            except Exception as exc:
+                if self._csv_sync_error is None:
+                    self._csv_sync_error = exc
+                raise
+            self._last_csv_fsync_ns = now_ns
 
     def _sync_log_stream(self) -> None:
-        stream = self._log_stream
-        if stream is not None and not stream.closed:
-            stream.flush()
-            os.fsync(stream.fileno())
+        with self._log_sync_lock:
+            stream = self._log_stream
+            if stream is not None and not stream.closed:
+                try:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                except Exception as exc:
+                    if self._log_sync_error is None:
+                        self._log_sync_error = exc
+                    raise
+
+    def sync_log_if_due(self, *, force: bool = False) -> None:
+        """Synchronize run.log at a bounded interval, retaining the first failure."""
+        with self._log_sync_lock:
+            now_ns = time.perf_counter_ns()
+            if not force and now_ns - self._last_log_fsync_ns < LOG_FSYNC_INTERVAL_NS:
+                return
+            self._sync_log_stream()
+            self._last_log_fsync_ns = now_ns
 

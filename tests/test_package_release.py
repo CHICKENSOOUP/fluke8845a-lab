@@ -2,6 +2,9 @@ import hashlib
 import json
 import logging
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -18,7 +21,7 @@ from scripts.package_windows_release import (
     validate_portable_runtime_components,
     validate_runtime_license_manifest,
 )
-from scripts.release_metadata import release_identity
+from scripts.release_metadata import SEMVER, release_identity
 from scripts.release_publication import (
     main as release_publication_main,
     validate_github_release,
@@ -41,6 +44,187 @@ def test_build_script_transports_unicode_python_runtime_path_as_utf8_hex():
     assert "[System.Text.Encoding]::UTF8.GetString($pythonBaseBytes)" in build_script
 
 
+def test_build_script_transports_unicode_python_site_packages_path_as_utf8_hex():
+    build_script = (package_windows_release.ROOT / "build_windows.ps1").read_text(encoding="utf-8")
+    assert "sysconfig.get_paths()['purelib'].encode('utf-8').hex()" in build_script
+    assert "scripts\\build_path_helpers.ps1" in build_script
+    assert "ConvertFrom-FlukeUtf8Hex -Hex $pythonSitePackagesHex" in build_script
+    assert '$env:PYTHONPATH = (Join-Path $PSScriptRoot "src") + ";" + $pythonSitePackages' in build_script
+
+
+def test_windows_powershell_utf8_hex_helper_round_trips_unicode_and_rejects_invalid_hex():
+    powershell = next(
+        (
+            shutil.which(name)
+            for name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh")
+            if shutil.which(name)
+        ),
+        None,
+    )
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    helper_path = package_windows_release.ROOT / "scripts" / "build_path_helpers.ps1"
+    assert helper_path.is_file(), "the tested PowerShell helper must exist"
+    helper_literal = str(helper_path).replace("'", "''")
+    expected_path = r"C:\Users\解程旭\构建目录\venv\Lib\site-packages"
+    expected_literal = expected_path.replace("'", "''")
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            f". '{helper_literal}'",
+            f"$expected = '{expected_literal}'",
+            "$hex = [BitConverter]::ToString([System.Text.Encoding]::UTF8.GetBytes($expected)).Replace('-', '')",
+            "$actual = ConvertFrom-FlukeUtf8Hex -Hex $hex",
+            "if ($actual -cne $expected) { throw 'UTF-8 path did not round-trip exactly.' }",
+            "$invalidRejected = $false",
+            "try { ConvertFrom-FlukeUtf8Hex -Hex '0G' } catch { $invalidRejected = $true }",
+            "if (-not $invalidRejected) { throw 'Invalid UTF-8 hex was accepted.' }",
+            "[Console]::Write('round-trip-ok')",
+        ]
+    )
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        cwd=package_windows_release.ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout == "round-trip-ok"
+
+
+def test_build_uses_a_unique_scoped_mock_config_directory():
+    build_script = (package_windows_release.ROOT / "build_windows.ps1").read_text(encoding="utf-8")
+
+    assert 'build\\smoke-config"' not in build_script
+    create_config = build_script.index("New-FlukeSmokeConfigDirectory")
+    set_config = build_script.index('$env:FLUKE8845A_CONFIG_DIR = $smokeConfigDirectory')
+    smoke_launch = build_script.index('--mock", "--smoke')
+    cleanup_config = build_script.index("Remove-FlukeSmokeConfigDirectory")
+    restore_config = build_script.index("if ($null -eq $previousConfigDir)")
+
+    assert create_config < set_config < smoke_launch
+    assert cleanup_config < restore_config
+    assert "-SmokeConfigParent $env:TEMP" in build_script
+
+
+def test_powershell_smoke_config_directory_cleanup_is_scoped_and_preserves_siblings(tmp_path):
+    powershell = next(
+        (
+            shutil.which(name)
+            for name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh")
+            if shutil.which(name)
+        ),
+        None,
+    )
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    helper_path = package_windows_release.ROOT / "scripts" / "build_path_helpers.ps1"
+    helper_literal = str(helper_path).replace("'", "''")
+    parent_literal = str(tmp_path).replace("'", "''")
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            f". '{helper_literal}'",
+            f"$parent = '{parent_literal}'",
+            "$prefix = 'Fluke8845A-smoke-config'",
+            "$sibling = Join-Path $parent ($prefix + '-sibling')",
+            "New-Item -ItemType Directory -Path $sibling -Force | Out-Null",
+            "Set-Content -LiteralPath (Join-Path $sibling 'profiles.json') -Value 'preserve-me'",
+            "$first = New-FlukeSmokeConfigDirectory -SmokeConfigParent $parent",
+            "$second = New-FlukeSmokeConfigDirectory -SmokeConfigParent $parent",
+            "if ($first -eq $second) { throw 'Build smoke config directories must be unique.' }",
+            "Set-Content -LiteralPath (Join-Path $first 'profiles.json') -Value 'generated'",
+            "Set-Content -LiteralPath (Join-Path $second 'profiles.json') -Value 'preserve-second'",
+            "$parentRejected = $false",
+            "try { Remove-FlukeSmokeConfigDirectory -Path $parent -SmokeConfigParent $parent } catch { $parentRejected = $true }",
+            "if (-not $parentRejected) { throw 'The helper must refuse to remove its parent.' }",
+            "$siblingRejected = $false",
+            "try { Remove-FlukeSmokeConfigDirectory -Path $sibling -SmokeConfigParent $parent } catch { $siblingRejected = $true }",
+            "if (-not $siblingRejected) { throw 'The helper must refuse to remove a sibling.' }",
+            "Remove-FlukeSmokeConfigDirectory -Path $first -SmokeConfigParent $parent",
+            "if (Test-Path -LiteralPath $first) { throw 'The generated config directory was not removed.' }",
+            "if (-not (Test-Path -LiteralPath (Join-Path $second 'profiles.json'))) { throw 'The other build directory was removed.' }",
+            "if ((Get-Content -LiteralPath (Join-Path $sibling 'profiles.json') -Raw).Trim() -ne 'preserve-me') { throw 'The sibling profile was modified.' }",
+            "Remove-FlukeSmokeConfigDirectory -Path $second -SmokeConfigParent $parent",
+            "[Console]::Write('scoped-cleanup-ok')",
+        ]
+    )
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        cwd=package_windows_release.ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout == "scoped-cleanup-ok"
+
+
+def test_powershell_smoke_config_rejects_reparse_ancestors(tmp_path):
+    powershell = next(
+        (
+            shutil.which(name)
+            for name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh")
+            if shutil.which(name)
+        ),
+        None,
+    )
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    helper_path = package_windows_release.ROOT / "scripts" / "build_path_helpers.ps1"
+    helper_literal = str(helper_path).replace("'", "''")
+    root_literal = str(tmp_path).replace("'", "''")
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            f". '{helper_literal}'",
+            f"$root = '{root_literal}'",
+            "$target = Join-Path $root 'junction-target'",
+            "$junction = Join-Path $root 'junction-parent'",
+            "$parent = Join-Path $junction 'windows-temp'",
+            "New-Item -ItemType Directory -Path $target | Out-Null",
+            "try { New-Item -ItemType Junction -Path $junction -Target $target | Out-Null } catch { [Console]::Write('junction-unavailable'); exit 0 }",
+            "try {",
+            "    $rejected = $false",
+            "    try { New-FlukeSmokeConfigDirectory -SmokeConfigParent $parent | Out-Null } catch { $rejected = $true }",
+            "    if (-not $rejected) { throw 'A reparse point in the smoke config parent chain must be rejected.' }",
+            "    if (Test-Path -LiteralPath $parent) { throw 'The helper created a directory through a reparse point before rejecting it.' }",
+            "    [Console]::Write('reparse-ancestor-rejected')",
+            "} finally {",
+            "    if (Test-Path -LiteralPath $parent) { Remove-Item -LiteralPath $parent -Recurse -Force }",
+            "    if (Test-Path -LiteralPath $junction) { Remove-Item -LiteralPath $junction -Force }",
+            "}",
+        ]
+    )
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        cwd=package_windows_release.ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    if result.stdout == "junction-unavailable":
+        pytest.skip("The current Windows account cannot create a test junction")
+    assert result.stdout == "reparse-ancestor-rejected"
+
+
 def test_build_script_generates_archived_mock_report_after_build_identity():
     build_script = (package_windows_release.ROOT / "build_windows.ps1").read_text(encoding="utf-8")
     identity_marker = build_script.index('"BUILD-IDENTITY.json"')
@@ -48,6 +232,40 @@ def test_build_script_generates_archived_mock_report_after_build_identity():
     archived_report = build_script.index('Copy-Item -LiteralPath $mockE2EReport -Destination $releaseMockE2EReport')
 
     assert identity_marker < mock_report < archived_report
+
+
+def test_mock_report_updater_preserves_utf8_build_title_and_executable_hash(tmp_path):
+    from importlib.util import find_spec
+
+    spec = find_spec("scripts.update_mock_report")
+    assert spec is not None, "frozen Mock report updates need an explicit UTF-8-safe helper"
+
+    from scripts.update_mock_report import update_mock_report_hash
+
+    report_path = tmp_path / "mock-report.json"
+    executable_path = tmp_path / "Fluke8845A.exe"
+    title = "Fluke 8845A 科研测量与长期记录 · v1.1.0 · 构建 9400878C"
+    report_path.write_text(
+        json.dumps({"window_title": title, "status": "ok"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    executable_bytes = b"frozen executable bytes"
+    executable_path.write_bytes(executable_bytes)
+
+    update_mock_report_hash(report_path, executable_path)
+
+    encoded_report = report_path.read_bytes()
+    assert not encoded_report.startswith(b"\xef\xbb\xbf"), "the helper must write BOM-free UTF-8 JSON"
+    updated = json.loads(encoded_report.decode("utf-8"))
+    assert updated["window_title"] == title
+    assert updated["executable_sha256"] == hashlib.sha256(executable_bytes).hexdigest().upper()
+
+
+def test_windows_build_uses_utf8_safe_mock_report_updater():
+    build_script = (package_windows_release.ROOT / "build_windows.ps1").read_text(encoding="utf-8")
+
+    assert "scripts\\update_mock_report.py" in build_script
+    assert "$mockE2EData | ConvertTo-Json -Depth 10 | Set-Content" not in build_script
 
 
 def test_windows_build_runs_web_tests_before_nuitka_compilation():
@@ -163,7 +381,24 @@ def test_atomic_archive_cleanup_failure_is_reported(tmp_path, monkeypatch, caplo
     original_unlink(candidate, missing_ok=True)
 
 
-def test_windows_archive_smoke_failure_preserves_previous_archive(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("desktop_only", [False, True])
+@pytest.mark.parametrize(
+    ("smoke_failure", "report_failure", "archive_exists", "interrupt_mode", "mutate_archive_after_replace"),
+    [
+        (True, False, True, None, False),
+        (False, False, True, None, False),
+        (False, True, True, None, False),
+        (False, True, False, None, False),
+        (False, False, True, "before_receipt", False),
+        (False, False, True, "after_archive_replace", False),
+        (False, False, True, "after_receipt", False),
+        (False, False, True, None, True),
+    ],
+)
+def test_windows_archive_smoke_report_persists_only_after_success(
+    tmp_path, monkeypatch, capsys, smoke_failure, report_failure, archive_exists,
+    interrupt_mode, mutate_archive_after_replace, desktop_only,
+):
     root = tmp_path / "checkout"
     dist = root / "dist"
     app_dist = dist / "candidate" / "Fluke8845A.dist"
@@ -178,6 +413,8 @@ def test_windows_archive_smoke_failure_preserves_previous_archive(tmp_path, monk
     qt_inventory.write_text("path,family,bytes,sha256\n", encoding="utf-8")
     build_identity = app_dist / "BUILD-IDENTITY.json"
     identity_payload = {"source_tree_sha256": "A" * 64}
+    if desktop_only:
+        identity_payload["artifact_scope"] = "desktop_only"
     build_identity.write_text(json.dumps(identity_payload), encoding="utf-8")
     docs = root / "docs"
     docs.mkdir()
@@ -189,7 +426,16 @@ def test_windows_archive_smoke_failure_preserves_previous_archive(tmp_path, monk
     provenance.write_text(json.dumps(identity_payload), encoding="utf-8")
     archive = dist / "Fluke8845A_Test_Windows_x64.zip"
     old_archive = b"previously verified portable package"
-    archive.write_bytes(old_archive)
+    if archive_exists:
+        archive.write_bytes(old_archive)
+    validation_report = root / "output" / "mock_validation" / "Fluke8845A_Test_portable_validation.json"
+    old_validation_report = b'{"status":"previous"}\n'
+    if (
+        report_failure
+        or interrupt_mode in {"before_receipt", "after_archive_replace"}
+        or mutate_archive_after_replace
+    ) and archive_exists:
+        validation_report.write_bytes(old_validation_report)
 
     monkeypatch.setattr(package_windows_release, "ROOT", root)
     monkeypatch.setattr(package_windows_release, "DIST", dist)
@@ -201,7 +447,7 @@ def test_windows_archive_smoke_failure_preserves_previous_archive(tmp_path, monk
         "_release_files",
         lambda _app_dist: [
             (desktop_exe, "Fluke8845A.exe"),
-            (web_exe, "Fluke8845A-Web.dist/Fluke8845A-Web.exe"),
+            *([] if desktop_only else [(web_exe, "Fluke8845A-Web.dist/Fluke8845A-Web.exe")]),
             (build_identity, "BUILD-IDENTITY.json"),
             (license_manifest, "docs/licenses/windows-runtime-license-manifest.json"),
             (qt_inventory, "docs/licenses/windows-qt-runtime-inventory.csv"),
@@ -227,20 +473,133 @@ def test_windows_archive_smoke_failure_preserves_previous_archive(tmp_path, monk
     monkeypatch.setattr(package_windows_release, "validate_windows_archive_provenance", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(package_windows_release, "validate_mock_e2e_report", lambda *_args, **_kwargs: None)
 
-    def fail_extracted_smoke(*_args, **_kwargs):
-        raise RuntimeError("extracted package smoke failed")
+    if smoke_failure:
+        def fail_extracted_smoke(*_args, **_kwargs):
+            raise RuntimeError("extracted package smoke failed")
 
-    monkeypatch.setattr(package_windows_release, "verify_extracted_portable_release", fail_extracted_smoke)
+        monkeypatch.setattr(package_windows_release, "verify_extracted_portable_release", fail_extracted_smoke)
+    else:
+        monkeypatch.setattr(
+            package_windows_release,
+            "verify_extracted_portable_release",
+            lambda *_args, **_kwargs: {
+                "schema_version": 1,
+                "status": "ok",
+                "serial_enumeration": {"status": "ok", "exit_code": 0},
+                "mock_e2e": {"status": "ok", "simulation": True, "mode_count": 6},
+                "localhost_web": {"status": "not_included"} if desktop_only else {"status": "ok", "health": {"status": "ok", "bind": "127.0.0.1"}},
+            },
+        )
+    if report_failure:
+        def fail_validation_report(*_args, **_kwargs):
+            raise OSError("validation report destination is unavailable")
+
+        monkeypatch.setattr(package_windows_release, "_write_portable_validation_report", fail_validation_report)
+    elif interrupt_mode == "before_receipt":
+        def interrupt_before_receipt(*_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(package_windows_release, "_write_portable_validation_report", interrupt_before_receipt)
+    elif interrupt_mode == "after_receipt":
+        write_validation_report = package_windows_release._write_portable_validation_report
+
+        def interrupt_after_receipt(*args, **kwargs):
+            write_validation_report(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(package_windows_release, "_write_portable_validation_report", interrupt_after_receipt)
+    elif interrupt_mode == "after_archive_replace":
+        from contextlib import contextmanager
+
+        archive_context = package_windows_release.atomic_archive_path
+
+        @contextmanager
+        def interrupt_after_archive_replace(path):
+            with archive_context(path) as candidate:
+                yield candidate
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(package_windows_release, "atomic_archive_path", interrupt_after_archive_replace)
+    elif mutate_archive_after_replace:
+        from contextlib import contextmanager
+
+        archive_context = package_windows_release.atomic_archive_path
+
+        @contextmanager
+        def mutate_published_archive(path):
+            with archive_context(path) as candidate:
+                yield candidate
+            archive.write_bytes(b"external replacement after verification")
+
+        monkeypatch.setattr(package_windows_release, "atomic_archive_path", mutate_published_archive)
 
     result = package_windows_release.main([
         "--app-dist", str(app_dist), "--archive", str(archive), "--mock-report", str(mock_report),
         "--provenance", str(provenance),
+        *(["--desktop-only"] if desktop_only else []),
     ])
 
-    assert result == 2
-    assert archive.read_bytes() == old_archive
-    assert not list(archive.parent.glob("*.tmp.zip"))
-    assert "extracted package smoke failed" in capsys.readouterr().err
+    if smoke_failure:
+        assert result == 2
+        assert archive.read_bytes() == old_archive
+        assert not validation_report.exists()
+        assert not list(archive.parent.glob("*.tmp.zip"))
+        assert "extracted package smoke failed" in capsys.readouterr().err
+    elif report_failure:
+        assert result == 2
+        assert archive.exists() is archive_exists
+        if archive_exists:
+            assert archive.read_bytes() == old_archive
+            assert validation_report.read_bytes() == old_validation_report
+        else:
+            assert not validation_report.exists()
+        assert not list(archive.parent.glob("*.tmp.zip"))
+        assert not list(archive.parent.glob("*.rollback.zip"))
+        assert "validation report destination is unavailable" in capsys.readouterr().err
+    elif interrupt_mode in {"before_receipt", "after_archive_replace"}:
+        assert result == 130
+        assert archive.read_bytes() == old_archive
+        assert validation_report.read_bytes() == old_validation_report
+        assert not list(archive.parent.glob("*.tmp.zip"))
+        assert not list(archive.parent.glob("*.rollback.zip"))
+    elif interrupt_mode == "after_receipt":
+        assert result == 0
+        assert archive.read_bytes() != old_archive
+        report = json.loads(validation_report.read_text(encoding="utf-8"))
+        assert report["portable_archive"]["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest().upper()
+    elif mutate_archive_after_replace:
+        assert result == 2
+        assert archive.read_bytes() == old_archive
+        assert validation_report.read_bytes() == old_validation_report
+        assert "changed after extracted-package verification" in capsys.readouterr().err
+    else:
+        assert result == 0
+        assert archive.read_bytes() != old_archive
+        report = json.loads(validation_report.read_text(encoding="utf-8"))
+        assert report["status"] == "ok"
+        assert report["portable_archive"]["filename"] == archive.name
+        assert report["portable_archive"]["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest().upper()
+        assert report["serial_enumeration"]["status"] == "ok"
+        assert report["mock_e2e"]["mode_count"] == 6
+        if desktop_only:
+            assert report["localhost_web"] == {"status": "not_included"}
+            with ZipFile(archive) as contents:
+                assert not any(name.startswith("Fluke8845A-Web.dist/") for name in contents.namelist())
+        else:
+            assert report["localhost_web"]["health"]["bind"] == "127.0.0.1"
+
+
+def test_portable_archive_destination_lock_prevents_concurrent_publish(tmp_path):
+    report = tmp_path / "output" / "mock_validation" / "Fluke8845A_Test_portable_validation.json"
+    first_lock = package_windows_release._acquire_publication_lock(report)
+    try:
+        with pytest.raises(RuntimeError, match="another process"):
+            package_windows_release._acquire_publication_lock(report)
+    finally:
+        package_windows_release._release_archive_lock(first_lock)
+
+    next_lock = package_windows_release._acquire_publication_lock(report)
+    package_windows_release._release_archive_lock(next_lock)
 
 
 def test_main_release_identity_contains_project_version_channel_and_commit():
@@ -362,6 +721,59 @@ def test_windows_portable_archive_uses_portable_quick_start_as_root_readme(tmp_p
 
     assert len(readme_entries) == 1
     assert readme_entries[0][0].read_text(encoding="utf-8") == portable_text
+
+
+def test_windows_portable_archive_includes_six_mock_experiment_examples(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    docs = root / "docs"
+    docs.mkdir(parents=True)
+    (docs / "portable-windows-quick-start.md").write_text("portable quick start", encoding="utf-8")
+    examples_root = root / "examples" / "mock_experiments"
+    example_files = ("config.json", "events.csv", "measurements.csv", "run.log", "CSV_打开说明.txt")
+    expected_names = set()
+    for mode in ("ACI", "ACV", "DCI", "DCV", "RES2", "RES4"):
+        mode_dir = examples_root / mode
+        mode_dir.mkdir(parents=True)
+        for filename in example_files:
+            source = mode_dir / filename
+            source.write_text("synthetic example", encoding="utf-8")
+            expected_names.add(source.relative_to(root).as_posix())
+    unexpected_file = examples_root / "DCV" / "local-debug-dump.txt"
+    unexpected_file.write_text("must not enter the portable archive", encoding="utf-8")
+    app_dist = tmp_path / "app.dist"
+    app_dist.mkdir()
+    monkeypatch.setattr(package_windows_release, "ROOT", root)
+
+    package_members = {
+        member for _source, member in package_windows_release._release_files(app_dist)
+    }
+
+    assert expected_names <= package_members
+    assert expected_names <= package_windows_release.REQUIRED_ENTRIES
+    assert unexpected_file.relative_to(root).as_posix() not in package_members
+
+
+def test_windows_portable_archive_rejects_example_symlinks(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    docs = root / "docs"
+    docs.mkdir(parents=True)
+    (docs / "portable-windows-quick-start.md").write_text("portable quick start", encoding="utf-8")
+    examples = root / "examples" / "mock_experiments" / "DCV"
+    examples.mkdir(parents=True)
+    linked_entry = examples / "measurements.csv"
+    linked_entry.write_text("synthetic example", encoding="utf-8")
+    app_dist = tmp_path / "app.dist"
+    app_dist.mkdir()
+    monkeypatch.setattr(package_windows_release, "ROOT", root)
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: True if path == linked_entry else original_is_symlink(path),
+    )
+
+    with pytest.raises(ValueError, match="symbolic links"):
+        package_windows_release._release_files(app_dist)
 
 
 def test_windows_release_docs_reject_directory_junction_escape(tmp_path, monkeypatch):
@@ -503,6 +915,37 @@ def test_stable_release_identity_requires_matching_version_tag():
     }
     with pytest.raises(ValueError, match="does not match"):
         release_identity("1.0.1", "tag", "v1.0.2")
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["01.0.0", "1.0.0-01", "1.0.0-..", "1.0.0+..", "1.0.0+build..meta"],
+)
+def test_release_identity_rejects_invalid_semver(version):
+    with pytest.raises(ValueError, match="Invalid project version"):
+        release_identity(version, "tag", f"v{version}")
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["0.0.0", "1.2.3", "1.2.3-alpha.1", "1.2.3-rc.1+build.7", "1.2.3+build.007"],
+)
+def test_semver_accepts_valid_core_prerelease_and_build_metadata(version):
+    assert SEMVER.fullmatch(version)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_prerelease"),
+    [
+        ("1.2.3-rc.1", True),
+        ("1.2.3-rc.1+build-7", True),
+        ("1.2.3+build-7", False),
+    ],
+)
+def test_tag_release_identity_marks_only_prerelease_versions(version, expected_prerelease):
+    identity = release_identity(version, "tag", f"v{version}")
+
+    assert identity["prerelease"] is expected_prerelease
 
 
 def test_main_release_identity_rejects_manual_dispatch_from_other_branches():
@@ -680,6 +1123,7 @@ def test_release_publication_cli_checks_release_tag_status_and_asset_sizes(tmp_p
 def test_source_and_portable_manifests_require_qt_license_text_and_notice():
     source_expected = {
         "docs/qt-licensing-and-third-party-notices.md",
+        "docs/licenses/GPL-3.0.txt",
         "docs/licenses/LGPL-3.0.txt",
         "docs/licenses/windows-portable-review-2026-10-15.md",
         "docs/licenses/windows-qt-runtime-inventory-2026-10-15.csv",
@@ -687,6 +1131,7 @@ def test_source_and_portable_manifests_require_qt_license_text_and_notice():
     }
     binary_expected = {
         "docs/licenses/windows-runtime-license-manifest.json",
+        "docs/licenses/third-party/qt-for-python/GPL-3.0.txt",
         "docs/licenses/third-party/cpython/LICENSE.txt",
         "docs/licenses/third-party/numpy/LICENSE.txt",
         "docs/licenses/third-party/pyserial/LICENSE.txt",
@@ -785,6 +1230,168 @@ def test_portable_web_smoke_compares_all_static_resources_and_requires_no_store(
     package_windows_release.validate_local_web_resources("http://127.0.0.1:8765", web_root)
 
     assert requested == ["/", "/app.css", "/app.js", "/history_worker.js"]
+
+
+def test_portable_web_smoke_returns_persistable_health_asset_and_shutdown_evidence(
+    tmp_path, monkeypatch,
+):
+    project_web_root = Path(__file__).resolve().parents[1] / "src" / "fluke8845a" / "web"
+    release_root = tmp_path / "release"
+    web_root = release_root / "Fluke8845A-Web.dist" / "fluke8845a" / "web"
+    web_root.mkdir(parents=True)
+    for asset in ("index.html", "app.css", "app.js", "history_worker.js"):
+        shutil.copy2(project_web_root / asset, web_root / asset)
+    executable = release_root / "Fluke8845A-Web.dist" / "Fluke8845A-Web.exe"
+    executable.write_bytes(b"test executable")
+
+    class Reservation:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", 0)
+
+        def getsockname(self):
+            return ("127.0.0.1", 8765)
+
+    class Process:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            assert timeout in {2.0, 5.0}
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    class Response:
+        status = 200
+        headers = {"Cache-Control": "no-store"}
+
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+    health = {"status": "ok", "bind": "127.0.0.1", "version": "1.1.0"}
+    requested = []
+
+    def fake_urlopen(url, **_kwargs):
+        url = url.full_url if hasattr(url, "full_url") else url
+        route = url.split("127.0.0.1:8765", 1)[1]
+        requested.append(route)
+        if route == "/api/health":
+            return Response(json.dumps(health).encode("utf-8"))
+        if route == "/api/command":
+            return Response(b'{"success":true}')
+        asset = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js", "/history_worker.js": "history_worker.js"}[route]
+        return Response((web_root / asset).read_bytes())
+
+    process = Process()
+    monkeypatch.setattr(package_windows_release.socket, "socket", lambda: Reservation())
+    monkeypatch.setattr(package_windows_release.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(package_windows_release, "urlopen", fake_urlopen)
+
+    report = package_windows_release.verify_local_web_release(release_root)
+
+    assert report["status"] == "ok"
+    assert report["health"] == health
+    assert report["shutdown"] == {
+        "acknowledged": True,
+        "http_status": 200,
+        "process_exit_code": 0,
+    }
+    assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
+    for route, asset in (("/", "index.html"), ("/app.css", "app.css"), ("/app.js", "app.js"), ("/history_worker.js", "history_worker.js")):
+        body = (web_root / asset).read_bytes()
+        assert report["assets"][route] == {
+            "sha256": hashlib.sha256(body).hexdigest().upper(),
+            "bytes": len(body),
+        }
+    assert requested == ["/api/health", "/", "/app.css", "/app.js", "/history_worker.js", "/api/command"]
+
+
+@pytest.mark.parametrize("desktop_only", [False, True])
+def test_extracted_portable_smoke_returns_serial_mock_and_web_receipt(tmp_path, monkeypatch, desktop_only):
+    provenance = {
+        "candidate_build_name": "Fluke8845A_Test",
+        "source_tree_sha256": "A" * 64,
+        "head_commit": "b" * 40,
+        "worktree_dirty": True,
+        "executables": {"desktop": {"sha256": "B" * 64}},
+    }
+    if desktop_only:
+        provenance["artifact_scope"] = "desktop_only"
+    archive_path = tmp_path / "Fluke8845A_Test_Windows_x64.zip"
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr(package_windows_release.BUILD_PROVENANCE_NAME, json.dumps(provenance))
+        archive.writestr(package_windows_release.BUILD_IDENTITY_NAME, json.dumps(provenance))
+        archive.writestr("Fluke8845A.exe", b"mock desktop executable")
+
+    modes = ("DCV", "ACV", "DCI", "ACI", "RES2", "RES4")
+    mock_report = {
+        "status": "ok",
+        "simulation": True,
+        "mode_count": 6,
+        "modes": [
+            {"mode": mode, "sample_count": 4, "valid_sample_count": 4, "simulation": True}
+            for mode in modes
+        ],
+    }
+    web_report = {
+        "schema_version": 1,
+        "status": "ok",
+        "health": {"status": "ok", "bind": "127.0.0.1", "version": "1.1.0"},
+        "assets": {"/": {"sha256": "C" * 64, "bytes": 20}},
+        "shutdown": {"acknowledged": True, "http_status": 200, "process_exit_code": 0},
+    }
+
+    def fake_run(command, **_kwargs):
+        if "--mock-e2e" in command:
+            report_path = Path(command[command.index("--report") + 1])
+            report_path.write_text(json.dumps(mock_report), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(package_windows_release, "validate_runtime_build_identity", lambda *_args: None)
+    monkeypatch.setattr(package_windows_release, "validate_mock_e2e_report", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(package_windows_release.subprocess, "run", fake_run)
+    def verify_web(*_args):
+        assert not desktop_only, "desktop-only validation must not launch an absent Web executable"
+        return web_report
+
+    monkeypatch.setattr(package_windows_release, "verify_local_web_release", verify_web)
+
+    receipt = package_windows_release.verify_extracted_portable_release(
+        archive_path,
+        "B" * 64,
+        "A" * 64,
+    )
+
+    assert receipt["status"] == "ok"
+    assert receipt["source_tree_sha256"] == "A" * 64
+    assert receipt["serial_enumeration"] == {"status": "ok", "exit_code": 0}
+    assert receipt["mock_e2e"]["simulation"] is True
+    assert receipt["mock_e2e"]["mode_count"] == 6
+    assert {item["mode"] for item in receipt["mock_e2e"]["modes"]} == set(modes)
+    assert receipt["localhost_web"] == ({"status": "not_included"} if desktop_only else web_report)
 
 
 def test_portable_web_smoke_rejects_missing_no_store_header(monkeypatch):
@@ -944,6 +1551,130 @@ def test_release_zip_rejects_stale_history_worker_copy(tmp_path, archive_prefix)
     with ZipFile(archive_path) as archive:
         with pytest.raises(ValueError, match="当前源码"):
             validate_web_archive_resources(archive, archive_prefix, web_root)
+
+
+def _copy_source_package_for_web_smoke(tmp_path: Path) -> Path:
+    project_root = Path(__file__).resolve().parents[1]
+    extracted_root = tmp_path / "extracted-source"
+    archive_path = tmp_path / "source-smoke.zip"
+    with ZipFile(archive_path, "w") as archive:
+        for path in files_for_archive():
+            archive.write(path, path.relative_to(project_root).as_posix())
+    with ZipFile(archive_path) as archive:
+        archive.extractall(extracted_root)
+    return extracted_root
+
+
+def _capture_started_processes(monkeypatch):
+    started = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    return started
+
+
+def test_extracted_source_web_smoke_serves_current_health_and_asset_fingerprints(
+    tmp_path, monkeypatch,
+):
+    smoke = getattr(package_source, "smoke_extracted_source_web", None)
+    assert callable(smoke), "source ZIP smoke must launch and inspect the extracted Web service"
+    extracted_root = _copy_source_package_for_web_smoke(tmp_path)
+    project_root = Path(__file__).resolve().parents[1]
+    started = _capture_started_processes(monkeypatch)
+
+    report = smoke(
+        extracted_root,
+        expected_web_root=project_root / "src" / "fluke8845a" / "web",
+        timeout_seconds=15,
+    )
+
+    assert report["health"]["status"] == "ok"
+    assert report["health"]["bind"] == "127.0.0.1"
+    assert report["health"]["version"] == "1.1.0"
+    assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
+    for route, filename in {
+        "/": "index.html",
+        "/app.css": "app.css",
+        "/app.js": "app.js",
+        "/history_worker.js": "history_worker.js",
+    }.items():
+        expected = hashlib.sha256(
+            (project_root / "src" / "fluke8845a" / "web" / filename).read_bytes()
+        ).hexdigest()
+        assert report["assets"][route]["sha256"] == expected
+    assert len(started) == 1
+    assert started[0].poll() is not None, "smoke must stop its extracted Web process"
+
+
+def test_extracted_source_web_smoke_reports_stale_asset_and_stops_server(
+    tmp_path, monkeypatch,
+):
+    smoke = getattr(package_source, "smoke_extracted_source_web", None)
+    assert callable(smoke), "source ZIP smoke must launch and inspect the extracted Web service"
+    extracted_root = _copy_source_package_for_web_smoke(tmp_path)
+    stale_app_js = extracted_root / "src" / "fluke8845a" / "web" / "app.js"
+    stale_app_js.write_bytes(stale_app_js.read_bytes() + b"\n// stale extracted asset\n")
+    project_root = Path(__file__).resolve().parents[1]
+    started = _capture_started_processes(monkeypatch)
+
+    with pytest.raises(RuntimeError, match=r"/app\.js.*SHA-256"):
+        smoke(
+            extracted_root,
+            expected_web_root=project_root / "src" / "fluke8845a" / "web",
+            timeout_seconds=15,
+        )
+
+    assert len(started) == 1
+    assert started[0].poll() is not None, "failed smoke must stop its extracted Web process"
+
+
+def test_source_web_smoke_cli_runs_against_an_extracted_source_archive(tmp_path):
+    project_root = Path(__file__).resolve().parents[1]
+    extracted_root = _copy_source_package_for_web_smoke(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "scripts" / "package_source.py"),
+            "--smoke-extracted-source-web",
+            str(extracted_root),
+            "--timeout-seconds",
+            "15",
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=25,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    prefix, separator, report_json = result.stdout.partition("Source ZIP Web smoke passed: ")
+    assert separator, result.stdout
+    report = json.loads(report_json)
+    assert report["health"]["status"] == "ok"
+    assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
+
+
+def test_release_workflow_runs_web_smoke_from_the_extracted_source_archive():
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-release.yml").read_text(
+        encoding="utf-8"
+    )
+    smoke_marker = "- name: Smoke test first launch from extracted source ZIP\n"
+    smoke_step = workflow.split(smoke_marker, 1)[1].split("      - name:", 1)[0]
+    assert '$env:QT_QPA_PLATFORM = "offscreen"' in smoke_step
+    assert 'python "scripts\\launch_windows.py" desktop --mock --smoke' in smoke_step
+    assert "Extracted source ZIP first-launch smoke failed" in smoke_step
+    assert 'python "$env:GITHUB_WORKSPACE\\scripts\\package_source.py"' in smoke_step
+    assert '--smoke-extracted-source-web "$extractRoot"' in smoke_step
+    assert "--timeout-seconds 20" in smoke_step
+    assert "Extracted source ZIP Web smoke failed" in smoke_step
 
 
 def test_source_archive_includes_first_run_windows_launchers():
@@ -1224,6 +1955,7 @@ def test_runtime_license_manifest_verifies_every_copied_file_hash():
         "third-party/cpython/LICENSE.txt": b"PSF license",
         "third-party/pyside6_essentials/LicenseRef-Qt-Commercial.txt": b"Qt commercial ref",
         "third-party/shiboken6/LicenseRef-Qt-Commercial.txt": b"Shiboken commercial ref",
+        "third-party/qt-for-python/GPL-3.0.txt": b"GPLv3",
         "third-party/qt-for-python/LGPL-3.0.txt": b"LGPLv3",
     }
     qt_open_item = "Qt/PySide module and third-party notices require final exact-bundle review."
@@ -1236,7 +1968,11 @@ def test_runtime_license_manifest_verifies_every_copied_file_hash():
                 "declared_license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only" if name in {"PySide6_Essentials", "shiboken6"} else "",
                 "planned_license_path": "LGPL-3.0-only; review remains open" if name in {"PySide6_Essentials", "shiboken6"} else "",
                 "license_files": ["third-party/cpython/LICENSE.txt"] if name == "CPython" else (
-                    [f"third-party/{name.casefold()}/LicenseRef-Qt-Commercial.txt", "third-party/qt-for-python/LGPL-3.0.txt"]
+                    [
+                        f"third-party/{name.casefold()}/LicenseRef-Qt-Commercial.txt",
+                        "third-party/qt-for-python/GPL-3.0.txt",
+                        "third-party/qt-for-python/LGPL-3.0.txt",
+                    ]
                     if name in {"PySide6_Essentials", "shiboken6"} else []
                 ),
             }
@@ -1266,6 +2002,12 @@ def test_runtime_license_manifest_verifies_every_copied_file_hash():
     with pytest.raises(ValueError, match="(?i)missing required license files for PySide6_Essentials"):
         validate_runtime_license_manifest(missing_qt_license, contents)
 
+    missing_gpl_text = json.loads(json.dumps(manifest))
+    pyside_component = next(item for item in missing_gpl_text["components"] if item["name"] == "PySide6_Essentials")
+    pyside_component["license_files"].remove("third-party/qt-for-python/GPL-3.0.txt")
+    with pytest.raises(ValueError, match="(?i)missing required license files for PySide6_Essentials"):
+        validate_runtime_license_manifest(missing_gpl_text, contents)
+
     missing_qt_review = json.loads(json.dumps(manifest))
     missing_qt_review["known_open_items"] = ["Other review remains open"]
     with pytest.raises(ValueError, match="Qt/PySide review item"):
@@ -1288,6 +2030,7 @@ def test_runtime_license_manifest_binds_exact_native_binary_inventory():
         "third-party/cpython/LICENSE.txt": b"PSF license",
         "third-party/pyside6_essentials/LicenseRef-Qt-Commercial.txt": b"Qt commercial ref",
         "third-party/shiboken6/LicenseRef-Qt-Commercial.txt": b"Shiboken commercial ref",
+        "third-party/qt-for-python/GPL-3.0.txt": b"GPLv3",
         "third-party/qt-for-python/LGPL-3.0.txt": b"LGPLv3",
     }
     qt_license_records = [
@@ -1312,7 +2055,11 @@ def test_runtime_license_manifest_binds_exact_native_binary_inventory():
                 "declared_license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only" if name in {"PySide6_Essentials", "shiboken6"} else "",
                 "planned_license_path": "LGPL-3.0-only; review remains open" if name in {"PySide6_Essentials", "shiboken6"} else "",
                 "license_files": ["third-party/cpython/LICENSE.txt"] if name == "CPython" else (
-                    [f"third-party/{name.casefold()}/LicenseRef-Qt-Commercial.txt", "third-party/qt-for-python/LGPL-3.0.txt"]
+                    [
+                        f"third-party/{name.casefold()}/LicenseRef-Qt-Commercial.txt",
+                        "third-party/qt-for-python/GPL-3.0.txt",
+                        "third-party/qt-for-python/LGPL-3.0.txt",
+                    ]
                     if name in {"PySide6_Essentials", "shiboken6"} else []
                 ),
             }

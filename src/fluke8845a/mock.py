@@ -47,7 +47,7 @@ class Mock8845A:
 
     def connect(self) -> InstrumentInfo:
         self.connected = True
-        self._started_ns = time.monotonic_ns()
+        self._started_ns = time.perf_counter_ns()
         self._sample_number = 0
         self._rng = random.Random(self.scenario.seed)
         self._log(f"MOCK已连接，场景={self.scenario.name}；所有读数均为模拟数据")
@@ -77,7 +77,7 @@ class Mock8845A:
             "nplc_response": str(settings.nplc) if settings.nplc is not None else None,
             "ac_bandwidth_response": str(settings.ac_bandwidth_hz) if settings.ac_bandwidth_hz is not None else None,
             "analog_filter_response": str(settings.analog_filter) if spec.analog_filter else None,
-            "digital_filter_response": str(settings.digital_filter) if spec.digital_filter else None,
+            "digital_filter_response": str(int(settings.digital_filter)) if spec.digital_filter else None,
             "input_impedance_auto_response": (
                 str(settings.input_impedance_auto) if spec.input_impedance_auto else None
             ),
@@ -100,16 +100,21 @@ class Mock8845A:
             ac_bandwidth_hz=settings.ac_bandwidth_hz,
             analog_filter=self._settings.analog_filter,
             autozero=self._settings.autozero,
-            digital_filter=self._settings.digital_filter,
+            digital_filter=settings.digital_filter,
             input_impedance_auto=self._settings.input_impedance_auto,
         )
         self._log(
-            f"MOCK调速：NPLC={self._settings.nplc}；交流带宽={self._settings.ac_bandwidth_hz} Hz"
+            f"MOCK调速：NPLC={self._settings.nplc}；交流带宽={self._settings.ac_bandwidth_hz} Hz；"
+            f"数字滤波={'开' if self._settings.digital_filter else '关'}"
         )
         return {
             "nplc_response": str(self._settings.nplc) if self._settings.nplc is not None else None,
             "ac_bandwidth_response": str(self._settings.ac_bandwidth_hz)
             if self._settings.ac_bandwidth_hz is not None else None,
+            "digital_filter_response": (
+                str(int(self._settings.digital_filter))
+                if descriptor(self._settings.mode).digital_filter else None
+            ),
         }
 
     def _base_value(self, quantity: str) -> float:
@@ -120,7 +125,7 @@ class Mock8845A:
             raise ConnectionError("MOCK断线")
         if self._settings is None:
             raise RuntimeError("MOCK尚未配置")
-        started_ns = time.monotonic_ns()
+        started_ns = time.perf_counter_ns()
         now = datetime.now(timezone.utc)
         self._sample_number += 1
         if self.scenario.disconnect_at_sample == self._sample_number:
@@ -147,7 +152,7 @@ class Mock8845A:
         noise = self._rng.gauss(0.0, abs(base) * self.scenario.noise_fraction)
         value = base + drift + step + noise
         raw = f"{value:.15E}"
-        received_ns = time.monotonic_ns()
+        received_ns = time.perf_counter_ns()
         utc = now.isoformat(timespec="microseconds")
         local = now.astimezone().isoformat(timespec="microseconds")
         rang = self._settings.range_si if not self._settings.autorange else next(

@@ -9,7 +9,7 @@ const vm = require("node:vm");
 const ROOT = path.resolve(__dirname, "..");
 const WORKER_SOURCE = path.join(ROOT, "src/fluke8845a/web/history_worker.js");
 
-async function runWorker(file, modes = [{ value: "DCV", unit: "V" }], kind = "measurements") {
+async function runWorker(file, modes = [{ value: "DCV", unit: "V" }], kind = "measurements", experimentId = "run-7") {
   if (typeof file.stream !== "function" && typeof file.text === "function" && file.size <= 1024 * 1024) {
     const bytes = new TextEncoder().encode(await file.text());
     file = {
@@ -35,7 +35,7 @@ async function runWorker(file, modes = [{ value: "DCV", unit: "V" }], kind = "me
     ArrayBuffer, setTimeout, clearTimeout,
   });
   vm.runInContext(fs.readFileSync(WORKER_SOURCE, "utf8"), context);
-  await handler({ data: { file, modes, kind, experimentId: "run-7" } });
+  await handler({ data: { file, modes, kind, experimentId } });
   return [...messages].reverse().find((message) => typeof message?.ok === "boolean");
 }
 
@@ -50,6 +50,24 @@ test("history worker preserves CSV columns, sample ids, quoted fields, BOM, and 
     { x: 1, y: "NaN", status: "timeout", mode: "DCV", unit: "V", raw: "timeout", id: 9 },
   ]);
   assert.equal(result.experimentId, "run-7");
+});
+
+test("history worker refuses to associate events when any measurement row lacks an experiment id", async () => {
+  const measurements = await runWorker({ size: 160, text: async () =>
+    "experiment_id,sample_index,elapsed_s,mode,unit_si,value_si,status\r\n"
+    + "run-7,1,0,DCV,V,1,ok\r\n"
+    + ",2,1,DCV,V,2,ok\r\n"
+  });
+
+  assert.equal(measurements.ok, true, measurements.error);
+  assert.equal(measurements.experimentId, null);
+  assert.ok(measurements.warnings.some((warning) => warning.includes("缺少 experiment_id")));
+
+  const events = await runWorker({ size: 80, text: async () =>
+    "experiment_id,elapsed_s,event\r\nrun-7,0.5,load switched\r\n"
+  }, undefined, "events", measurements.experimentId);
+  assert.equal(events.ok, false);
+  assert.match(events.error, /测量 CSV 缺少 experiment_id，无法验证/);
 });
 
 test("history worker ignores and reports unterminated measurement and event tails", async () => {

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections import deque
 from threading import Event
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,11 +20,11 @@ import pytest
 from PySide6.QtCore import QPoint, QPointF, QRect, QThread, Qt, QTimer
 from PySide6.QtGui import QColor, QFontInfo, QImage, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QLineEdit, QMessageBox, QPushButton, QWidget
 
 from fluke8845a import gui as gui_module
 from fluke8845a import storage as storage_module
-from fluke8845a.filter_policy import digital_filter_enable_error
+from fluke8845a import worker as worker_module
 from fluke8845a.gui import MainWindow
 from fluke8845a.mock import MockScenario
 from fluke8845a.modes import DESCRIPTORS, Mode
@@ -130,17 +131,41 @@ def test_main_window_is_a_single_plot_with_settings_in_a_separate_window(
     window = MainWindow()
     try:
         assert window.setup_section_stack.count() == 3
-        assert [button.text() for button in window.setup_section_buttons] == ["通信", "测量", "实验"]
+        assert window.findChild(QWidget, "communicationsSectionButton") is None
+        assert window.findChild(QWidget, "measurementSectionButton") is None
+        assert window.findChild(QWidget, "experimentSectionButton") is None
+        assert tuple(window.configuration_nav_buttons) == (
+            "communications", "measurement", "experiment", "analysis", "chart",
+        )
+        assert [button.text() for button in window.configuration_nav_buttons.values()] == [
+            "通信", "测量", "实验", "分析总览", "曲线设置",
+        ]
+        assert window.analysis_tabs.tabBar().isHidden()
         assert window.log_dock.isHidden()
         assert window.configuration_dialog.isHidden()
         assert window.workspace_stack.count() == 2
         assert window.configuration_button.text() == "设置与分析…"
-        assert window.configuration_button.parentWidget().objectName() == "appHeader"
-        for object_name in (
+        assert window.navigation_toolbar.objectName() == "workspaceNavigationToolbar"
+        assert window.toolBarArea(window.navigation_toolbar).name == "TopToolBarArea"
+        assert window.navigation_toolbar.isMovable() is False
+        assert tuple(window.navigation_buttons) == (
+            "communications", "acquisition", "analysis", "files", "diagnostics",
+        )
+        assert [button.objectName() for button in window.navigation_buttons.values()] == [
             "communicationsNavigation", "acquisitionNavigation",
             "analysisNavigation", "experimentFilesNavigation", "diagnosticsNavigation",
-        ):
-            assert window.findChild(QPushButton, object_name) is not None
+        ]
+        assert window.navigation_toolbar.widgetForAction(
+            window.configuration_navigation_action
+        ) is window.configuration_button
+        assert window.navigation_buttons["acquisition"].isChecked()
+        assert window.new_measurement_button.text() == "新建测量"
+        assert window.measurement_action_bar.isAncestorOf(window.new_measurement_button)
+        assert window.clear_plot_button.text() == "清空图表"
+        assert window.measurement_action_bar.isAncestorOf(window.clear_plot_button)
+        assert window.configuration_button.parentWidget() is not window.statusBar()
+        assert window.statusBar().findChild(QPushButton, "configurationNavigation") is None
+        assert window.configuration_button.maximumHeight() <= 32
         assert window.setup_scroll_area.objectName() == "configurationScrollArea"
         assert window.setup_scroll_area.findChild(QPushButton, "diagnoseButton") is window.diagnose_button
         assert window.communication_workspace.isAncestorOf(window.port_combo)
@@ -148,7 +173,12 @@ def test_main_window_is_a_single_plot_with_settings_in_a_separate_window(
         assert window.communication_workspace.isAncestorOf(window.connection_stages_label)
         assert window.communication_workspace.isAncestorOf(window.communication_log_text)
         assert window.setup_section_stack.widget(1).isAncestorOf(window.mode_combo)
+        measurement_settings_page = window.setup_section_stack.widget(1)
+        assert not measurement_settings_page.isAncestorOf(window.interval_spin)
         assert window.measurement_workspace.isAncestorOf(window.interval_spin)
+        assert window.measurement_workspace.isAncestorOf(window._action_bar)
+        assert window._action_bar.isAncestorOf(window.interval_spin)
+        assert window.measurement_workspace.isAncestorOf(window.start_button)
         assert not window.setup_section_stack.widget(2).isAncestorOf(window.interval_spin)
         experiment_page = window.setup_section_stack.widget(2)
         assert experiment_page.isAncestorOf(window.output_root)
@@ -160,6 +190,7 @@ def test_main_window_is_a_single_plot_with_settings_in_a_separate_window(
         assert window.findChild(QFrame, "readingCard")
         assert window.findChild(QFrame, "plotToolbar")
         assert window.brand_icon.pixmap() is not None
+        assert window.instrument_readback_status.isHidden()
         assert window.latest_value_label.text() == "等待读数"
         assert "DCV" in window.reading_mode_label.text()
         assert not window.plot_empty_overlay.isHidden()
@@ -184,10 +215,758 @@ def test_main_window_is_a_single_plot_with_settings_in_a_separate_window(
         qt_app.processEvents()
 
 
+def test_new_measurement_button_opens_experiment_setup_without_discarding_current_plot(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-measurement-config"))
+    window = MainWindow()
+    try:
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        current_plot = (list(window._plot_x), list(window._plot_y))
+
+        window.new_measurement_button.click()
+        qt_app.processEvents()
+
+        assert window.configuration_dialog.isVisible()
+        assert window.workspace_stack.currentIndex() == 0
+        assert window.setup_section_stack.currentIndex() == 2
+        assert window.experiment_name.hasFocus()
+        assert window.experiment_name.selectedText() == window.experiment_name.text()
+        assert re.fullmatch(r"实验_\d{8}_\d{6}_DCV", window.experiment_name.text())
+        assert (list(window._plot_x), list(window._plot_y)) == current_plot
+        assert "开始后曲线自动换新" in window.new_measurement_button.toolTip()
+        assert "旧实验 CSV 保留" in window.new_measurement_button.toolTip()
+        assert "无需先清空" in window.new_measurement_button.toolTip()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_measurement_refreshes_time_mode_name_and_selects_it_for_renaming(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-measurement-name-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = Mode.ACV
+        window._set_combo_data(window.mode_combo, Mode.ACV.value)
+        window._open_new_measurement_setup()
+        first_name = window.experiment_name.text()
+        window.experiment_name.setText("my_custom_run")
+
+        window._open_new_measurement_setup()
+        qt_app.processEvents()
+
+        assert re.fullmatch(r"实验_\d{8}_\d{6}_ACV", window.experiment_name.text())
+        assert window.experiment_name.text() != "my_custom_run"
+        assert window.experiment_name.selectedText() == window.experiment_name.text()
+        assert first_name.endswith("_ACV")
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_measurement_while_running_can_cancel_without_changing_acquisition(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-measurement-cancel-config"))
+    window = MainWindow()
+    confirmation_calls = []
+    stop_calls = []
+    monkeypatch.setattr(
+        gui_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: confirmation_calls.append((args, kwargs))
+        or gui_module.QMessageBox.StandardButton.No,
+    )
+    monkeypatch.setattr(window._worker, "request_stop", lambda: stop_calls.append(True))
+    try:
+        window._connected = True
+        window._simulation = True
+        window._acquiring = True
+        window._experiment_active = True
+        window._experiment_csv_path = tmp_path / "existing-run" / "measurements.csv"
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        current_plot = (list(window._plot_x), list(window._plot_y))
+        window._update_controls()
+
+        assert window.new_measurement_button.isEnabled()
+        window.new_measurement_button.click()
+
+        assert len(confirmation_calls) == 1
+        assert stop_calls == []
+        assert window._acquiring and window._experiment_active
+        assert (list(window._plot_x), list(window._plot_y)) == current_plot
+        assert not window.configuration_dialog.isVisible()
+    finally:
+        window._connected = False
+        window._simulation = False
+        window._acquiring = False
+        window._experiment_active = False
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize("signal_order", ["finished_then_saved", "saved_then_finished"])
+def test_new_measurement_while_running_opens_setup_only_after_successful_save(
+    qt_app, monkeypatch, tmp_path, signal_order
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-measurement-stop-config"))
+    window = MainWindow()
+    stop_calls = []
+    monkeypatch.setattr(
+        gui_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: gui_module.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(window._worker, "request_stop", lambda: stop_calls.append(True))
+    try:
+        window._connected = True
+        window._simulation = True
+        window._acquiring = True
+        window._experiment_active = True
+        window._experiment_csv_path = tmp_path / "existing-run" / "measurements.csv"
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        current_plot = (list(window._plot_x), list(window._plot_y))
+        window._update_controls()
+
+        window.new_measurement_button.click()
+        assert stop_calls == [True]
+        assert window._acquiring and window._experiment_active
+        assert not window.configuration_dialog.isVisible()
+        assert (list(window._plot_x), list(window._plot_y)) == current_plot
+
+        run_dir = tmp_path / "existing-run"
+        if signal_order == "finished_then_saved":
+            window._on_experiment_finished(str(run_dir))
+            assert not window.configuration_dialog.isVisible()
+            window._on_experiment_save_result(str(run_dir), True, "saved")
+        else:
+            window._on_experiment_save_result(str(run_dir), True, "saved")
+            assert not window.configuration_dialog.isVisible()
+            window._on_experiment_finished(str(run_dir))
+        qt_app.processEvents()
+
+        assert window.configuration_dialog.isVisible()
+        assert window.setup_section_stack.currentIndex() == 2
+        assert window.experiment_name.selectedText() == window.experiment_name.text()
+        assert (list(window._plot_x), list(window._plot_y)) == current_plot
+        assert window._experiment_csv_path == run_dir / "measurements.csv"
+    finally:
+        window._connected = False
+        window._simulation = False
+        window._acquiring = False
+        window._experiment_active = False
+        window._new_measurement_after_save = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_measurement_does_not_open_settings_when_stop_save_fails(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-measurement-save-failure-config"))
+    window = MainWindow()
+    monkeypatch.setattr(
+        gui_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: gui_module.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(window._worker, "request_stop", lambda: None)
+    try:
+        window._connected = True
+        window._simulation = True
+        window._acquiring = True
+        window._experiment_active = True
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        window._update_controls()
+        window.new_measurement_button.click()
+        window._on_experiment_finished(str(tmp_path / "existing-run"))
+
+        window._on_experiment_save_result(str(tmp_path / "existing-run"), False, "disk full")
+
+        assert not window.configuration_dialog.isVisible()
+        assert (list(window._plot_x), list(window._plot_y)) == ([0.0, 1.0], [1.25, 1.5])
+        assert not window._new_measurement_after_save
+        assert "disk full" in window.statusBar().currentMessage()
+    finally:
+        window._connected = False
+        window._simulation = False
+        window._acquiring = False
+        window._experiment_active = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_start_error_before_experiment_started_preserves_previous_csv_reference_and_curve(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "start-error-preserve-run-config"))
+    window = MainWindow()
+    previous_csv = tmp_path / "previous-run" / "measurements.csv"
+    failed_directory = tmp_path / "failed-run"
+    try:
+        window._experiment_csv_path = previous_csv
+        window._plot_x.extend([3.0, 4.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        previous_plot = (list(window._plot_x), list(window._plot_y))
+        window._start_pending = True
+
+        # The Worker can create a recorder and then fail synchronous startup,
+        # emitting finished/save(false) without ever emitting experiment_started.
+        window._on_experiment_finished(str(failed_directory))
+        window._on_experiment_save_result(str(failed_directory), False, "startup sync failed")
+
+        assert window._experiment_csv_path == previous_csv
+        assert (list(window._plot_x), list(window._plot_y)) == previous_plot
+        assert not window.configuration_dialog.isVisible()
+        assert "startup sync failed" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_experiment_start_resets_run_analysis_but_preserves_instrument_parameters(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-run-reset-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = Mode.RES2
+        window._set_combo_data(window.mode_combo, Mode.RES2.value)
+        profile = window._profiles[Mode.RES2.value]
+        profile["autorange"] = False
+        profile["range_si"] = 100.0
+        profile["nplc"] = 10.0
+        profile["baseline"] = 30_000_000.0
+        window._profiles[Mode.DCV.value]["baseline"] = 2.0
+        window._load_mode_controls(Mode.RES2)
+        settings_before = window._settings_for_mode(Mode.RES2)
+        interval_before = window.interval_spin.value()
+        window._plot_x.extend([100.0, 101.0])
+        window._plot_y.extend([30_000_000.0, 30_000_001.0])
+        window._plot_metadata.extend([{"sample_index": 1}, {"sample_index": 2}])
+        window.curve.setData(window._plot_x, window._plot_y)
+        window._global_stats.update({
+            "count": 2, "minimum": 30_000_000.0, "maximum": 30_000_001.0,
+            "mean": 30_000_000.5, "sample_stddev": 0.7,
+        })
+        window._selected_plot_point = (100.0, 30_000_000.0, 1)
+        window._selected_plot_metadata = {"sample_index": 1}
+        window._locked_cursor_marker.show()
+        window._baseline = 30_000_000.0
+        window.baseline_edit.setText("30000000")
+        window.baseline_line.show()
+        window.region_start_spin.setValue(10.0)
+        window.region_end_spin.setValue(20.0)
+        window._region.setRegion((10.0, 20.0))
+        window.follow_check.setChecked(False)
+        window.view_box.setRange(xRange=(90.0, 110.0), yRange=(-1.0, 1.0), padding=0)
+        window._experiment_csv_path = tmp_path / "previous-run" / "measurements.csv"
+
+        window._on_experiment_started(str(tmp_path / "next-run"))
+        qt_app.processEvents()
+
+        assert not window._plot_x and not window._plot_y and not window._plot_metadata
+        assert window._global_stats["count"] == 0
+        assert window._selected_plot_point is None
+        assert window._selected_plot_metadata is None
+        assert not window._locked_cursor_marker.isVisible()
+        assert window._baseline is None
+        assert window.baseline_edit.text() == ""
+        assert window.baseline_line.isHidden()
+        assert all(window._profiles[mode.value]["baseline"] is None for mode in Mode)
+        assert tuple(window._region.getRegion()) == pytest.approx((0.0, 60.0))
+        assert (window.region_start_spin.value(), window.region_end_spin.value()) == pytest.approx((0.0, 60.0))
+        assert window.follow_check.isChecked()
+        assert window._settings_for_mode(Mode.RES2) == settings_before
+        assert window.interval_spin.value() == interval_before
+        assert window._experiment_csv_path == tmp_path / "next-run" / "measurements.csv"
+        x_range = window.view_box.viewRange()[0]
+        assert x_range != pytest.approx((90.0, 110.0))
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_experiment_ctrl_n_opens_naming_setup_without_clearing_plot(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-experiment-shortcut-config"))
+    window = MainWindow()
+    try:
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        action = window._shortcut_actions["newMeasurementShortcutAction"]
+
+        assert action.text() == "新建测量"
+        assert action.shortcut().toString() == "Ctrl+N"
+        action.trigger()
+        qt_app.processEvents()
+
+        assert window.configuration_dialog.isVisible()
+        assert window.setup_section_stack.currentIndex() == 2
+        assert window.experiment_name.hasFocus()
+        assert list(window._plot_x) == [0.0, 1.0]
+        assert list(window._plot_y) == [1.25, 1.5]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_measurement_and_clear_actions_are_visible_next_to_the_plot(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "measurement-actions-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        assert window.measurement_workspace.isAncestorOf(window.measurement_action_bar)
+        assert window.measurement_action_bar.isAncestorOf(window.new_measurement_button)
+        assert window.measurement_action_bar.isAncestorOf(window.clear_plot_button)
+        assert window.new_measurement_button.isVisible()
+        assert window.clear_plot_button.isVisible()
+        assert window.navigation_toolbar.findChild(QPushButton, "newMeasurementButton") is None
+        assert window.navigation_toolbar.findChild(QPushButton, "clearPlotButton") is None
+        assert "新建测量" in window.new_measurement_hint.text()
+        assert "填名称" in window.new_measurement_hint.text()
+        assert "单次测量" in window.new_measurement_hint.text()
+        assert "开始连续采集" in window.new_measurement_hint.text()
+        assert "新测量开始后自动换图" in window.new_measurement_hint.text()
+        assert "旧 CSV 保留" in window.new_measurement_hint.text()
+        assert "清空图表" in window.new_measurement_hint.text()
+        assert window.configuration_single_button.text() == "单次测量"
+        assert window.configuration_start_button.text() == "开始连续采集"
+        assert window.configuration_single_button.objectName() == "configurationSingleButton"
+        assert window.configuration_start_button.objectName() == "configurationStartButton"
+        assert window.configuration_single_button.isEnabled() == window.single_button.isEnabled()
+        assert window.configuration_start_button.isEnabled() == window.start_button.isEnabled()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("button_name", "one_shot"),
+    [("configuration_start_button", False), ("configuration_single_button", True)],
+)
+def test_measurement_can_start_from_settings_window_and_returns_to_plot(
+    qt_app, monkeypatch, tmp_path, button_name, one_shot
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "settings-start-config"))
+    window = MainWindow()
+    started = []
+
+    def accept_start(*, one_shot):
+        assert not window.configuration_dialog.isVisible()
+        started.append(one_shot)
+        window._start_pending = True
+
+    monkeypatch.setattr(window, "_start", accept_start)
+    try:
+        window.show()
+        window._open_new_measurement_setup()
+        qt_app.processEvents()
+        assert window.configuration_dialog.isVisible()
+        assert not window.configuration_start_button.isEnabled()
+        assert not window.configuration_single_button.isEnabled()
+
+        window._connected = True
+        window._simulation = True
+        window._update_controls()
+        assert window.configuration_start_button.isEnabled()
+        assert window.configuration_single_button.isEnabled()
+        assert window.configuration_start_button.isEnabled() == window.start_button.isEnabled()
+        assert window.configuration_single_button.isEnabled() == window.single_button.isEnabled()
+
+        window._start_pending = True
+        window._update_controls()
+        assert not window.configuration_start_button.isEnabled()
+        assert not window.configuration_single_button.isEnabled()
+        window._start_pending = False
+        window._update_controls()
+
+        getattr(window, button_name).click()
+        qt_app.processEvents()
+
+        assert started == [one_shot]
+        assert not window.configuration_dialog.isVisible()
+        assert window.isVisible()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_settings_window_stays_open_when_start_is_not_accepted(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "settings-start-rejected-config"))
+    window = MainWindow()
+
+    def reject_start(*, one_shot):
+        assert not window.configuration_dialog.isVisible()
+
+    monkeypatch.setattr(window, "_start", reject_start)
+    window._connected = True
+    window._simulation = True
+    window._update_controls()
+    try:
+        window.show()
+        window._open_new_measurement_setup()
+        qt_app.processEvents()
+
+        window.configuration_single_button.click()
+        qt_app.processEvents()
+
+        assert window.configuration_dialog.isVisible()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_settings_window_is_restored_when_start_raises(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "settings-start-exception-config"))
+    window = MainWindow()
+    errors = []
+
+    def fail_start(*, one_shot):
+        raise RuntimeError("unexpected setup failure")
+
+    monkeypatch.setattr(window, "_start", fail_start)
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    window._connected = True
+    window._simulation = True
+    window._update_controls()
+    try:
+        window.show()
+        window._open_new_measurement_setup()
+        qt_app.processEvents()
+
+        window.configuration_single_button.click()
+        qt_app.processEvents()
+
+        assert window.configuration_dialog.isVisible()
+        assert "启动失败：unexpected setup failure" in window.preflight_status.text()
+        assert errors == ["unexpected setup failure"]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_settings_start_exception_preserves_an_existing_pending_request(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "settings-start-pending-config"))
+    window = MainWindow()
+    errors = []
+
+    def fail_start(*, one_shot):
+        raise RuntimeError("stale action")
+
+    monkeypatch.setattr(window, "_start", fail_start)
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    try:
+        window.configuration_dialog.show()
+        window._start_pending = True
+        window._update_controls()
+
+        window._start_from_configuration(one_shot=False)
+
+        assert window._start_pending is True
+        assert not window.configuration_dialog.isVisible()
+        assert not window.configuration_start_button.isEnabled()
+        assert errors == ["stale action"]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_clear_plot_button_clears_display_buffer_but_preserves_saved_measurement_csv(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "clear-plot-config"))
+    saved_csv = tmp_path / "saved-experiment" / "measurements.csv"
+    saved_csv.parent.mkdir()
+    saved_csv.write_text("sample_index,value_si\n1,1.25\n", encoding="utf-8")
+    original_csv = saved_csv.read_bytes()
+    window = MainWindow()
+    confirmation_calls = []
+    monkeypatch.setattr(
+        gui_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: confirmation_calls.append((args, kwargs))
+        or gui_module.QMessageBox.StandardButton.No,
+    )
+    try:
+        window._experiment_csv_path = saved_csv
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        window.plot_empty_overlay.hide()
+        window.latest_value_label.setText("1.5 V")
+        window._global_stats["count"] = 2
+
+        window.clear_plot_button.click()
+
+        assert not window._plot_x
+        assert not window._plot_y
+        assert window._experiment_csv_path is None
+        assert not window.plot_empty_overlay.isHidden()
+        assert window._global_stats["count"] == 0
+        assert saved_csv.is_file()
+        assert saved_csv.read_bytes() == original_csv
+        assert not confirmation_calls
+        assert "CSV" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_cleared_plot_empty_state_offers_a_direct_new_measurement_action(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "cleared-plot-new-run-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert window.plot_empty_overlay.isVisible()
+        assert window.plot_empty_new_measurement_button.isHidden()
+
+        window._plot_x.extend([0.0, 1.0])
+        window._plot_y.extend([1.25, 1.5])
+        window.curve.setData(window._plot_x, window._plot_y)
+        window._experiment_csv_path = tmp_path / "saved-run" / "measurements.csv"
+        window._clear_plot_from_ui()
+
+        assert window.plot_empty_overlay.isVisible()
+        assert window.plot_empty_title.text() == "曲线已清空"
+        assert window.plot_empty_new_measurement_button.isVisible()
+        assert _stylesheet_rule(window, "QPushButton#plotEmptyNewMeasurementButton")["background"] == "#167b80"
+        assert "旧实验 CSV 保留" in window.plot_empty_hint.text()
+        assert "无需先清空" in window.plot_empty_hint.text()
+
+        window.plot_empty_new_measurement_button.click()
+        qt_app.processEvents()
+
+        assert window.configuration_dialog.isVisible()
+        assert window.setup_section_stack.currentIndex() == 2
+        assert window.experiment_name.hasFocus()
+        assert not window._plot_x
+        assert not window._plot_y
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_clear_plot_button_is_disabled_while_acquisition_is_running(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "clear-plot-running-config"))
+    window = MainWindow()
+    try:
+        window._plot_x.append(0.0)
+        window._plot_y.append(1.25)
+        window._acquiring = True
+        window._update_controls()
+
+        assert not window.clear_plot_button.isEnabled()
+    finally:
+        window._acquiring = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_measurement_actions_are_disabled_while_history_csv_is_loading(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "history-action-lock-config"))
+    confirmation_calls = []
+    monkeypatch.setattr(
+        gui_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: confirmation_calls.append((args, kwargs))
+        or gui_module.QMessageBox.StandardButton.Yes,
+    )
+    window = MainWindow()
+    try:
+        window._plot_x.append(0.0)
+        window._plot_y.append(1.25)
+        window.curve.setData(window._plot_x, window._plot_y)
+        window._history_load_pending = True
+        window._history_load_task = object()
+        window._update_controls()
+
+        assert not window.clear_plot_button.isEnabled()
+        assert not window.new_measurement_button.isEnabled()
+        assert "历史 CSV 正在加载" in window.new_measurement_hint.text()
+        window._clear_plot_from_ui()
+        window._open_new_measurement_setup()
+
+        assert list(window._plot_x) == [0.0]
+        assert list(window._plot_y) == [1.25]
+        assert not window.configuration_dialog.isVisible()
+        assert not confirmation_calls
+    finally:
+        window._history_load_pending = False
+        window._history_load_task = None
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("acquiring", "experiment_active", "start_pending", "expected_hint"),
+    [
+        (True, True, False, "当前实验仍在运行"),
+        (False, True, False, "当前实验正在收尾并保存"),
+        (False, False, True, "正在处理启动请求"),
+    ],
+)
+def test_new_measurement_hint_explains_current_blocking_state(
+    qt_app, monkeypatch, tmp_path, acquiring, experiment_active, start_pending, expected_hint
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "measurement-running-hint-config"))
+    window = MainWindow()
+    try:
+        window._connected = True
+        window._simulation = True
+        window._experiment_name_valid = True
+        window._acquiring = acquiring
+        window._experiment_active = experiment_active
+        window._start_pending = start_pending
+        window._update_controls()
+
+        hint = window.new_measurement_hint.text()
+        assert expected_hint in hint
+        assert window.new_measurement_button.isEnabled() is acquiring
+        assert window.stop_button.isEnabled() is acquiring
+        if acquiring:
+            assert "点击“新建测量”后将先停止并保存" in hint
+            assert "取消则继续当前采集" in hint
+            assert "先点“停止并保存”" in window.start_button.toolTip()
+            assert window.configuration_start_button.toolTip() == window.start_button.toolTip()
+            assert "停止并保存后打开新设置" in window.new_measurement_button.toolTip()
+            assert not window.clear_plot_button.isEnabled()
+            assert "停止并保存" in window.clear_plot_button.toolTip()
+            assert not window.single_button.isEnabled()
+            assert not window.configuration_single_button.isEnabled()
+        elif experiment_active:
+            assert "先点“停止并保存”" not in hint
+            assert "完成后可清空图表" in window.clear_plot_button.toolTip()
+            assert "完成后可新建测量" in window.new_measurement_button.toolTip()
+            assert not window.start_button.isEnabled()
+            assert not window.single_button.isEnabled()
+            assert not window.configuration_start_button.isEnabled()
+            assert not window.configuration_single_button.isEnabled()
+            assert "收尾并保存" in window.start_button.toolTip()
+            assert window.configuration_start_button.toolTip() == window.start_button.toolTip()
+            assert window.configuration_single_button.toolTip() == window.single_button.toolTip()
+        elif start_pending:
+            assert "请稍候" in window.new_measurement_button.toolTip()
+            assert "启动请求" in window.start_button.toolTip()
+            assert "采集中不能更改" not in window.start_button.toolTip()
+            assert window.configuration_start_button.toolTip() == window.start_button.toolTip()
+            assert "启动请求" in window.clear_plot_button.toolTip()
+            assert "先停止并保存" not in window.clear_plot_button.toolTip()
+    finally:
+        window._connected = False
+        window._simulation = False
+        window._experiment_name_valid = False
+        window._acquiring = False
+        window._experiment_active = False
+        window._start_pending = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_main_workspace_keeps_plot_and_moves_controls_to_top_navigation_and_settings(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "minimal-main-config"))
+    window = MainWindow()
+    try:
+        assert window.measurement_workspace.isAncestorOf(window._action_bar)
+        assert window.measurement_workspace.isAncestorOf(window.interval_spin)
+        assert window.measurement_workspace.isAncestorOf(window.start_button)
+        assert not window.measurement_workspace.isAncestorOf(window.plot_toolbar)
+        assert not window.setup_scroll_area.isAncestorOf(window._action_bar)
+        assert window.configuration_button.parentWidget() is not window.statusBar()
+        assert window.navigation_toolbar.widgetForAction(
+            window.configuration_navigation_action
+        ) is window.configuration_button
+        assert window.analysis_tabs.isAncestorOf(window.plot_toolbar)
+        assert window.analysis_tabs.isAncestorOf(window.chart_gesture_help)
+        assert window._shortcut_actions["startShortcutAction"].text() == "开始连续采集"
+        assert window._shortcut_actions["singleShortcutAction"].text() == "单次测量"
+        assert window._shortcut_actions["pauseShortcutAction"].text() == "暂停采集"
+        assert window._shortcut_actions["stopShortcutAction"].text() == "停止并保存"
+        assert window._shortcut_actions["startShortcutAction"].isEnabled() == window.start_button.isEnabled()
+        assert window._shortcut_actions["singleShortcutAction"].isEnabled() == window.single_button.isEnabled()
+        assert window.return_live_action.isEnabled() == window.return_live_button.isEnabled()
+        assert window.clear_plot_action.text() == "清空图表"
+        assert window.follow_action.isChecked() == window.follow_check.isChecked()
+        window.follow_action.setChecked(False)
+        assert not window.follow_check.isChecked()
+        window.follow_check.setChecked(True)
+        assert window.follow_action.isChecked()
+        curve_menu = next(
+            action.menu() for action in window.menuBar().actions() if action.text() == "曲线"
+        )
+        assert any(action.text() == "打开曲线设置…" for action in curve_menu.actions())
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("mode", "title", "current_sockets", "sense_group"),
+    [
+        (Mode.DCV, "电压输入 · 并联连接", False, False),
+        (Mode.DCI, "电流输入 · 串联连接", True, False),
+        (Mode.RES2, "两线电阻 · INPUT HI / LO", False, False),
+        (Mode.RES4, "四线电阻 · INPUT 与 SENSE", False, True),
+    ],
+)
+def test_desktop_terminal_diagram_tracks_mode_and_disclaims_wiring(
+    qt_app, monkeypatch, tmp_path, mode, title, current_sockets, sense_group,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._refresh_terminal_diagram(mode)
+
+        assert window.terminal_diagram.objectName() == "terminalDiagram"
+        assert window.terminal_diagram_title.text() == title
+        assert window.terminal_diagram_note.text().startswith("仅供端子位置参考")
+        assert "不检测实际接线" in window.terminal_diagram.toolTip()
+        assert window.terminal_socket_widgets["hi"].property("socketTone") == "high"
+        assert window.terminal_socket_widgets["lo"].property("socketTone") == "low"
+        assert window.terminal_socket_widgets["ma"].isHidden() is (not current_sockets)
+        assert window.terminal_socket_widgets["10a"].isHidden() is (not current_sockets)
+        assert window.terminal_sense_group.isHidden() is (not sense_group)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_compact_window_reduces_plot_minimum_and_action_spacing(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "compact-layout-config"))
     window = MainWindow()
     try:
+        window.show()
+        qt_app.processEvents()
         window.measurement_workspace.resize(600, 550)
         window._update_readout_layout()
 
@@ -255,11 +1034,119 @@ def test_light_secondary_text_and_unselected_tabs_meet_contrast_target(qt_app, m
         qt_app.processEvents()
 
 
-def test_sampling_interval_labels_have_readable_contrast_on_dark_action_bar(qt_app, monkeypatch, tmp_path):
+def test_unstyled_main_window_label_has_readable_contrast_on_dark_root(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "fallback-contrast-config"))
+    window = MainWindow()
+    try:
+        fallback_label = QLabel("未显式设色的状态文字", window.centralWidget())
+        fallback_label.ensurePolished()
+        text_color = fallback_label.palette().color(fallback_label.foregroundRole())
+        assert _contrast_ratio(text_color, QColor("#252d31")) >= 4.5
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_message_box_text_keeps_readable_default_contrast(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "message-box-contrast-config"))
+    window = MainWindow()
+    dialog = QMessageBox(QMessageBox.Icon.Warning, "测试标题", "测试正文", parent=window)
+    try:
+        dialog.ensurePolished()
+        message_label = dialog.findChild(QLabel, "qt_msgbox_label")
+        assert message_label is not None
+        foreground = message_label.palette().color(message_label.foregroundRole())
+        background = message_label.palette().color(message_label.backgroundRole())
+        assert _contrast_ratio(foreground, background) >= 4.5
+
+        files_dialog_label = QLabel("未显式设色的文件说明", window.files_dialog)
+        files_dialog_label.ensurePolished()
+        files_text = files_dialog_label.palette().color(files_dialog_label.foregroundRole())
+        assert _contrast_ratio(files_text, QColor("#f1efe6")) >= 4.5
+    finally:
+        dialog.close()
+        window.close()
+        qt_app.processEvents()
+
+
+def test_wiring_confirmation_instructions_remain_readable(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "wiring-dialog-contrast-config"))
+    window = MainWindow()
+    dialog = gui_module.WiringConfirmationDialog(
+        Mode.DCV, "确认被测回路已断电，红黑表笔接入 HI / LO。", parent=window,
+    )
+    try:
+        dialog.instructions_label.ensurePolished()
+        foreground = dialog.instructions_label.palette().color(
+            dialog.instructions_label.foregroundRole()
+        )
+        assert _contrast_ratio(foreground, QColor("#f1efe6")) >= 4.5
+        note_foreground = dialog.note_label.palette().color(
+            dialog.note_label.foregroundRole()
+        )
+        assert _contrast_ratio(note_foreground, QColor("#f1efe6")) >= 4.5
+    finally:
+        dialog.close()
+        window.close()
+        qt_app.processEvents()
+
+
+def test_plot_cursor_and_event_markers_meet_non_text_contrast_target(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "plot-marker-contrast-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend((1.0, 2.0, 3.0))
+        window._refresh_curve()
+        window._add_event_marker("负载切换", elapsed_s=1.0)
+        qt_app.processEvents()
+
+        plot_background = window.plot_widget.backgroundBrush().color()
+        assert _contrast_ratio(window.baseline_line.pen.color(), plot_background) >= 3.0
+        assert _contrast_ratio(window._event_lines[0].pen.color(), plot_background) >= 3.0
+
+        view_box = window.plot_widget.getPlotItem().vb
+        window._on_mouse_moved(view_box.mapViewToScene(QPointF(1.0, 2.0)))
+        assert window._crosshair_x is not None
+        assert _contrast_ratio(window._crosshair_x.pen.color(), plot_background) >= 3.0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_status_badges_and_readout_text_meet_wcag_contrast_target(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "status-contrast-config"))
+    window = MainWindow()
+    try:
+        text_background_pairs = {
+            'QLabel#connectionBadge[state="connected"]': "#29433c",
+            'QLabel#connectionBadge[state="mock"]': "#51412a",
+            'QLabel#instrumentReadbackBadge[state="readback"]': "#29433c",
+            'QLabel#instrumentReadbackBadge[state="local"]': "#51412a",
+            'QLabel#operationStatus[state="busy"]': "#252d31",
+            'QLabel#operationStatus[state="success"]': "#252d31",
+            'QLabel#operationStatus[state="error"]': "#252d31",
+            "QLabel#readingValue": "#1d262a",
+            "QLabel#readingMode": "#1d262a",
+            "QFrame#readingCard QFrame#metricCell QLabel#eyebrow": "#303b3e",
+            "QFrame#readingCard QLabel#metricValue, QFrame#readingCard QLabel#statusValue": "#303b3e",
+            "QLabel#mockScenarioBanner": "#51412a",
+            "QLabel#warningBanner": "#fff2cc",
+        }
+        for selector, background in text_background_pairs.items():
+            style = _stylesheet_rule(window, selector)
+            assert _contrast_ratio(QColor(style["color"]), QColor(background)) >= 4.5, selector
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_sampling_interval_labels_have_readable_contrast_in_settings(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "interval-contrast-config"))
     window = MainWindow()
     try:
-        background = QColor("#30383c")
+        background = QColor("#f1efe6")
         for object_name in ("targetIntervalLabel", "fastestIntervalLabel"):
             label = window.findChild(QLabel, object_name)
             assert label is not None
@@ -267,6 +1154,27 @@ def test_sampling_interval_labels_have_readable_contrast_on_dark_action_bar(qt_a
             color = QColor(rule["color"])
             assert int(rule["font-size"].removesuffix("px")) >= 12
             assert _contrast_ratio(color, background) >= 4.5
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_sampling_interval_labels_have_readable_contrast_in_main_action_bar(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "interval-main-contrast-config"))
+    window = MainWindow()
+    try:
+        background = QColor("#30383c")
+        for object_name in ("targetIntervalLabel", "fastestIntervalLabel"):
+            label = window.findChild(QLabel, object_name)
+            assert label is not None
+            assert window._action_bar.isAncestorOf(label)
+        rule = _stylesheet_rule(
+            window,
+            "QFrame#actionBar QLabel#targetIntervalLabel, "
+            "QFrame#actionBar QLabel#fastestIntervalLabel",
+        )
+        color = QColor(rule["color"])
+        assert _contrast_ratio(color, background) >= 4.5
     finally:
         window.close()
         qt_app.processEvents()
@@ -281,7 +1189,9 @@ def test_y_axis_span_label_uses_readable_dark_workspace_text(qt_app, monkeypatch
             if child.text() == "纵轴跨度"
         )
         assert label.objectName() == "secondaryText"
-        style = _stylesheet_rule(window, "QWidget#measurementWorkspace QLabel#secondaryText")
+        style = _stylesheet_rule(
+            window, "QDialog#configurationDialog QFrame#plotToolbar QLabel#secondaryText"
+        )
         assert _contrast_ratio(QColor(style["color"]), QColor("#252d31")) >= 4.5
     finally:
         window.close()
@@ -294,6 +1204,14 @@ def test_plot_toolbar_reflows_without_clipping_and_keeps_hints_readable(qt_app, 
     try:
         window.resize(700, 720)
         window.show()
+        window._show_configuration()
+        window._set_configuration_workspace(1)
+        window.analysis_tabs.setCurrentWidget(window.chart_settings_tab)
+        window.configuration_dialog.setMinimumWidth(0)
+        window.configuration_dialog.setMaximumWidth(2000)
+        window.configuration_dialog.resize(700, 720)
+        qt_app.processEvents()
+        QTest.qWait(20)
         qt_app.processEvents()
 
         toolbar = window.findChild(QFrame, "plotToolbar")
@@ -327,12 +1245,19 @@ def test_plot_toolbar_reflows_without_clipping_and_keeps_hints_readable(qt_app, 
 
         assert window.acquisition_hint.wordWrap()
         for object_name in ("chartViewMode", "chartAcquisitionHint"):
-            rule = _stylesheet_rule(window, f"QLabel#{object_name}")
+            rule = _stylesheet_rule(
+                window,
+                f"QDialog#configurationDialog QFrame#plotToolbar QLabel#{object_name}",
+            )
+            typography = _stylesheet_rule(window, f"QLabel#{object_name}")
             color = QColor(rule["color"])
-            assert int(rule["font-size"].removesuffix("px")) >= 12
+            assert int(typography["font-size"].removesuffix("px")) >= 12
             assert _contrast_ratio(color, QColor("#252d31")) >= 4.5
 
         window.resize(1500, 720)
+        window.configuration_dialog.resize(1500, 720)
+        qt_app.processEvents()
+        QTest.qWait(20)
         qt_app.processEvents()
         assert window._plot_toolbar_mode == "wide"
         assert not window.acquisition_hint.wordWrap()
@@ -340,6 +1265,9 @@ def test_plot_toolbar_reflows_without_clipping_and_keeps_hints_readable(qt_app, 
         assert_toolbar_geometry_is_safe()
 
         window.resize(700, 720)
+        window.configuration_dialog.resize(700, 720)
+        qt_app.processEvents()
+        QTest.qWait(20)
         qt_app.processEvents()
         assert window._plot_toolbar_mode != "wide"
         assert toolbar_uses_multiple_rows()
@@ -355,22 +1283,51 @@ def test_plot_toolbar_follow_and_source_labels_have_readable_contrast(qt_app, mo
     try:
         background = QColor("#252d31")
         assert window.follow_check.objectName() == "chartFollowCheck"
+        for selector in (
+            "QDialog#configurationDialog QFrame#plotToolbar QCheckBox#chartFollowCheck",
+            "QDialog#configurationDialog QFrame#plotToolbar QLabel#chartSourceLabel",
+        ):
+            rule = _stylesheet_rule(window, selector)
+            assert _contrast_ratio(QColor(rule["color"]), background) >= 4.5
         for selector in ("QCheckBox#chartFollowCheck", "QLabel#chartSourceLabel"):
             rule = _stylesheet_rule(window, selector)
             assert int(rule["font-size"].removesuffix("px")) >= 12
-            assert _contrast_ratio(QColor(rule["color"]), background) >= 4.5
     finally:
         window.close()
         qt_app.processEvents()
 
 
-def test_target_sampling_interval_is_in_the_main_acquisition_workspace(
+def test_y_axis_apply_button_keeps_a_compact_width_on_wide_toolbar(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "compact-span-button-config"))
+    window = MainWindow()
+    try:
+        window.resize(1500, 720)
+        window.show()
+        window._show_configuration()
+        window._set_configuration_workspace(1)
+        window.analysis_tabs.setCurrentWidget(window.chart_settings_tab)
+        window.configuration_dialog.setMinimumWidth(0)
+        window.configuration_dialog.setMaximumWidth(2000)
+        window.configuration_dialog.resize(1500, 720)
+        qt_app.processEvents()
+
+        assert window._plot_toolbar_mode == "wide"
+        assert window.y_axis_span_control.width() <= 420
+        assert window.apply_y_axis_span_button.width() <= 96
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_target_sampling_interval_is_in_main_acquisition_workspace(
     qt_app, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "acquisition-interval-config"))
     window = MainWindow()
     try:
         assert window.measurement_workspace.isAncestorOf(window.interval_spin)
+        assert window._action_bar.isAncestorOf(window.interval_spin)
+        assert not window.setup_section_stack.widget(1).isAncestorOf(window.interval_spin)
         assert not window.setup_section_stack.widget(2).isAncestorOf(window.interval_spin)
     finally:
         window.close()
@@ -432,22 +1389,97 @@ def test_input_impedance_profile_is_dc_voltage_only(qt_app, monkeypatch, tmp_pat
         qt_app.processEvents()
 
 
-def test_desktop_top_navigation_opens_the_matching_settings_section(
+def test_desktop_settings_dialog_uses_one_navigation_row_for_all_sections(
     qt_app, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
-        window.analysisNavigationButton.click()
+        window.configuration_button.click()
         assert window.configuration_dialog.isVisible()
-        assert window.workspace_stack.currentIndex() == 1
+        assert window.workspace_stack.currentIndex() == 0
         assert window.setup_section_stack.currentIndex() == 0
-        window.filesNavigationButton.click()
+        assert window.configuration_nav_buttons["communications"].isChecked()
+
+        window.configuration_nav_buttons["analysis"].click()
+        assert window.workspace_stack.currentIndex() == 1
+        assert window.configuration_nav_buttons["analysis"].isChecked()
+        assert window.navigation_buttons["analysis"].isChecked()
+
+        window.configuration_nav_buttons["measurement"].click()
+        assert window.workspace_stack.currentIndex() == 0
+        assert window.setup_section_stack.currentIndex() == 1
+        assert window.configuration_nav_buttons["measurement"].isChecked()
+        assert window.navigation_buttons["communications"].isChecked()
+
+        window.configuration_nav_buttons["chart"].click()
+        assert window.workspace_stack.currentIndex() == 1
+        assert window.analysis_tabs.currentWidget() is window.chart_settings_tab
+        assert window.configuration_nav_buttons["chart"].isChecked()
+
+        window.configuration_dialog.hide()
+        qt_app.processEvents()
+        assert window.navigation_buttons["acquisition"].isChecked()
+
+        window.experiment_files_action.trigger()
         assert window.configuration_dialog.isHidden()
         assert window.files_dialog.isVisible()
-        window.acquisitionNavigationButton.click()
-        assert window.files_dialog.isHidden()
+
+        file_menu_action = next(
+            action for action in window.menuBar().actions() if action.text() == "文件"
+        )
+        assert window.experiment_files_action in file_menu_action.menu().actions()
+
+        instrument_menu_action = next(
+            action for action in window.menuBar().actions() if action.text() == "仪器"
+        )
+        instrument_menu = instrument_menu_action.menu()
+        diagnostic_action = next(
+            action for action in instrument_menu.actions()
+            if action.text() == "SCPI诊断…"
+        )
+        diagnostic_action.trigger()
+        assert "诊断需要已连接的真实仪器" in window.statusBar().currentMessage()
+        log_action = window.log_dock.toggleViewAction()
+        log_action.trigger()
+        assert not window.log_dock.isHidden()
+        log_action.trigger()
+        assert window.log_dock.isHidden()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_desktop_top_navigation_switches_workspaces_and_tracks_current_task(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "top-navigation-config"))
+    window = MainWindow()
+    try:
+        window.navigation_buttons["communications"].click()
+        assert window.configuration_dialog.isVisible()
+        assert window.setup_section_stack.currentIndex() == 0
+        assert window.navigation_buttons["communications"].isChecked()
+
+        window.navigation_buttons["analysis"].click()
+        assert window.configuration_dialog.isVisible()
+        assert window.workspace_stack.currentIndex() == 1
+        assert window.navigation_buttons["analysis"].isChecked()
+
+        window.navigation_buttons["acquisition"].click()
         assert window.configuration_dialog.isHidden()
+        assert window.files_dialog.isHidden()
+        assert window.navigation_buttons["acquisition"].isChecked()
+
+        window.navigation_buttons["files"].click()
+        assert window.files_dialog.isVisible()
+        assert window.navigation_buttons["files"].isChecked()
+
+        window.navigation_buttons["diagnostics"].click()
+        assert not window.log_dock.isHidden()
+        assert window.configuration_dialog.isHidden()
+        assert window.files_dialog.isHidden()
+        assert window.navigation_buttons["diagnostics"].isChecked()
     finally:
         window.close()
         qt_app.processEvents()
@@ -502,7 +1534,7 @@ def test_desktop_files_navigation_opens_a_dedicated_artifact_workspace(
         window._experiment_csv_path = experiment_dir / "measurements.csv"
         window._update_experiment_directory_controls()
 
-        window.filesNavigationButton.click()
+        window.experiment_files_action.trigger()
 
         assert window.files_dialog.isVisible()
         assert window.configuration_dialog.isHidden()
@@ -511,6 +1543,45 @@ def test_desktop_files_navigation_opens_a_dedicated_artifact_workspace(
         assert all(any(text.startswith(name) for text in listed) for name in (
             "measurements.csv", "events.csv", "config.json", "run.log", "curve.png",
         ))
+
+        window.files_close_button.click()
+        qt_app.processEvents()
+        assert window.files_dialog.isHidden()
+        assert window.navigation_buttons["acquisition"].isChecked()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_desktop_file_workspace_lists_exported_artifacts_outside_experiment_directory(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "file-export-results-config"))
+    window = MainWindow()
+    try:
+        experiment_dir = tmp_path / "experiment"
+        experiment_dir.mkdir()
+        (experiment_dir / "events.csv").write_text("event_index,event\n1,connected\n", encoding="utf-8")
+        (experiment_dir / "measurements.csv").write_text("sample_index,value_si\n1,1\n", encoding="utf-8")
+        window._experiment_csv_path = experiment_dir / "measurements.csv"
+        window._experiment_active = False
+        window._refresh_file_workspace()
+
+        export_path = tmp_path / "exports" / "events_excel_safe.csv"
+        export_path.parent.mkdir()
+        export_path.write_text("event_index,event\n1,connected\n", encoding="utf-8")
+        window._on_safe_events_exported(str(export_path), None)
+
+        assert window.files_export_results_list.count() == 1
+        result = window.files_export_results_list.item(0)
+        assert "事件安全副本" in result.text()
+        assert export_path.name in result.text()
+        assert result.toolTip() == str(export_path)
+        listed_directory_files = {
+            window.experiment_file_list.item(i).text()
+            for i in range(window.experiment_file_list.count())
+        }
+        assert not any(text.startswith(export_path.name) for text in listed_directory_files)
     finally:
         window.close()
         qt_app.processEvents()
@@ -531,6 +1602,29 @@ def test_desktop_settings_navigation_closes_files_workspace(
         assert window.files_dialog.isHidden()
         assert window.configuration_dialog.isVisible()
         assert window.workspace_stack.currentIndex() == (1 if section == "analysis" else 0)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize("entry", ["toolbar", "shortcut"])
+def test_opening_configuration_closes_the_files_dialog(
+    qt_app, monkeypatch, tmp_path, entry,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / f"files-to-settings-{entry}"))
+    window = MainWindow()
+    try:
+        window._navigate_workspace("files")
+        assert window.files_dialog.isVisible()
+
+        if entry == "toolbar":
+            window.configuration_button.click()
+        else:
+            window._shortcut_actions["settingsShortcutAction"].trigger()
+
+        assert window.configuration_dialog.isVisible()
+        assert window.files_dialog.isHidden()
+        assert window.navigation_buttons["communications"].isChecked()
     finally:
         window.close()
         qt_app.processEvents()
@@ -776,6 +1870,7 @@ def test_capture_shortcuts_are_visible_and_bound_to_the_expected_actions(
     window = MainWindow()
     try:
         expected = {
+            "newMeasurementShortcutAction": "Ctrl+N",
             "startShortcutAction": "Ctrl+R",
             "pauseShortcutAction": "Ctrl+P",
             "stopShortcutAction": "Ctrl+Shift+S",
@@ -787,6 +1882,7 @@ def test_capture_shortcuts_are_visible_and_bound_to_the_expected_actions(
             assert action is not None
             assert action.shortcut().toString() == sequence
 
+        assert "Ctrl+N" in window.new_measurement_button.toolTip()
         assert "Ctrl+R" in window.start_button.toolTip()
         assert "Ctrl+P" in window.pause_button.toolTip()
         assert "Ctrl+Shift+S" in window.stop_button.toolTip()
@@ -1053,6 +2149,198 @@ def test_disabled_measurement_controls_explain_acquisition_lock(qt_app, monkeypa
         qt_app.processEvents()
 
 
+def test_fixed_range_explains_that_autorange_must_be_disabled(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._connected = True
+        window._control_mode = "computer"
+        window.autorange_check.setChecked(False)
+        window.autorange_check.setChecked(True)
+
+        assert not window.range_combo.isEnabled()
+        assert "自动量程" in window.range_combo.toolTip()
+        assert "关闭" in window.range_combo.toolTip()
+
+        window._connected = False
+        window._update_controls()
+        assert "请先连接" not in window.range_combo.toolTip()
+        window._connected = True
+
+        window._control_mode = "local"
+        window._acquiring = True
+        window._update_controls()
+        assert "Local" in window.range_combo.toolTip()
+        assert "采集中" in window.range_combo.toolTip()
+
+        window._acquiring = False
+        window._control_mode = "computer"
+        window._update_controls()
+        assert "Local" not in window.range_combo.toolTip()
+        assert "采集中" not in window.range_combo.toolTip()
+        window.autorange_check.setChecked(False)
+
+        assert window.range_combo.isEnabled()
+        assert "自动量程" not in window.range_combo.toolTip()
+    finally:
+        window._acquiring = False
+        window._connected = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_disabled_initialize_parameters_explains_local_lock(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._connected = True
+        window._simulation = False
+        window._control_mode = "local"
+        window._update_controls()
+
+        assert not window.initialize_parameters_button.isEnabled()
+        assert "Local" in window.initialize_parameters_button.toolTip()
+        assert "Computer" in window.initialize_parameters_button.toolTip()
+    finally:
+        window._connected = False
+        window._acquiring = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_disabled_firmware_and_safe_export_actions_explain_acquisition_lock(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        experiment_dir = tmp_path / "run"
+        experiment_dir.mkdir()
+        measurements = experiment_dir / "measurements.csv"
+        measurements.write_text("sample_index,raw_reading\n1,1.0\n", encoding="utf-8")
+        (experiment_dir / "events.csv").write_text("timestamp_local,text\n", encoding="utf-8")
+        (experiment_dir / "config.json").write_text("{}", encoding="utf-8")
+        window._connected = True
+        window._simulation = False
+        window._control_mode = "computer"
+        window._device_serial = "TEST8845A001"
+        window._firmware_profiles[window._device_serial] = {"outguard_sw": "2.10.882.24"}
+        window._acquiring = True
+        window._experiment_active = True
+        window._experiment_csv_path = measurements
+        window._update_controls()
+        window._refresh_file_workspace()
+
+        assert not window.outguard_sw_edit.isEnabled()
+        assert "采集中" in window.outguard_sw_edit.toolTip()
+        assert "停止" in window.outguard_sw_edit.toolTip()
+        assert not window.clear_firmware_profile_button.isEnabled()
+        assert "采集中" in window.clear_firmware_profile_button.toolTip()
+        assert not window.files_safe_events_button.isEnabled()
+        assert "停止" in window.files_safe_events_button.toolTip()
+        assert not window.files_share_package_button.isEnabled()
+        assert "停止" in window.files_share_package_button.toolTip()
+
+        window._acquiring = False
+        window._experiment_active = False
+        window._update_controls()
+        window._refresh_file_workspace()
+        assert window.outguard_sw_edit.isEnabled()
+        assert "采集中" not in window.outguard_sw_edit.toolTip()
+        assert window.files_safe_events_button.isEnabled()
+        assert "停止" not in window.files_safe_events_button.toolTip()
+    finally:
+        window._connected = False
+        window._acquiring = False
+        window._experiment_active = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_firmware_clear_button_explains_when_no_panel_version_is_saved(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._connected = True
+        window._simulation = False
+        window._control_mode = "computer"
+        window._device_serial = "TEST8845A001"
+        window._firmware_profiles.pop(window._device_serial, None)
+        window._update_controls()
+
+        assert not window.clear_firmware_profile_button.isEnabled()
+        assert "尚无" in window.clear_firmware_profile_button.toolTip()
+        assert "版本记录" in window.clear_firmware_profile_button.toolTip()
+
+        window._firmware_profiles[window._device_serial] = {"outguard_sw": "2.10.882.24"}
+        window._update_controls()
+        assert window.clear_firmware_profile_button.isEnabled()
+        assert "没有" not in window.clear_firmware_profile_button.toolTip()
+    finally:
+        window._connected = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_safe_export_buttons_stay_locked_while_background_export_runs(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    directory = tmp_path / "run"
+    directory.mkdir()
+    for name, content in (
+        ("measurements.csv", "sample_index,raw_reading\n1,1.0\n"),
+        ("events.csv", "timestamp_local,text\n"),
+        ("config.json", "{}"),
+    ):
+        (directory / name).write_text(content, encoding="utf-8")
+    window = MainWindow()
+    try:
+        window._experiment_csv_path = directory / "measurements.csv"
+        window._experiment_active = False
+        window._safe_events_export_task = object()
+        window._update_controls()
+        assert not window.files_safe_events_button.isEnabled()
+        window._refresh_file_workspace()
+        assert not window.export_events_safe_button.isEnabled()
+        assert not window.files_safe_events_button.isEnabled()
+        assert "正在后台" in window.export_events_safe_button.toolTip()
+
+        window._safe_events_export_task = None
+        window._on_safe_events_exported(str(directory / "events_excel_safe.csv"), None)
+        assert window.files_safe_events_button.isEnabled()
+
+        errors = []
+        window._show_error = errors.append
+        window._safe_events_export_task = object()
+        window._update_controls()
+        window._refresh_file_workspace()
+        assert not window.export_events_safe_button.isEnabled()
+        assert not window.files_safe_events_button.isEnabled()
+        window._on_safe_events_exported(str(directory / "events_excel_safe.csv"), "disk full")
+        assert window.export_events_safe_button.isEnabled()
+        assert window.files_safe_events_button.isEnabled()
+        assert "正在后台" not in window.export_events_safe_button.toolTip()
+        assert "正在后台" not in window.files_safe_events_button.toolTip()
+        assert errors and "disk full" in errors[0]
+
+        window._safe_measurements_export_task = object()
+        window._update_controls()
+        window._refresh_file_workspace()
+        assert not window.files_safe_measurements_button.isEnabled()
+        assert "正在后台" in window.files_safe_measurements_button.toolTip()
+
+        window._safe_measurements_export_task = None
+        window._share_export_task = object()
+        window._update_controls()
+        window._refresh_file_workspace()
+        assert not window.files_share_package_button.isEnabled()
+        assert "正在后台" in window.files_share_package_button.toolTip()
+    finally:
+        window._safe_events_export_task = None
+        window._safe_measurements_export_task = None
+        window._share_export_task = None
+        window._connected = False
+        window.close()
+        qt_app.processEvents()
+
+
 def test_history_csv_loading_disables_measurement_start_controls(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
@@ -1285,6 +2573,58 @@ def test_single_measurement_has_distinct_saved_result_feedback(qt_app, monkeypat
         qt_app.processEvents()
 
 
+@pytest.mark.parametrize("start_result", ["failed", "started"])
+def test_new_measurement_replaces_plot_only_after_worker_confirms_start(
+    qt_app, monkeypatch, tmp_path, start_result
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "new-run-config"))
+    window = MainWindow()
+    start_requests = []
+    old_csv = tmp_path / "old-run" / "measurements.csv"
+    old_plot = ([0.0, 1.0], [2.0, 2.1])
+    new_directory = tmp_path / "new-run"
+    try:
+        window._connected = True
+        window._simulation = True
+        window._current_mode = Mode.DCV
+        window._instrument_mode_known = True
+        window._active_settings_by_mode[Mode.DCV.value] = {"mode": Mode.DCV.value}
+        window._experiment_csv_path = old_csv
+        window._plot_x.extend(old_plot[0])
+        window._plot_y.extend(old_plot[1])
+        window.curve.setData(window._plot_x, window._plot_y)
+        window.output_root.setText(str(tmp_path))
+        window.experiment_name.setText("new run")
+        window._bridge.start_experiment.disconnect(window._worker.start_experiment)
+        window._bridge.start_experiment.connect(lambda *args: start_requests.append(args))
+        monkeypatch.setattr(
+            window, "_prepare_start_preflight", lambda *_args, **_kwargs: False,
+        )
+        monkeypatch.setattr(gui_module.QMessageBox, "warning", lambda *_args, **_kwargs: None)
+
+        window._start_continuous()
+
+        assert len(start_requests) == 1
+        assert window._start_pending
+        assert (list(window._plot_x), list(window._plot_y)) == old_plot
+        assert window._experiment_csv_path == old_csv
+
+        if start_result == "failed":
+            window._show_error("模拟的启动失败")
+            assert not window._start_pending
+            assert (list(window._plot_x), list(window._plot_y)) == old_plot
+            assert window._experiment_csv_path == old_csv
+        else:
+            window._on_experiment_started(str(new_directory))
+            assert not window._start_pending
+            assert not window._plot_x
+            assert not window._plot_y
+            assert window._experiment_csv_path == new_directory / "measurements.csv"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_stop_save_feedback_includes_valid_and_abnormal_sample_counts(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
@@ -1308,15 +2648,58 @@ def test_pause_button_stays_in_place_and_changes_to_resume(qt_app, monkeypatch, 
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._on_acquisition_state_changed("running", False)
         window._on_status("连续采集中")
         pause_geometry = window.pause_button.geometry()
         assert window.pause_button.text() == "暂停"
+        window._on_acquisition_state_changed("paused", False)
         window._on_status("采集已暂停")
         assert window.pause_button.text() == "继续"
         assert window.pause_button.geometry() == pause_geometry
     finally:
         window._acquiring = False
         window._paused = False
+        window.close()
+        qt_app.processEvents()
+
+
+def test_acquisition_state_comes_from_typed_signal_not_status_copy(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "typed-acquisition-state-config"))
+    window = MainWindow()
+    try:
+        window._on_status("连续采集中（MOCK模拟）")
+        assert not window._acquiring
+        assert not window._paused
+        assert not window._experiment_active
+
+        window._on_acquisition_state_changed("running", False)
+        assert window._acquiring
+        assert not window._paused
+        assert window._experiment_active
+
+        window._on_status("数据采集中 · 目标间隔 0 s")
+        assert window._acquiring
+        assert window.experiment_status.text() == "数据采集中 · 目标间隔 0 s"
+
+        window._on_acquisition_state_changed("paused", False)
+        assert window._acquiring
+        assert window._paused
+        assert window._experiment_active
+
+        window._on_status("用户可见文案已更改")
+        assert window._paused
+        assert window.pause_button.text() == "继续"
+
+        window._on_acquisition_state_changed("stopped", False)
+        assert not window._acquiring
+        assert not window._paused
+        assert window._experiment_active
+
+        window._on_experiment_finished(str(tmp_path))
+        assert not window._experiment_active
+    finally:
         window.close()
         qt_app.processEvents()
 
@@ -1408,18 +2791,28 @@ def test_window_close_confirmation_explains_active_acquisition_will_stop(
     monkeypatch.setattr(gui_module.QMessageBox, "question", question)
     window = MainWindow()
     history_cancellations = []
+    events = [(float(index), f"待加载事件 {index}") for index in range(320)]
     window._history_load_task = SimpleNamespace(cancel=lambda: history_cancellations.append(True))
     try:
         window._connected = True
         window._acquiring = True
         window.show()
         qt_app.processEvents()
+        window._add_event_markers(events)
+        assert window._event_marker_timer.isActive()
 
         assert not window.close()
         assert window.isVisible() and not window._shutdown_started
         assert history_cancellations == []
         assert "关闭桌面软件窗口将停止当前采集" in prompts[0][2]
         assert "单独运行的 localhost 网页服务不会因此关闭" in prompts[0][2]
+        assert window._event_marker_timer.isActive()
+
+        deadline = time.monotonic() + 3.0
+        while window._event_marker_timer.isActive() and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert not window._event_marker_timer.isActive()
+        assert [label.toPlainText() for label in window._event_labels] == [text for _, text in events]
 
         assert not window.close()
         assert history_cancellations == [True]
@@ -1739,7 +3132,7 @@ def test_shutdown_wait_state_is_visible_in_status_area(qt_app, monkeypatch, tmp_
     try:
         window.show()
         window._navigate_workspace("analysis")
-        window.analysis_tabs.setCurrentIndex(2)
+        window.analysis_tabs.setCurrentWidget(window.analysis_overview_tab)
         qt_app.processEvents()
         assert not window.close()
         assert window.shutdown_status_label.isVisible()
@@ -1765,6 +3158,9 @@ def test_chart_gesture_help_can_be_expanded_and_collapsed(qt_app, monkeypatch, t
     window = MainWindow()
     try:
         window.show()
+        window._show_configuration()
+        window._set_configuration_workspace(1)
+        window.analysis_tabs.setCurrentWidget(window.chart_settings_tab)
         qt_app.processEvents()
         assert window.chart_gesture_help.isHidden()
         window.chart_gesture_help_button.click()
@@ -1773,6 +3169,53 @@ def test_chart_gesture_help_can_be_expanded_and_collapsed(qt_app, monkeypatch, t
         assert "Ctrl" in window.chart_gesture_help.text()
         window.chart_gesture_help_button.click()
         assert window.chart_gesture_help.isHidden()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_analysis_workspace_concentrates_statistics_baseline_and_events(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "analysis-overview-config"))
+    window = MainWindow()
+    try:
+        window.resize(1040, 700)
+        window._show_configuration()
+        window.configuration_dialog.resize(760, 520)
+        window.workspace_stack.setCurrentIndex(1)
+        window.configuration_dialog.show()
+        qt_app.processEvents()
+
+        assert window.analysis_tabs.count() == 2
+        assert window.analysis_tabs.tabText(0) == "分析总览"
+        assert window.analysis_tabs.tabText(1) == "曲线设置"
+        sections = (
+            ("analysisStatisticsSection", window.stats_label),
+            ("analysisBaselineSection", window.baseline_edit),
+            ("analysisEventsSection", window.event_edit),
+        )
+        for object_name, control in sections:
+            section = window.analysis_overview_scroll_area.findChild(QWidget, object_name)
+            assert section is not None, f"missing analysis section: {object_name}"
+            assert section.isAncestorOf(control)
+            assert window.analysis_overview_scroll_area.isAncestorOf(section)
+        assert window.analysis_overview_scroll_area.isAncestorOf(window.region_start_spin)
+        assert window.analysis_overview_scroll_area.isAncestorOf(window.set_selected_baseline_button)
+        assert window.analysis_overview_scroll_area.isAncestorOf(window.event_list_widget)
+        assert window.analysis_overview_scroll_area.isAncestorOf(window.event_csv_safety_warning)
+        assert window.analysis_overview_scroll_area.widgetResizable()
+        assert (
+            window.analysis_overview_scroll_area.horizontalScrollBarPolicy()
+            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        vertical_scroll = window.analysis_overview_scroll_area.verticalScrollBar()
+        assert vertical_scroll.maximum() > 0, "short configuration window must expose vertical scrolling"
+        vertical_scroll.setValue(vertical_scroll.maximum())
+        qt_app.processEvents()
+        export_button_position = window.export_events_safe_button.mapTo(
+            window.analysis_overview_scroll_area.viewport(), QPoint(0, 0)
+        )
+        export_button_rect = QRect(export_button_position, window.export_events_safe_button.size())
+        assert window.analysis_overview_scroll_area.viewport().rect().contains(export_button_rect)
     finally:
         window.close()
         qt_app.processEvents()
@@ -1824,6 +3267,7 @@ def test_local_control_badge_explicitly_requires_panel_confirmation(qt_app, monk
     window = MainWindow()
     try:
         window._on_connected(True, "已连接 · FLUKE,8845A,TEST,2.0")
+        assert not window.instrument_readback_status.isHidden()
         window._on_control_mode_changed("local")
 
         assert "待面板确认" in window.connection_badge.text()
@@ -1929,7 +3373,7 @@ def test_high_dpi_layout_keeps_readout_chart_and_controls_separate(tmp_path, sca
                     if widget is not None else []
                 ),
             })
-        window._show_setup_section(2)
+        window._show_setup_section(1)
         app.processEvents()
         interval_visible = controls[2].isVisible()
         interval_fits = controls[2].height() >= controls[2].sizeHint().height()
@@ -2005,6 +3449,9 @@ def test_150_percent_dpi_short_window_keeps_chart_panels_inside_and_readable(tmp
         window = MainWindow()
         window.resize(887, 440)
         window.show()
+        window._show_configuration()
+        window._set_configuration_workspace(1)
+        window.analysis_tabs.setCurrentWidget(window.chart_settings_tab)
         app.processEvents()
         app.processEvents()
         bounds = window.measurement_workspace.contentsRect()
@@ -2034,6 +3481,13 @@ def test_150_percent_dpi_short_window_keeps_chart_panels_inside_and_readable(tmp
                 window.latest_value_label.font().pointSizeF(),
             ],
             "latest_invalid_button_visible": window.latest_invalid_log_button.isVisible(),
+            "measurement_buttons_visible": all(
+                button.isVisible() for button in (
+                    window.new_measurement_button, window.clear_plot_button,
+                )
+            ),
+            "measurement_hint_visible": window.new_measurement_hint.isVisible(),
+            "measurement_hint_text": window.new_measurement_hint.text(),
             "panel_items": panel_items,
             "panel_items_inside": all(
                 rect[0] >= bounds.x() and rect[1] >= bounds.y()
@@ -2060,6 +3514,7 @@ def test_150_percent_dpi_short_window_keeps_chart_panels_inside_and_readable(tmp
         }], 0.0, {"attempt_count": 1, "valid_count": 0, "abnormal_count": 1, "count": 0})
         window._save_live_plot_snapshot()
         window._restore_live_plot_snapshot(window._live_plot_snapshot)
+        window._set_configuration_workspace(0)
         app.processEvents()
         error_bounds = window.measurement_workspace.contentsRect()
         error_panels = [
@@ -2151,6 +3606,9 @@ def test_150_percent_dpi_short_window_keeps_chart_panels_inside_and_readable(tmp
     }
     assert snapshot["workspace"][1] >= snapshot["workspace_minimum_hint"][1], snapshot
     assert snapshot["panel_items_inside"], snapshot["panel_items"]
+    assert snapshot["measurement_buttons_visible"], snapshot
+    assert snapshot["measurement_hint_visible"], snapshot
+    assert "新测量开始后自动换图" in snapshot["measurement_hint_text"], snapshot
     assert snapshot["reading_labels_fit"], snapshot["reading_label_heights"]
     assert snapshot["plot_toolbar_fit"], snapshot["plot_toolbar_heights"]
     error = snapshots["error"]
@@ -2190,6 +3648,9 @@ def test_150_percent_dpi_1366x768_work_area_keeps_plot_controls_readable(tmp_pat
         window = MainWindow()
         window.resize(911, 512)  # 1366 x 768 physical pixels at 150% scaling.
         window.show()
+        window._show_configuration()
+        window._set_configuration_workspace(1)
+        window.analysis_tabs.setCurrentWidget(window.chart_settings_tab)
         for _ in range(3):
             app.processEvents()
         QTest.qWait(120)
@@ -2262,6 +3723,167 @@ def test_long_run_plot_cache_is_bounded_without_truncating_global_stats(qt_app, 
         assert window._plot_x[-1] == total_samples
         assert window._global_stats["count"] == total_samples
         assert f"统计范围：全程 · 有效点 n={total_samples}" in window.stats_label.text()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_live_curve_render_is_bounded_and_preserves_peaks_and_gaps(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    sample_count = 24_001
+    peak_index = 12_222
+    gap_index = 10_003
+    try:
+        window._plot_x.extend(float(index) for index in range(sample_count))
+        window._plot_y.extend(0.0 for _ in range(sample_count))
+        window._plot_y[peak_index] = 25.0
+        window._plot_break_before.extend(False for _ in range(sample_count))
+        window._plot_break_before[gap_index] = True
+        window._plot_metadata.extend({"sample_index": index + 1} for index in range(sample_count))
+        window._plot_y_origin = 0.0
+        window.view_box.setRange(xRange=(0.0, float(sample_count)), yRange=(-1.0, 26.0), padding=0)
+
+        window._refresh_curve()
+        rendered_x, rendered_y = window.curve.getData()
+
+        assert len(rendered_x) <= gui_module.MAX_LIVE_RENDER_POINTS
+        assert 25.0 in rendered_y
+        assert any(not math.isfinite(float(value)) for value in rendered_y)
+        assert len(window._plot_x) == sample_count
+        assert window._plot_y[peak_index] == 25.0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_live_curve_render_budget_counts_gap_separators(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    sample_count = gui_module.MAX_LIVE_RENDER_POINTS
+    peak_index = sample_count // 2
+    try:
+        window._plot_x.extend(float(index) for index in range(sample_count))
+        window._plot_y.extend(0.0 for _ in range(sample_count))
+        window._plot_y[peak_index] = 30.0
+        window._plot_break_before.extend(False for _ in range(sample_count))
+        for index in range(1, sample_count, 3):
+            window._plot_break_before[index] = True
+        window._plot_metadata.extend({"sample_index": index + 1} for index in range(sample_count))
+        window._plot_y_origin = 0.0
+        window.view_box.setRange(
+            xRange=(0.0, float(sample_count)), yRange=(-1.0, 31.0), padding=0,
+        )
+
+        window._refresh_curve()
+        rendered_x, rendered_y = window.curve.getData()
+
+        assert len(rendered_x) <= gui_module.MAX_LIVE_RENDER_POINTS
+        assert 30.0 in rendered_y
+        assert sum(not math.isfinite(float(value)) for value in rendered_y) > 1
+        assert len(window._plot_x) == sample_count
+        assert window._plot_y[peak_index] == 30.0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_live_curve_render_has_hard_cap_when_bucket_size_stalls(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    sample_count = 100_000
+    try:
+        window._plot_x.extend(float(index) for index in range(sample_count))
+        window._plot_y.extend(0.0 for _ in range(sample_count))
+        window._plot_break_before.extend(False for _ in range(sample_count))
+        # Four distinct candidates per 42-sample bucket expose a case where
+        # reducing the helper's point target by one leaves its bucket size fixed.
+        for start in range(0, sample_count, 42):
+            window._plot_y[start + 10] = -1.0
+            window._plot_y[start + 30] = 1.0
+            window._plot_break_before[start] = True
+        for start in range(0, 42 * 97, 42):
+            window._plot_break_before[start + 10] = True
+        window._plot_metadata.extend(
+            {"sample_index": index + 1, "raw_reading": f"raw-{index}"}
+            for index in range(sample_count)
+        )
+        window._plot_y_origin = 0.0
+        window.view_box.setRange(
+            xRange=(0.0, float(sample_count)), yRange=(-2.0, 2.0), padding=0,
+        )
+
+        window._refresh_curve()
+        rendered_x, rendered_y = window.curve.getData()
+
+        assert len(rendered_x) <= gui_module.MAX_LIVE_RENDER_POINTS
+        assert sum(float(value) == -1.0 for value in rendered_y) == 2_381
+        assert sum(float(value) == 1.0 for value in rendered_y) == 2_381
+        assert len(window._plot_x) == sample_count
+        assert len(window._plot_metadata) == sample_count
+        assert window._nearest_plot_index(float(sample_count - 1)) == sample_count - 1
+        displayed_x = {
+            float(x) for x, y in zip(rendered_x, rendered_y)
+            if math.isfinite(float(y))
+        }
+        omitted_index = next(
+            index for index in range(sample_count) if float(index) not in displayed_x
+        )
+        assert window._lock_plot_point_at(float(omitted_index))
+        assert window._selected_plot_point == (
+            float(omitted_index), float(window._plot_y[omitted_index]), omitted_index + 1,
+        )
+        assert f"原始 raw-{omitted_index}" in window.cursor_label.text()
+        source_breaks = list(window._plot_break_before)
+        finite_positions = [
+            index for index, value in enumerate(rendered_y)
+            if math.isfinite(float(value))
+        ]
+        for left_position, right_position in zip(finite_positions, finite_positions[1:]):
+            left_x = int(rendered_x[left_position])
+            right_x = int(rendered_x[right_position])
+            source_has_gap = any(source_breaks[left_x + 1:right_x + 1])
+            rendered_has_gap = any(
+                not math.isfinite(float(value))
+                for value in rendered_y[left_position + 1:right_position]
+            )
+            assert rendered_has_gap == source_has_gap
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_live_curve_render_bounds_trace_when_every_retained_point_is_a_gap(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    monkeypatch.setattr(gui_module, "MAX_LIVE_RENDER_POINTS", 6)
+    window = MainWindow()
+    try:
+        window._plot_x.extend(float(index) for index in range(20))
+        window._plot_y.extend((0.0, -2.0, 0.0, 2.0, *([0.0] * 16)))
+        window._plot_break_before.extend(True for _ in range(20))
+        window._plot_metadata.extend({"sample_index": index + 1} for index in range(20))
+        window._plot_y_origin = 0.0
+        window.view_box.setRange(xRange=(0.0, 19.0), yRange=(-3.0, 3.0), padding=0)
+
+        window._refresh_curve()
+        rendered_x, rendered_y = window.curve.getData()
+
+        assert len(rendered_x) <= 6
+        assert float(rendered_x[0]) == 0.0
+        assert float(rendered_x[-1]) == 19.0
+        assert any(not math.isfinite(float(value)) for value in rendered_y)
+        finite_positions = [
+            index for index, value in enumerate(rendered_y)
+            if math.isfinite(float(value))
+        ]
+        assert all(
+            any(
+                not math.isfinite(float(value))
+                for value in rendered_y[left + 1:right]
+            )
+            for left, right in zip(finite_positions, finite_positions[1:])
+        )
+        assert len(window._plot_x) == 20
     finally:
         window.close()
         qt_app.processEvents()
@@ -2525,6 +4147,99 @@ def test_real_reading_updates_gui_curve_and_stats_without_plotting_failed_value(
         assert not window.plot_empty_overlay.isHidden()
         assert window.latest_value_label.text() == "等待读数"
         assert window._global_stats["count"] == 0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_first_gui_drain_warns_when_older_plot_rows_were_dropped(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    monkeypatch.setattr(worker_module, "MAX_PENDING_GUI_ROWS", 3)
+    window = MainWindow()
+    mailbox_worker = worker_module.MeasurementWorker()
+    mailbox_worker._ui_pending_rows = deque(maxlen=3)
+
+    def deliver_sample_update():
+        window._on_sample(*mailbox_worker.take_sample_update(
+            include_display_dropped_rows=True,
+        ))
+
+    mailbox_worker.sample_ready.connect(deliver_sample_update)
+    for value in range(1, 6):
+        mailbox_worker._running_stats.add(float(value))
+    mailbox_worker._pending_rows.extend(
+        {
+            "sample_index": index,
+            "elapsed_s": float(index),
+            "mode": Mode.DCV.value,
+            "value_si": 1.0,
+            "unit_si": "V",
+            "raw_reading": "+1.0E+00",
+            "status": "ok",
+            "error": "",
+        }
+        for index in range(1, 6)
+    )
+
+    try:
+        mailbox_worker._flush_ui_rows()
+        qt_app.processEvents()
+
+        warning = getattr(window, "display_loss_warning", None)
+        assert warning is not None
+        assert not warning.isHidden()
+        assert "曲线显示丢点，CSV 原始数据完整" in warning.text()
+        assert "2" in warning.text()
+        assert list(window._plot_x) == [3.0, 4.0, 5.0]
+    finally:
+        mailbox_worker.shutdown()
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("value", "elapsed"),
+    [(math.nan, 1.0), (2.0, math.inf)],
+)
+def test_nonfinite_success_row_is_logged_and_never_plotted(
+    qt_app, monkeypatch, tmp_path, value, elapsed,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        row = {
+            "sample_index": 1,
+            "elapsed_s": elapsed,
+            "mode": Mode.DCV.value,
+            "value_si": value,
+            "unit_si": "V",
+            "raw_reading": "NaN",
+            "status": "ok",
+        }
+        # Worker RunningStats ignores non-finite values even if a malformed
+        # upstream row is mislabeled status=ok.
+        window._on_sample([row], 0.0, {
+            "count": 0,
+            "minimum": None,
+            "maximum": None,
+            "mean": None,
+            "sample_stddev": None,
+            "valid_count": 0,
+            "attempt_count": 1,
+            "abnormal_count": 1,
+        })
+        qt_app.processEvents()
+
+        assert not window._plot_x
+        assert not window._plot_y
+        assert window._plot_break_pending
+        assert "非有限值" in window.log_text.toPlainText()
+        assert "已从曲线中排除" in window.latest_invalid_label.text()
+        assert window.latest_value_label.text() == "等待读数"
+        assert window.valid_sample_count_label.text() == "有效样本 0"
+        assert "有效点 n=0" in window.stats_label.text()
     finally:
         window.close()
         qt_app.processEvents()
@@ -3169,7 +4884,7 @@ def test_locked_curve_point_stays_fixed_when_mouse_preview_moves(qt_app, monkeyp
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((10.0, 20.0, 30.0))
-        window.curve.setData(list(window._plot_x), list(window._plot_y))
+        window._refresh_curve()
         window.plot_widget.setRange(xRange=(0.0, 2.0), yRange=(0.0, 30.0), padding=0)
         qt_app.processEvents()
 
@@ -3252,6 +4967,29 @@ def test_control_mode_has_hover_help_and_local_disables_instrument_controls(
         assert window.mode_combo.isEnabled()
         assert window.apply_button.isEnabled()
         assert window.zero_button.isEnabled()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_control_mode_explanation_is_visible_beside_the_switch(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        window._show_configuration()
+        qt_app.processEvents()
+
+        explanation = window.control_mode_explanation_label
+        assert explanation.isVisible()
+        assert "Computer" in explanation.text()
+        assert "软件可设置仪表并采集" in explanation.text()
+        assert "Local" in explanation.text()
+        assert "停用测量、参数设置、诊断和 ZERO" in explanation.text()
+        assert "RS-232" in explanation.text()
+        assert "COMPUTER" in explanation.text()
     finally:
         window.close()
         qt_app.processEvents()
@@ -3453,6 +5191,114 @@ def test_bulk_history_event_markers_layout_once(qt_app, monkeypatch, tmp_path):
         qt_app.processEvents()
 
 
+def test_large_history_event_markers_are_added_in_gui_batches(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    events = [(float(index), f"实验事件 {index}") for index in range(512)]
+    timer_fired = Event()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        window._add_event_markers(events)
+
+        batch_size = gui_module.EVENT_MARKER_BATCH_SIZE
+        assert len(window._event_lines) == batch_size
+        assert window._event_marker_timer.isActive()
+        QTimer.singleShot(0, timer_fired.set)
+        QTest.qWait(1)
+        assert timer_fired.is_set(), "批量创建事件标记期间 Qt 事件循环应继续响应"
+        assert len(window._event_lines) < len(events)
+
+        deadline = time.monotonic() + 3.0
+        while window._event_marker_timer.isActive() and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert not window._event_marker_timer.isActive(), "事件标记批次未在限定时间内完成"
+        assert [line.value() for line in window._event_lines] == [elapsed for elapsed, _ in events]
+        assert [label.toPlainText() for label in window._event_labels] == [text for _, text in events]
+        assert window.event_list_widget.count() == len(events)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_clearing_large_event_marker_load_cancels_pending_events(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    first_events = [(float(index), f"旧事件 {index}") for index in range(512)]
+    replacement_events = [(float(index), f"新事件 {index}") for index in range(3)]
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._add_event_markers(first_events)
+        assert len(window._event_lines) == gui_module.EVENT_MARKER_BATCH_SIZE
+
+        window._clear_event_markers()
+        assert not window._event_marker_timer.isActive()
+        assert not window._pending_event_markers
+        QTest.qWait(5)
+        assert not window._event_lines
+        assert not window._event_labels
+        assert window.event_list_widget.count() == 0
+
+        window._add_event_markers(replacement_events)
+        assert [label.toPlainText() for label in window._event_labels] == [text for _, text in replacement_events]
+        assert not window._event_marker_timer.isActive()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_closing_window_stops_pending_event_marker_batches(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    events = [(float(index), f"实验事件 {index}") for index in range(512)]
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._add_event_markers(events)
+        assert window._event_marker_timer.isActive()
+        rendered_before_close = len(window._event_lines)
+
+        window.close()
+        QTest.qWait(5)
+
+        assert not window._event_marker_timer.isActive()
+        assert not window._pending_event_markers
+        assert not window._event_markers_loading
+        assert len(window._event_lines) == rendered_before_close
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_appending_events_while_large_marker_load_is_pending_keeps_both_batches(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    first_events = [(float(index), f"批次 A {index}") for index in range(512)]
+    second_events = [(512.0, "批次 B 1"), (513.0, "批次 B 2")]
+    expected = first_events + second_events
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._add_event_markers(first_events)
+        window._add_event_markers(second_events)
+
+        deadline = time.monotonic() + 3.0
+        while window._event_marker_timer.isActive() and time.monotonic() < deadline:
+            QTest.qWait(5)
+
+        assert not window._event_marker_timer.isActive(), "事件标记批次未在限定时间内完成"
+        assert [line.value() for line in window._event_lines] == [elapsed for elapsed, _ in expected]
+        assert [label.toPlainText() for label in window._event_labels] == [text for _, text in expected]
+        assert window.event_list_widget.count() == len(expected)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_sampling_interval_editor_emits_live_changes_and_maps_zero_to_fastest(
     qt_app, monkeypatch, tmp_path
 ):
@@ -3544,6 +5390,12 @@ def test_initialize_parameters_restores_mode_defaults_without_resetting_instrume
     window._baseline = 12.5
     window.baseline_line.show()
     try:
+        assert window.initialize_parameters_button.text() == "恢复默认设置"
+        reset_tooltip = window.initialize_parameters_button.toolTip()
+        assert "软件控件" in reset_tooltip
+        assert "应用仪器参数" in reset_tooltip
+        assert "串口设置和保存目录会保留" in reset_tooltip
+        assert "不会复位仪表" in reset_tooltip
         assert window.initialize_parameters_button.isEnabled()
         window.initialize_parameters_button.click()
 
@@ -3629,6 +5481,9 @@ def test_current_range_limit_is_visible_with_cause_and_next_step(
         assert not window.range_limit_hint.isHidden()
         assert cause in window.range_limit_hint.text()
         assert next_step in window.range_limit_hint.text()
+        if firmware == "1.9.0.0":
+            assert "DCI 的 400 mA 门槛由官方用户手册明确对应 OutG SW" in window.range_limit_hint.text()
+            assert "字段映射未获官方资料确认" not in window.range_limit_hint.text()
     finally:
         window.close()
         qt_app.processEvents()
@@ -3638,8 +5493,8 @@ def test_current_range_limit_is_visible_with_cause_and_next_step(
     ("firmware", "terminals", "disabled_ranges", "enabled_ranges", "cause", "next_step"),
     [
         (
-            "1.0.700.17", "FRONT", (0.4,), (0.1, 1.0),
-            "1.0.700.17", "OutG SW",
+            "1.0.700.17", "FRONT", (), (0.01, 0.1, 0.4, 1.0),
+            "1.0.700.18", "仪表面板核对软件版本",
         ),
         (
             "1.0.700.18", "REAR", (1.0, 3.0, 10.0), (0.4,),
@@ -3655,7 +5510,8 @@ def test_aci_current_range_limit_shows_cause_and_next_step(
     window = MainWindow()
     try:
         window._simulation = False
-        window._connected = False
+        window._connected = True
+        window._control_mode = "computer"
         window._device_serial = "ACI-RANGE-LIMIT-TEST"
         window._idn_version_candidate = ""
         window._terminals = terminals
@@ -3673,8 +5529,20 @@ def test_aci_current_range_limit_shows_cause_and_next_step(
         assert cause in window.range_limit_hint.text()
         assert next_step in window.range_limit_hint.text()
         if firmware == "1.0.700.17":
-            assert "ACI 要求 1.0.700.18" in window.range_limit_hint.text()
-            assert "不超过100 mA" in window.range_limit_hint.text()
+            assert window.autorange_check.isEnabled() is (terminals == "FRONT")
+            assert "官方资料未说明" in window.range_limit_hint.text()
+            assert "本软件不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档" in window.range_limit_hint.text()
+            range_index = window.range_combo.findData(0.4)
+            range_tip = window.range_combo.model().item(range_index).toolTip()
+            assert "未说明对应 OutG SW 还是 InG SW" in range_tip
+            assert "不会根据 OutG SW 或 InG SW 自动拒绝" in range_tip
+            assert "未说明对应 OutG SW 还是 InG SW" in window.autorange_check.toolTip()
+            assert "仪表面板核对软件版本" in window.autorange_check.toolTip()
+            assert "DCI 400 mA 门槛依据此处人工核对的 OutG SW" in window.outguard_sw_edit.toolTip()
+            assert "ACI 不根据 OutG SW 或 InG SW 自动拒绝" in window.outguard_sw_edit.toolTip()
+            assert "DCI 固件门槛不依据 InG SW" in window.inguard_sw_edit.toolTip()
+            assert "ACI 不根据 OutG SW 或 InG SW 自动拒绝" in window.inguard_sw_edit.toolTip()
+            assert "ACI 不根据 OutG SW 或 InG SW 自动拒绝" in window.idn_label.toolTip()
         for value in disabled_ranges:
             index = window.range_combo.findData(value)
             assert index >= 0
@@ -3782,11 +5650,12 @@ def test_gui_exposes_only_parameters_supported_by_selected_mode(qt_app, monkeypa
         assert window.analog_filter_check.isHidden() is (not spec.analog_filter)
         assert window.digital_filter_check.isHidden() is (not spec.digital_filter)
         if spec.digital_filter:
-            assert not window.digital_filter_check.isEnabled()
-            assert digital_filter_enable_error(mode) in window.digital_filter_check.toolTip()
             window.nplc_combo.setCurrentIndex(window.nplc_combo.findData(10))
-            assert not window.digital_filter_check.isEnabled()
-            assert window._settings_for_mode(mode).digital_filter is False
+            window._update_digital_filter_availability()
+            assert window.digital_filter_check.isEnabled()
+            assert "平均数量随功能和量程变化" in window.digital_filter_check.toolTip()
+            window.digital_filter_check.setChecked(True)
+            assert window._settings_for_mode(mode).digital_filter is True
     finally:
         window.close()
         qt_app.processEvents()
@@ -3801,6 +5670,7 @@ def test_unverified_or_old_firmware_does_not_block_slow_nplc(
     try:
         window._connected = True
         window._simulation = False
+        window._control_mode = "computer"
         window._firmware = firmware
         window._current_mode = Mode.DCV
         window._profiles[Mode.DCV.value]["nplc"] = 10
@@ -3811,9 +5681,12 @@ def test_unverified_or_old_firmware_does_not_block_slow_nplc(
         assert slow_index >= 0
         assert window.nplc_combo.currentData() == 10
         assert window.nplc_combo.model().item(slow_index).isEnabled()
-        assert not window.digital_filter_check.isEnabled()
-        assert "OutG SW 早于 2.0 不支持该功能" in window.digital_filter_check.toolTip()
-        assert "跳过数字滤波命令和回读" in window.digital_filter_check.toolTip()
+        if firmware:
+            assert not window.digital_filter_check.isEnabled()
+            assert "OutG SW 早于 2.0 不支持该功能" in window.digital_filter_check.toolTip()
+        else:
+            assert window.digital_filter_check.isEnabled()
+            assert "未知固件将尝试设置并回读" in window.digital_filter_check.toolTip()
     finally:
         window._connected = False
         window.close()
@@ -4002,7 +5875,7 @@ def test_speed_and_interval_controls_remain_readable_at_minimum_window_size(
         for control in (window.nplc_combo, window.apply_speed_button):
             assert control.height() >= control.sizeHint().height()
             assert control.isVisible()
-        window._show_setup_section(2)
+        window._show_setup_section(1)
         qt_app.processEvents()
         assert window.interval_spin.height() >= window.interval_spin.sizeHint().height()
         assert window.interval_spin.isVisible()
@@ -4015,18 +5888,41 @@ def test_speed_and_interval_controls_remain_readable_at_minimum_window_size(
 @pytest.mark.parametrize(
     ("modifiers", "expected"),
     [
-        (gui_module.Qt.KeyboardModifier.NoModifier, (False, True)),
+        (gui_module.Qt.KeyboardModifier.NoModifier, (True, True)),
         (gui_module.Qt.KeyboardModifier.ShiftModifier, (True, False)),
-        (gui_module.Qt.KeyboardModifier.ControlModifier, (True, True)),
-        (gui_module.Qt.KeyboardModifier.AltModifier, (False, True)),
-        (gui_module.Qt.KeyboardModifier.AltModifier | gui_module.Qt.KeyboardModifier.ShiftModifier, (False, True)),
+        (gui_module.Qt.KeyboardModifier.ControlModifier, (False, True)),
+        (gui_module.Qt.KeyboardModifier.AltModifier, (True, True)),
+        (gui_module.Qt.KeyboardModifier.AltModifier | gui_module.Qt.KeyboardModifier.ShiftModifier, (True, False)),
     ],
 )
 def test_wheel_zoom_modifier_mapping(modifiers, expected):
     assert gui_module._wheel_zoom_axes(modifiers) == expected
 
 
-def test_plain_wheel_forwarded_from_time_axis_still_zooms_vertical_axis(qt_app, monkeypatch, tmp_path):
+def test_double_clicking_plot_resets_manual_view_to_all_data(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "double-click-autoscale-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend((10.0, 20.0, 30.0))
+        window._refresh_curve()
+        window.view_box.setRange(xRange=(100.0, 200.0), yRange=(100.0, 200.0), padding=0)
+        window.follow_check.setChecked(False)
+        qt_app.processEvents()
+
+        QTest.mouseDClick(window.plot_widget.viewport(), Qt.MouseButton.LeftButton, pos=window.plot_widget.viewport().rect().center())
+        qt_app.processEvents()
+
+        x_range, y_range = window.view_box.viewRange()
+        assert x_range[0] < 0.0 and x_range[1] > 2.0
+        assert y_range[0] < 10.0 and y_range[1] > 30.0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_plain_wheel_forwarded_from_time_axis_zooms_both_axes(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
@@ -4047,13 +5943,13 @@ def test_plain_wheel_forwarded_from_time_axis_still_zooms_vertical_axis(qt_app, 
             ignore=lambda: None,
         )
 
-        # PyQtGraph forwards events over the bottom axis with axis=0. The
-        # unmodified wheel is the user's default Y-axis zoom everywhere in the chart.
+        # PyQtGraph forwards bottom-axis events with axis=0. Plain wheel zooms
+        # both axes even when the pointer is over tick labels.
         window.view_box.wheelEvent(wheel_event, axis=0)
 
         actual_x = tuple(window.view_box.viewRange()[0])
         actual_y = tuple(window.view_box.viewRange()[1])
-        assert actual_x == pytest.approx(initial_x)
+        assert 0 < actual_x[1] - actual_x[0] < initial_x[1] - initial_x[0]
         assert 0 < actual_y[1] - actual_y[0] < initial_y[1] - initial_y[0]
     finally:
         window.close()
@@ -4125,6 +6021,7 @@ def test_disabled_pause_and_stop_buttons_explain_the_required_state(qt_app, monk
         assert window.stop_button.isEnabled()
         assert "停止当前采集" in window.stop_button.toolTip()
 
+        window._on_acquisition_state_changed("running", True)
         window._on_status("单次测量中")
         assert not window.pause_button.isEnabled()
         assert "单次测量不支持暂停" in window.pause_button.toolTip()
@@ -4344,6 +6241,50 @@ def test_mode_wiring_schematic_renders_for_every_measurement_mode(qt_app, mode):
     widget.close()
 
 
+@pytest.mark.parametrize("mode", list(Mode))
+def test_start_confirmation_shows_matching_schematic_and_mode_safety_text(
+    qt_app, monkeypatch, tmp_path, mode,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    dialogs = []
+
+    def show_and_cancel(dialog):
+        dialogs.append(dialog)
+        dialog.show()
+        qt_app.processEvents()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(gui_module.WiringConfirmationDialog, "exec", show_and_cancel)
+    try:
+        window.show()
+        window._connected = True
+        window._instrument_mode_known = True
+        window._current_mode = mode
+        combo_signals_blocked = window.mode_combo.blockSignals(True)
+        window.mode_combo.setCurrentIndex(window.mode_combo.findData(mode.value))
+        window.mode_combo.blockSignals(combo_signals_blocked)
+        window._load_mode_controls(mode)
+        window.experiment_name.setText(f"{mode.value} 接线确认")
+
+        window._start_single()
+
+        assert len(dialogs) == 1
+        dialog = dialogs[0]
+        spec = DESCRIPTORS[mode]
+        assert dialog.schematic.mode is mode
+        assert dialog.schematic.isVisible()
+        assert dialog.instructions_label.isVisible()
+        assert spec.safety in dialog.instructions_label.text()
+        if spec.safety_limits:
+            assert spec.safety_limits in dialog.instructions_label.text()
+    finally:
+        for dialog in dialogs:
+            dialog.close()
+        window.close()
+        qt_app.processEvents()
+
+
 @pytest.mark.parametrize(("current_range_si", "autorange", "expected_terminal"), [
     (0.4, False, "mA/400 mA"),
     (1.0, False, "10 A"),
@@ -4531,6 +6472,75 @@ def test_history_csv_scan_runs_off_gui_thread_while_event_loop_stays_responsive(
         assert window.single_button.isEnabled()
         assert window._history_mode
         assert window._last_value == 1.25
+    finally:
+        release_parser.set()
+        window.close()
+        qt_app.processEvents()
+
+
+def test_history_load_ignores_second_request_while_first_is_pending(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    source = tmp_path / "history.csv"
+    source.write_text(
+        "experiment_id,sample_index,elapsed_s,mode,unit_si,value_si,status,error\n"
+        "exp-1,1,0,DCV,V,1.25,ok,\n",
+        encoding="utf-8",
+    )
+    dialog_calls = []
+
+    def choose_history_file(*_args):
+        dialog_calls.append(True)
+        return str(source), "CSV"
+
+    monkeypatch.setattr(gui_module.QFileDialog, "getOpenFileName", choose_history_file)
+    original_loader = gui_module.load_history_csv
+    parser_started = Event()
+    release_parser = Event()
+    parser_calls = []
+
+    def delayed_loader(*args, **kwargs):
+        parser_calls.append(True)
+        parser_started.set()
+        if not release_parser.wait(5):
+            raise TimeoutError("测试未及时释放历史 CSV 解析任务")
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(gui_module, "load_history_csv", delayed_loader)
+    monkeypatch.setattr(
+        gui_module.QMessageBox, "information",
+        lambda *_args: gui_module.QMessageBox.StandardButton.Ok,
+    )
+    window = MainWindow()
+    errors = []
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    try:
+        window.show()
+        window._connected = True
+        window._simulation = True
+        window._update_controls()
+        window._load_history()
+        assert window._history_load_pending
+        first_task = window._history_load_task
+
+        deadline = time.monotonic() + 2
+        while not parser_started.is_set() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.005)
+        assert parser_started.is_set(), "首个历史 CSV 解析任务没有启动"
+
+        window._load_history()
+        assert dialog_calls == [True], "加载期间不应再次打开文件选择框"
+        assert window._history_load_task is first_task
+        assert len(parser_calls) == 1, "加载期间重复触发不应启动第二个解析任务"
+
+        release_parser.set()
+        _wait_history_load(window)
+        assert not window._history_load_pending
+        assert window._history_mode
+        assert window._last_value == 1.25
+        assert not errors, errors
     finally:
         release_parser.set()
         window.close()
@@ -5007,6 +7017,7 @@ def test_plot_keyboard_pan_preserves_tiny_vertical_scale(qt_app, monkeypatch, tm
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0, 30_000_000.0, 30_000_000.0))
@@ -5034,6 +7045,7 @@ def test_plot_wheel_zoom_can_narrow_high_magnitude_y_range_below_old_floor(qt_ap
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0, 30_000_000.0, 30_000_000.0))
@@ -5073,6 +7085,7 @@ def test_wheel_can_zoom_in_from_normal_autoscale_to_a_very_small_y_span(qt_app, 
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0, 30_000_000.0, 30_000_000.0))
@@ -5152,10 +7165,11 @@ def test_actual_qt_wheel_event_sent_to_plot_viewport_shrinks_y_axis(qt_app, monk
 @pytest.mark.parametrize(
     ("modifiers", "zoom_x", "zoom_y", "y_anchor"),
     [
-            (Qt.KeyboardModifier.NoModifier, False, True, "sample"),
+        (Qt.KeyboardModifier.NoModifier, True, True, "sample"),
         (Qt.KeyboardModifier.ShiftModifier, True, False, None),
-            (Qt.KeyboardModifier.ControlModifier, True, True, "sample"),
-        (Qt.KeyboardModifier.AltModifier, False, True, "zero"),
+        (Qt.KeyboardModifier.ControlModifier, False, True, "sample"),
+        (Qt.KeyboardModifier.AltModifier, True, True, "sample"),
+        (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier, True, False, None),
     ],
 )
 def test_qt_wheel_modifiers_change_expected_axes_and_preserve_y_anchor(
@@ -5181,8 +7195,6 @@ def test_qt_wheel_modifiers_change_expected_axes_and_preserve_y_anchor(
             pointer = window.view_box.mapSceneToView(QPointF(scene_position))
             anchor = window._plot_y_zoom_anchor_at_x(float(pointer.x()))
             anchor_value = anchor[0] if anchor is not None else None
-        elif y_anchor == "zero":
-            anchor_value = window.view_box.zero_y
         initial_y_fraction = None
         if anchor_value is not None:
             initial_y_fraction = (anchor_value - initial_y[0]) / (initial_y[1] - initial_y[0])
@@ -5258,6 +7270,8 @@ def test_live_wheel_zoom_stays_fixed_after_next_sample(qt_app, monkeypatch, tmp_
             {"valid_count": 4},
         )
         qt_app.processEvents()
+        assert window.return_live_button.isEnabled()
+        assert window.return_live_action.isEnabled()
 
         updated_range = window.view_box.viewRange()[1]
         assert tuple(updated_range) == pytest.approx(tuple(zoomed_range), rel=1e-9, abs=1e-12), (
@@ -5440,6 +7454,7 @@ def test_actual_qt_wheel_zoom_continues_after_scene_to_view_anchor_overflows(qt_
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0,) * 3)
@@ -5646,6 +7661,7 @@ def test_short_wheel_run_can_shrink_desktop_y_span_by_six_orders_of_magnitude(qt
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0,) * 3)
@@ -5689,6 +7705,7 @@ def test_actual_qt_wheel_zoom_reaches_tiny_span_for_small_changes_at_30_megohm_b
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         origin = 30_000_000.0
         one_ulp = math.ulp(origin)
         readings = (origin, origin + one_ulp, origin + 2 * one_ulp)
@@ -5826,6 +7843,7 @@ def test_wheel_keeps_one_ulp_curve_anchor_at_large_reading(qt_app, monkeypatch, 
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         origin = 30_000_000.0
         adjacent_reading = math.nextafter(origin, math.inf)
         relative_sample = adjacent_reading - origin
@@ -5885,6 +7903,45 @@ def test_curve_y_anchor_uses_nearest_sample_without_reordering_nonmonotonic_hist
         assert anchor == pytest.approx(3.0)
         assert list(window.curve.getData()[0]) == [0.0, 2.0, 1.0]
         assert list(window._plot_y) == [1.0, 2.0, 3.0]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_curve_cursor_nearest_point_handles_nonmonotonic_x_order(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._plot_x.extend((0.0, 2.0, 1.0))
+        window._plot_y.extend((10.0, 20.0, 30.0))
+        window._plot_y_origin = 0.0
+        window._refresh_curve()
+
+        assert window._nearest_plot_index(1.1) == 2
+        assert window._lock_plot_point_at(1.1)
+        assert window._selected_plot_point == (1.0, 30.0, 3)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_curve_cursor_and_zoom_anchor_choose_last_finite_duplicate_x(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._plot_x.extend((0.0, 1.0, 1.0, 2.0))
+        window._plot_y.extend((0.0, 10.0, 20.0, 2.0))
+        window._plot_y_origin = 0.0
+        window._refresh_curve()
+
+        assert window._nearest_plot_index(1.0) == 2
+        assert window._plot_y_zoom_anchor_at_x(1.0) == (20.0, 20.0)
+        assert window._lock_plot_point_at(1.0)
+        assert window._selected_plot_point == (1.0, 20.0, 3)
     finally:
         window.close()
         qt_app.processEvents()
@@ -6024,6 +8081,9 @@ def test_plot_hover_tooltip_explains_wheel_zoom_direction(qt_app, monkeypatch, t
         assert "鼠标横坐标附近的实测点为锚" in tooltip
         assert "Shift+滚轮缩放时间轴" in tooltip
         assert "向下放大" in tooltip
+        assert "−1000 至 +1000 V" in tooltip
+        assert "这只是图表显示边界，不是仪器量程或输入额定值" in tooltip
+        assert "750 V RMS、1000 V peak 或 8×10^7 V·Hz" in tooltip
     finally:
         window.close()
         qt_app.processEvents()
@@ -6091,6 +8151,7 @@ def test_manual_plot_y_span_bypasses_pyqtgraph_quantization_below_old_floor(qt_a
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0, 30_000_000.0, 30_000_000.0))
@@ -6206,10 +8267,115 @@ def test_time_axis_limits_prevent_panning_far_from_data(qt_app, monkeypatch, tmp
         qt_app.processEvents()
 
 
+@pytest.mark.parametrize("translation", [-1000.0, 1000.0])
+def test_horizontal_pan_keeps_curve_in_view_without_changing_zoom_span(
+    qt_app, monkeypatch, tmp_path, translation
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / f"horizontal-pan-{translation}-config"))
+    window = MainWindow()
+    try:
+        window._plot_x.extend((0.0, 10.0))
+        window._plot_y.extend((5.0, 15.0))
+        window._refresh_curve()
+        window._update_plot_data_limits()
+        window.view_box.setRange(xRange=(4.0, 6.0), padding=0)
+        before = window.view_box.viewRange()[0]
+        before_span = before[1] - before[0]
+
+        # Exercise compound translation; the integration test below covers the mouse path.
+        window.view_box.translateBy(t=(translation, 0.0))
+
+        after = window.view_box.viewRange()[0]
+        overlap = max(0.0, min(after[1], 10.0) - max(after[0], 0.0))
+        assert overlap >= before_span * 0.19, "horizontal panning should keep a visible portion of the data envelope"
+        assert after[1] - after[0] == pytest.approx(before_span, rel=1e-12), (
+            "limiting horizontal pan must preserve the user's zoom level"
+        )
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_repeated_keyboard_horizontal_pan_keeps_curve_in_view(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "keyboard-horizontal-pan-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        window._plot_x.extend((0.0, 10.0))
+        window._plot_y.extend((5.0, 15.0))
+        window._refresh_curve()
+        window._update_plot_data_limits()
+        window.view_box.setRange(xRange=(0.0, 10.0), padding=0)
+        before_x = window.view_box.viewRange()[0]
+        before_span = before_x[1] - before_x[0]
+        window.plot_widget.setFocus()
+        qt_app.processEvents()
+
+        for _ in range(200):
+            QTest.keyClick(window.plot_widget, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+
+        x_range = window.view_box.viewRange()[0]
+        assert not window.follow_check.isChecked()
+        overlap = max(0.0, min(x_range[1], 10.0) - max(x_range[0], 0.0))
+        assert overlap >= before_span * 0.19, (
+            "repeated Shift+Right must not pan the entire curve out of view"
+        )
+        assert overlap <= before_span * 0.21, "repeated Shift+Right should reach the data-visibility clamp"
+        assert x_range[0] > before_x[0], "Shift+Right should actually move the time axis"
+        assert x_range[1] - x_range[0] == pytest.approx(before_span, rel=1e-12)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_repeated_horizontal_mouse_drag_keeps_curve_in_view_without_changing_zoom(
+    qt_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "mouse-horizontal-pan-config"))
+    window = MainWindow()
+    try:
+        window.show()
+        window._plot_x.extend((0.0, 10.0))
+        window._plot_y.extend((5.0, 15.0))
+        window._refresh_curve()
+        window._update_plot_data_limits()
+        window.view_box.setRange(xRange=(0.0, 10.0), padding=0)
+        qt_app.processEvents()
+
+        viewport = window.plot_widget.viewport()
+        view_box = window.plot_widget.getPlotItem().vb
+        drag_distance = max(30, viewport.width() // 3)
+        before_x, before_y = view_box.viewRange()
+        before_span = before_x[1] - before_x[0]
+        for _ in range(30):
+            start = QPoint(viewport.rect().center())
+            end = start - QPoint(drag_distance, 0)
+            assert viewport.rect().contains(start)
+            assert viewport.rect().contains(end)
+            assert view_box.sceneBoundingRect().contains(window.plot_widget.mapToScene(start))
+            assert view_box.sceneBoundingRect().contains(window.plot_widget.mapToScene(end))
+            QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=start)
+            QTest.mouseMove(viewport, end, 1)
+            QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=end)
+            qt_app.processEvents()
+
+        after_x, after_y = view_box.viewRange()
+        overlap = max(0.0, min(after_x[1], 10.0) - max(after_x[0], 0.0))
+        assert overlap >= before_span * 0.19, "horizontal mouse drag should keep some measured data visible"
+        assert overlap <= before_span * 0.21, "repeated horizontal drag should reach the data-visibility clamp"
+        assert after_x[0] > before_x[0], "mouse drag should actually move the time axis"
+        assert after_x[1] - after_x[0] == pytest.approx(before_span, rel=1e-12)
+        assert after_y == pytest.approx(before_y, rel=1e-12), "horizontal drag must not change the vertical view"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_vertical_pan_keeps_curve_in_view_without_changing_zoom_span(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "vertical-pan-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0,) * 3)
         window._refresh_curve()
@@ -6236,6 +8402,7 @@ def test_repeated_keyboard_vertical_pan_cannot_leave_tiny_data_view(qt_app, monk
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "keyboard-vertical-pan-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0,) * 3)
@@ -6268,6 +8435,7 @@ def test_vertical_mouse_drag_keeps_curve_in_view_without_changing_zoom_span(
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "mouse-vertical-pan-config"))
     window = MainWindow()
     try:
+        window._current_mode = Mode.RES2
         window.show()
         window._plot_x.extend((0.0, 1.0, 2.0))
         window._plot_y.extend((30_000_000.0,) * 3)
@@ -6361,9 +8529,213 @@ def test_vertical_zoom_out_is_not_capped_at_data_scale_factor(qt_app, monkeypatc
         y_range = window.view_box.viewRange()[1]
         span = y_range[1] - y_range[0]
         assert all(math.isfinite(value) for value in y_range)
-        assert span > initial_span * 1e20, (
-            f"vertical zoom-out should continue far beyond the old 1e12 cap, got {span / initial_span:g}x"
+        origin = window._plot_y_origin or 0.0
+        assert span == pytest.approx(2000.0, rel=1e-10)
+        assert y_range[0] + origin == pytest.approx(-1000.0)
+        assert y_range[1] + origin == pytest.approx(1000.0)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("mode", "origin", "readings"),
+    [
+        (Mode.DCV, 997.0, (996.0, 997.0, 998.0)),
+        (Mode.ACV, 750.0, (740.0, 749.0, 750.0)),
+    ],
+)
+def test_voltage_plot_limits_are_absolute_plus_minus_1000_v_and_allow_zoom_in(
+    qt_app, monkeypatch, tmp_path, mode, origin, readings,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = mode
+        window._plot_y_origin = origin
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend(readings)
+        window._refresh_curve()
+        window._update_plot_data_limits()
+
+        lower, upper = window.view_box._effectiveLimits()[1]
+        assert lower + origin == pytest.approx(-1000.0)
+        assert upper + origin == pytest.approx(1000.0)
+
+        window._rebase_plot_y_origin(readings[-1] + 1.0)
+        lower, upper = window.view_box._effectiveLimits()[1]
+        assert lower == pytest.approx(-1000.0 - window._plot_y_origin)
+        assert upper == pytest.approx(1000.0 - window._plot_y_origin)
+        assert lower + window._plot_y_origin == pytest.approx(-1000.0)
+        assert upper + window._plot_y_origin == pytest.approx(1000.0)
+
+        window.view_box.setRange(yRange=(-0.5, 0.5), padding=0)
+        window.view_box._scale_y_by(0.1, 0.0)
+        zoomed = window.view_box.viewRange()[1]
+        assert zoomed[1] - zoomed[0] == pytest.approx(0.1)
+        assert zoomed[0] >= lower and zoomed[1] <= upper
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("mode", "readings"),
+    [
+        (Mode.DCV, (-1000.0, 0.0, 1000.0)),
+        (Mode.DCV, (998.8, 999.0, 999.2)),
+        (Mode.DCV, (-999.2, -999.0, -998.8)),
+        (Mode.ACV, (748.8, 749.0, 749.2)),
+    ],
+)
+def test_voltage_qt_wheel_zoom_reaches_narrow_span_within_absolute_view_limits(
+    qt_app, monkeypatch, tmp_path, mode, readings,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = mode
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend(readings)
+        window._plot_y_origin = readings[0]
+        window._refresh_curve()
+        window._autoscale_plot()
+        window.show()
+        qt_app.processEvents()
+
+        initial_y_range = tuple(window.view_box.viewRange()[1])
+        initial_span = initial_y_range[1] - initial_y_range[0]
+        assert initial_span > 0
+
+        viewport = window.plot_widget.viewport()
+        scene_position = window.view_box.mapViewToScene(QPointF(1.0, 0.0))
+        position = window.plot_widget.mapFromScene(scene_position)
+        for _ in range(32):
+            event = QWheelEvent(
+                QPointF(position),
+                QPointF(viewport.mapToGlobal(position)),
+                QPoint(0, 0),
+                QPoint(0, 120),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.ScrollUpdate,
+                False,
+            )
+            QApplication.sendEvent(viewport, event)
+        qt_app.processEvents()
+
+        y_range = tuple(window.view_box.viewRange()[1])
+        span = y_range[1] - y_range[0]
+        origin = window._plot_y_origin or 0.0
+        absolute_low = y_range[0] + origin
+        absolute_high = y_range[1] + origin
+        anchor = readings[1] - origin
+
+        assert math.isfinite(span) and 0 < span < initial_span * 1e-9, (
+            f"plain Qt wheel zoom should narrow voltage span by at least nine orders; "
+            f"mode={mode.value}, {initial_span:.17g} → {span:.17g} V"
         )
+        assert -1000.0 <= absolute_low <= absolute_high <= 1000.0
+        assert y_range[0] <= anchor <= y_range[1], "the sample under the pointer must remain visible"
+        assert tuple(window._plot_y) == readings, "zoom must not modify raw readings"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("mode", "readings"),
+    [
+        (Mode.DCV, (-1000.0, 0.0, 1000.0)),
+        (Mode.ACV, (0.0, 375.0, 750.0)),
+    ],
+)
+def test_voltage_autoscale_keeps_full_scale_readings_visible_within_view_limit(
+    qt_app, monkeypatch, tmp_path, mode, readings,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = mode
+        window._plot_y_origin = 0.0
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend(readings)
+        window._refresh_curve()
+        window._autoscale_plot()
+
+        low, high = window.view_box.viewRange()[1]
+        assert low >= -1000.0
+        assert high <= 1000.0
+        assert all(low <= value <= high for value in readings)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_voltage_plot_view_clips_outside_samples_without_changing_them(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        raw_values = (-1001.0, 0.0, 1001.0)
+        window._current_mode = Mode.DCV
+        window._plot_y_origin = 0.0
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend(raw_values)
+        window._refresh_curve()
+        window._autoscale_plot()
+
+        low, high = window.view_box.viewRange()[1]
+        assert low >= -1000.0 and high <= 1000.0
+        assert list(window._plot_y) == list(raw_values)
+        rendered = list(window.curve.getData()[1])
+        assert math.isnan(float(rendered[0]))
+        assert float(rendered[1]) == pytest.approx(0.0)
+        assert math.isnan(float(rendered[2]))
+        assert not window.voltage_range_warning.isHidden()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize("mode", [Mode.DCI, Mode.ACI, Mode.RES2, Mode.RES4])
+def test_non_voltage_plot_view_limits_are_not_capped_at_1000(
+    qt_app, monkeypatch, tmp_path, mode,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = mode
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend((1.0, 1.0, 1.0))
+        window._refresh_curve()
+        window._update_plot_data_limits()
+
+        lower, upper = window.view_box._effectiveLimits()[1]
+        assert lower < -1000.0
+        assert upper > 1000.0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_resistance_plot_can_zoom_out_far_beyond_data_scale(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "resistance-zoom-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = Mode.RES2
+        window._plot_x.extend((0.0, 1.0, 2.0))
+        window._plot_y.extend((30_000_000.0,) * 3)
+        window._refresh_curve()
+        window._autoscale_plot()
+        initial = window.view_box.viewRange()[1]
+        initial_span = initial[1] - initial[0]
+
+        for _ in range(250):
+            window._zoom_plot(1.25, zoom_x=False, zoom_y=True)
+
+        actual = window.view_box.viewRange()[1]
+        assert all(math.isfinite(value) for value in actual)
+        assert actual[1] - actual[0] > initial_span * 1e20
     finally:
         window.close()
         qt_app.processEvents()
@@ -6404,6 +8776,64 @@ def test_extreme_vertical_axis_labels_do_not_overflow_absolute_offset(qt_app):
     assert len(labels) == 1
     assert labels[0].lower() not in {"inf", "nan"}
     assert "e+308" in labels[0]
+
+
+@pytest.mark.parametrize("mode", [Mode.DCV, Mode.ACV])
+def test_unrepresentable_voltage_view_interval_keeps_absolute_limits(mode):
+    lower, upper = gui_module._mode_plot_y_view_limits(mode, 1e300, -1.0, 1.0)
+
+    assert (lower, upper) == (-1000.0, 1000.0)
+
+
+@pytest.mark.parametrize(
+    ("raw_readings", "expected_origin", "expected_rendered"),
+    [
+        ([1e300, 25.0, 1001.0], 25.0, [math.nan, 0.0, math.nan]),
+        ([1e300, -1001.0], 0.0, [math.nan, math.nan]),
+    ],
+)
+@pytest.mark.parametrize("mode", [Mode.DCV, Mode.ACV])
+def test_voltage_plot_hides_out_of_range_points_without_changing_raw_cache(
+    qt_app, monkeypatch, tmp_path, mode, raw_readings, expected_origin, expected_rendered,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._current_mode = mode
+        window._plot_x.extend(float(index) for index in range(len(raw_readings)))
+        window._plot_y.extend(raw_readings)
+        window._plot_y_origin = raw_readings[0]
+
+        window._refresh_curve()
+        window._update_plot_data_limits()
+
+        origin = window._plot_y_origin
+        lower, upper = window.view_box._effectiveLimits()[1]
+        _x_values, rendered = window.curve.getData()
+
+        assert origin == expected_origin
+        assert (lower + origin, upper + origin) == pytest.approx((-1000.0, 1000.0))
+        assert len(rendered) == len(expected_rendered)
+        for actual, expected in zip(rendered, expected_rendered):
+            if math.isnan(expected):
+                assert math.isnan(float(actual))
+            else:
+                assert float(actual) == pytest.approx(expected)
+        anchor = window._plot_y_zoom_anchor_at_x(0.0)
+        if expected_origin == 25.0:
+            assert anchor == pytest.approx((0.0, 25.0))
+        else:
+            assert anchor is None
+        assert list(window._plot_y) == raw_readings
+        assert not window.voltage_range_warning.isHidden()
+
+        window._autoscale_plot()
+        absolute_view = tuple(value + expected_origin for value in window.view_box.viewRange()[1])
+        assert absolute_view[0] >= -1000.0
+        assert absolute_view[1] <= 1000.0
+    finally:
+        window.close()
+        qt_app.processEvents()
 
 
 def test_full_data_autoscale_and_return_to_live_window_are_distinct(qt_app, monkeypatch, tmp_path):
@@ -6499,7 +8929,8 @@ def test_event_editor_prominently_warns_about_spreadsheet_formula_text(qt_app, m
     window = MainWindow()
     try:
         window._navigate_workspace("analysis")
-        window.analysis_tabs.setCurrentIndex(2)
+        window.analysis_tabs.setCurrentWidget(window.analysis_overview_tab)
+        window.analysis_overview_scroll_area.ensureWidgetVisible(window.event_csv_safety_warning)
         qt_app.processEvents()
         assert window.event_csv_safety_warning.isVisible()
         warning = window.event_csv_safety_warning.text()
@@ -6537,7 +8968,11 @@ def test_history_source_label_and_return_live_restore_cached_curve(qt_app, monke
         _wait_history_load(window)
 
         assert window.chart_source_label.text() == "历史：published_history.csv"
-        assert window.return_live_button.isVisible() and window.return_live_button.isEnabled()
+        assert window.return_live_button.isEnabled()
+        assert window.return_live_action.isEnabled()
+        window._navigate_workspace("chart")
+        qt_app.processEvents()
+        assert window.return_live_button.isVisible()
         history_x, history_y = window.curve.getOriginalDataset()
         assert list(history_x) == [2.0, 3.0]
         assert list(history_y) == [0.0, 1.0]
@@ -6551,7 +8986,7 @@ def test_history_source_label_and_return_live_restore_cached_curve(qt_app, monke
             position_labels(*args)
 
         monkeypatch.setattr(window, "_position_event_labels", count_position_calls)
-        window.return_live_button.click()
+        window.return_live_action.trigger()
         live_x, live_y = window.curve.getData()
         assert window.chart_source_label.text() == "实时数据"
         assert window.view_mode_label.text() != "历史文件视图"
@@ -6562,6 +8997,10 @@ def test_history_source_label_and_return_live_restore_cached_curve(qt_app, monke
         assert [line.value() for line in window._event_lines] == [elapsed for elapsed, _ in live_events]
         assert [label.toPlainText() for label in window._event_labels] == [text for _, text in live_events]
         assert window.event_list_widget.count() == len(live_events)
+        assert window.return_live_action.isEnabled() == window.return_live_button.isEnabled()
+        window._clear_plot()
+        assert not window.return_live_action.isEnabled()
+        assert not window.return_live_button.isEnabled()
     finally:
         window.close()
         qt_app.processEvents()
@@ -6681,11 +9120,14 @@ def test_communication_failure_stops_gui_state_and_explains_new_segment_recovery
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
-        window._acquiring = True
-        window._experiment_active = True
-        window._on_status("串口通信异常，连接已关闭；请重新连接后开始新实验/分段")
+        window._on_acquisition_state_changed("running", False)
+        window._on_acquisition_state_changed("stopped", False)
 
         assert not window._acquiring
+        assert window._experiment_active  # Keep experiment actions locked while files finalize.
+        window._on_experiment_finished(str(tmp_path))
+        window._on_status("串口通信异常，连接已关闭；请重新连接后开始新实验/分段")
+
         assert not window._experiment_active
         assert "\u4e0d\u4f1a\u81ea\u52a8\u91cd\u8bd5" in window.recovery_hint_label.text()
         assert "\u65b0\u5b9e\u9a8c" in window.recovery_hint_label.text()
@@ -6721,6 +9163,49 @@ def test_recent_experiment_directory_can_be_opened_and_copied(qt_app, monkeypatc
         qt_app.processEvents()
 
 
+@pytest.mark.parametrize(
+    ("notice_exists", "expected_text"),
+    [
+        (False, "CSV 安全说明未生成"),
+        (True, "CSV_打开说明.txt"),
+    ],
+)
+def test_recent_experiment_summary_reports_csv_notice_presence(
+    qt_app, monkeypatch, tmp_path, notice_exists, expected_text,
+):
+    directory = tmp_path / "experiment-run"
+    directory.mkdir()
+    if notice_exists:
+        (directory / "CSV_打开说明.txt").write_text("CSV safety note", encoding="utf-8")
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        window._experiment_csv_path = directory / "measurements.csv"
+        window._update_controls()
+        summary = window.recent_experiment_files_label.text()
+        assert expected_text in summary
+        if not notice_exists:
+            assert "events_excel_safe.csv" in summary
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_recent_experiment_placeholder_describes_csv_notice_as_best_effort(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    window = MainWindow()
+    try:
+        summary = window.recent_experiment_files_label.text()
+        assert "尚无实验数据" in summary
+        assert "尝试生成 CSV_打开说明.txt" in summary
+        assert "events_excel_safe.csv" not in summary
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_safe_events_export_is_available_only_for_a_saved_run(qt_app, tmp_path):
     directory = tmp_path / "experiment-run"
     directory.mkdir()
@@ -6730,11 +9215,105 @@ def test_safe_events_export_is_available_only_for_a_saved_run(qt_app, tmp_path):
         window._experiment_active = False
         window._update_controls()
         assert window.export_events_safe_button.isEnabled()
-        assert "原始 events.csv 保持不变" in window.export_events_safe_button.toolTip()
+        assert "events.csv" in window.export_events_safe_button.toolTip()
+        assert "原始文件保持不变" in window.export_events_safe_button.toolTip()
         window._experiment_active = True
         window._update_experiment_directory_controls()
         assert not window.export_events_safe_button.isEnabled()
     finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_safe_events_export_start_locks_both_buttons_and_rejects_duplicate_start(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    directory = tmp_path / "experiment-run"
+    directory.mkdir()
+    (directory / "measurements.csv").write_text("sample_index,value_si\n1,1\n", encoding="utf-8")
+    (directory / "events.csv").write_text("event_index,event\n1,connected\n", encoding="utf-8")
+    destination = tmp_path / "events_excel_safe.csv"
+    dialog_calls = []
+    monkeypatch.setattr(
+        gui_module.QFileDialog, "getSaveFileName",
+        lambda *_args: (dialog_calls.append(True) or str(destination), "CSV (*.csv)"),
+    )
+    window = MainWindow()
+    started_tasks = []
+
+    class RecordingPool:
+        def start(self, task):
+            started_tasks.append(task)
+
+    try:
+        window._experiment_csv_path = directory / "measurements.csv"
+        window._experiment_active = False
+        window._update_controls()
+        window._refresh_file_workspace()
+        monkeypatch.setattr(
+            gui_module, "QThreadPool",
+            SimpleNamespace(globalInstance=lambda: RecordingPool()),
+        )
+
+        window._export_safe_events_csv()
+
+        assert len(started_tasks) == 1
+        assert window._safe_events_export_task is started_tasks[0]
+        assert not window.export_events_safe_button.isEnabled()
+        assert not window.files_safe_events_button.isEnabled()
+        assert "正在后台" in window.files_safe_events_button.toolTip()
+
+        window._export_safe_events_csv()
+
+        assert len(dialog_calls) == 1, "duplicate start must be rejected before opening another save dialog"
+        assert len(started_tasks) == 1, "only one events export task may be tracked at a time"
+    finally:
+        window._safe_events_export_task = None
+        window.close()
+        qt_app.processEvents()
+
+
+def test_safe_events_export_pool_start_failure_clears_task_and_restores_buttons(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
+    directory = tmp_path / "experiment-run"
+    directory.mkdir()
+    (directory / "measurements.csv").write_text("sample_index,value_si\n1,1\n", encoding="utf-8")
+    (directory / "events.csv").write_text("event_index,event\n1,connected\n", encoding="utf-8")
+    destination = tmp_path / "events_excel_safe.csv"
+    monkeypatch.setattr(
+        gui_module.QFileDialog, "getSaveFileName",
+        lambda *_args: (str(destination), "CSV (*.csv)"),
+    )
+    window = MainWindow()
+    errors = []
+
+    class BrokenPool:
+        def start(self, _task):
+            raise RuntimeError("thread pool unavailable")
+
+    try:
+        window._experiment_csv_path = directory / "measurements.csv"
+        window._experiment_active = False
+        window._update_controls()
+        window._refresh_file_workspace()
+        window._show_error = errors.append
+        monkeypatch.setattr(
+            gui_module, "QThreadPool",
+            SimpleNamespace(globalInstance=lambda: BrokenPool()),
+        )
+
+        window._export_safe_events_csv()
+
+        assert window._safe_events_export_task is None
+        assert window.export_events_safe_button.isEnabled()
+        assert window.files_safe_events_button.isEnabled()
+        assert "正在后台" not in window.files_safe_events_button.toolTip()
+        assert errors and "thread pool unavailable" in errors[0]
+    finally:
+        window._safe_events_export_task = None
         window.close()
         qt_app.processEvents()
 
@@ -7179,6 +9758,36 @@ def test_apply_settings_summarizes_known_range_firmware_and_terminal_conflicts(
         window._apply_settings()
         assert warnings and "400 mA" in warnings[0][2] and "1 A" in warnings[0][2]
         assert configure_calls == []
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_aci_fixed_400ma_apply_is_not_blocked_by_unmapped_outguard_version(
+    qt_app, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "aci-apply-conflict-config"))
+    window = MainWindow()
+    try:
+        window._simulation = False
+        window._firmware = "1.0.700.17"
+        window._terminals = "FRONT"
+        conflicts = window._settings_conflicts(
+            ModeSettings(Mode.ACI, autorange=False, range_si=0.4, ac_bandwidth_hz=20)
+        )
+
+        assert conflicts == []
+
+        window._terminals = "REAR"
+        assert window._settings_conflicts(
+            ModeSettings(Mode.ACI, autorange=False, range_si=0.4, ac_bandwidth_hz=20)
+        ) == []
+        rear_autorange_conflicts = window._settings_conflicts(
+            ModeSettings(Mode.ACI, autorange=True, ac_bandwidth_hz=20)
+        )
+        assert rear_autorange_conflicts
+        assert all("固件" not in conflict for conflict in rear_autorange_conflicts)
+        assert any("前面板" in conflict for conflict in rear_autorange_conflicts)
     finally:
         window.close()
         qt_app.processEvents()

@@ -21,6 +21,7 @@ SHARDS = {
     "runtime": (
         "tests/test_app.py",
         "tests/test_scpi.py",
+        "tests/test_hardware_validation_script.py",
         "tests/test_webapp.py",
         "tests/test_web_chart_history.py",
         "tests/test_web_share_export_endpoint.py",
@@ -28,6 +29,7 @@ SHARDS = {
     ),
     "release": (
         "tests/test_build_identity.py",
+        "tests/test_build_environment.py",
         "tests/test_build_provenance.py",
         "tests/test_hardware_probe_manifest.py",
         "tests/test_latest_verified_launcher.py",
@@ -43,6 +45,7 @@ SHARDS = {
         "tests/test_filter_policy.py",
         "tests/test_mock.py",
         "tests/test_modes.py",
+        "tests/test_path_security.py",
         "tests/test_plot_history.py",
         "tests/test_state.py",
         "tests/test_storage.py",
@@ -142,8 +145,9 @@ def run_shards(
             stdout_stream = (shard_directory / "stdout.log").open("wb")
             stderr_stream = (shard_directory / "stderr.log").open("wb")
             command = [
-                str(Path(python).resolve()), "-m", "pytest", "-p", "no:cacheprovider",
+                str(Path(python).resolve()), "-m", "pytest",
                 "--maxfail=1", "--basetemp", str(shard_directory / "temp"),
+                "-o", f"cache_dir={shard_directory / 'cache'}",
                 *modules,
             ]
             try:

@@ -4,7 +4,7 @@
     "manufacturer": "MOCK FLUKE",
     "model": "8845A-MOCK",
     "serial_number": "SIM-0001",
-    "firmware": "MOCK",
+    "firmware": "",
     "idn_raw": "MOCK,8845A-MOCK,SIM-0001,MOCK"
   },
   "connection": {
@@ -28,15 +28,19 @@
   "actual_device_configuration": {
     "function": "VOLT:DC",
     "range_response": "AUTO",
+    "range_readback_si": 10,
     "autorange_response": "True",
     "nplc_response": "1",
     "ac_bandwidth_response": null,
     "analog_filter_response": "False",
+    "digital_filter_response": "False",
+    "input_impedance_auto_response": "False",
     "autozero_response": "True",
     "input_terminals": "FRONT (simulated)"
   },
   "example_data_notice": "仅用于演示软件界面和分析，不是8845A实测数据。",
-  "software_version": "1.0.0",
+  "experiment_id": "41e782a7934740c8a661e72ed344e725",
+  "software_version": "1.1.0",
   "mode": "DCV",
   "mode_label": "直流电压 DCV",
   "quantity": "voltage",
@@ -48,11 +52,14 @@
     "nplc": 1,
     "ac_bandwidth_hz": null,
     "analog_filter": false,
-    "autozero": true
+    "digital_filter": false,
+    "autozero": true,
+    "input_impedance_auto": false
   },
-  "created_utc": "2026-10-12T08:35:30.483585+00:00",
+  "created_utc": "2026-10-21T14:27:54.879545+00:00",
   "sample_count": 30,
   "event_count": 4,
+  "experiment_name_lock_protocol": 1,
   "completion_status": "demo_complete",
-  "finished_utc": "2026-10-12T08:35:30.912261+00:00"
+  "finished_utc": "2026-10-21T14:27:55.209536+00:00"
 }

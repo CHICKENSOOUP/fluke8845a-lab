@@ -7,7 +7,9 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import math
+import os
 import re
 import shutil
 import socket
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from pathlib import Path, PurePosixPath
@@ -61,6 +64,7 @@ REQUIRED_ENTRIES = {
     "docs/user-guide.md",
     "docs/hardware-validation.md",
     "docs/qt-licensing-and-third-party-notices.md",
+    "docs/licenses/GPL-3.0.txt",
     "docs/licenses/LGPL-3.0.txt",
     "docs/licenses/windows-portable-review-2026-10-15.md",
     "docs/licenses/windows-portable-review-2026-10-20.md",
@@ -73,6 +77,7 @@ REQUIRED_ENTRIES = {
     "docs/licenses/third-party/pyqtgraph/LICENSE.txt",
     "docs/licenses/third-party/pyqtgraph/CET-color-map-CC-BY.txt",
     "docs/licenses/third-party/pyserial/LICENSE.txt",
+    "docs/licenses/third-party/qt-for-python/GPL-3.0.txt",
     "docs/licenses/third-party/openssl/Apache-2.0.txt",
     "docs/licenses/third-party/nuitka-runtime/LICENSE.txt",
     "docs/licenses/third-party/nuitka-runtime/LICENSE-RUNTIME.txt",
@@ -80,6 +85,13 @@ REQUIRED_ENTRIES = {
     "assets/fluke8845a_app_icon_v3.png",
     MOCK_E2E_REPORT,
 }
+MOCK_EXAMPLE_MODES = ("ACI", "ACV", "DCI", "DCV", "RES2", "RES4")
+MOCK_EXAMPLE_FILES = ("config.json", "events.csv", "measurements.csv", "run.log", "CSV_打开说明.txt")
+REQUIRED_ENTRIES.update(
+    f"examples/mock_experiments/{mode}/{filename}"
+    for mode in MOCK_EXAMPLE_MODES
+    for filename in MOCK_EXAMPLE_FILES
+)
 EXCLUDED_PATH_PARTS = {
     ".git",
     ".pytest_cache",
@@ -267,6 +279,7 @@ def validate_runtime_license_manifest(
         planned_license = str(component.get("planned_license_path", ""))
         expected_files = {
             f"third-party/{name.casefold()}/LicenseRef-Qt-Commercial.txt",
+            "third-party/qt-for-python/GPL-3.0.txt",
             "third-party/qt-for-python/LGPL-3.0.txt",
         }
         component_files = component.get("license_files")
@@ -416,8 +429,8 @@ def verify_extracted_portable_release(
     archive_path: Path,
     executable_sha256: str,
     expected_source_tree_sha256: str,
-) -> None:
-    """Run serial enumeration and six-mode Mock acquisition from an extracted ZIP."""
+) -> dict:
+    """Run extracted-package checks and return a compact, serializable receipt."""
     with tempfile.TemporaryDirectory(prefix="fluke8845a-portable-smoke-") as temporary:
         temporary_root = Path(temporary)
         release_root = temporary_root / "release"
@@ -457,11 +470,120 @@ def verify_extracted_portable_release(
             executable_sha256,
             expected_source_tree_sha256=expected_source_tree_sha256,
         )
-        verify_local_web_release(release_root)
+        web_report = (
+            {"status": "not_included"}
+            if provenance.get("artifact_scope") == "desktop_only"
+            else verify_local_web_release(release_root)
+        )
+        return {
+            "schema_version": 1,
+            "status": "ok",
+            "candidate_build_name": provenance["candidate_build_name"],
+            "head_commit": provenance["head_commit"],
+            "worktree_dirty": provenance["worktree_dirty"],
+            "source_tree_sha256": expected_source_tree_sha256.upper(),
+            "desktop_executable_sha256": executable_sha256.upper(),
+            "serial_enumeration": {"status": "ok", "exit_code": int(serial_result.returncode)},
+            "mock_e2e": {
+                "status": report["status"],
+                "simulation": report["simulation"],
+                "mode_count": report["mode_count"],
+                "modes": [
+                    {
+                        "mode": item["mode"],
+                        "sample_count": item["sample_count"],
+                        "valid_sample_count": item["valid_sample_count"],
+                    }
+                    for item in report["modes"]
+                ],
+            },
+            "localhost_web": web_report,
+            "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
 
 
-def verify_local_web_release(release_root: Path) -> None:
-    """Smoke the packaged loopback UI and its exit control with a hard time bound."""
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest().upper()
+
+
+def _write_portable_validation_report(path: Path, report: dict) -> None:
+    """Atomically write a JSON receipt outside the distributed ZIP."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(report, temporary, ensure_ascii=False, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                logging.getLogger(__name__).warning(
+                    "Could not remove temporary validation report %s: %s",
+                    temporary_path,
+                    cleanup_error,
+                )
+
+
+def _acquire_publication_lock(report_path: Path):
+    """Acquire a non-blocking OS lock for this candidate's report/ZIP pair."""
+    lock_path = Path(report_path).with_name(Path(report_path).name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_stream = lock_path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_stream.seek(0, os.SEEK_END)
+            if lock_stream.tell() == 0:
+                lock_stream.write(b"\0")
+                lock_stream.flush()
+            lock_stream.seek(0)
+            msvcrt.locking(lock_stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        lock_stream.close()
+        raise RuntimeError(f"another process is packaging {Path(report_path).name}") from exc
+    return lock_stream
+
+
+def _release_archive_lock(lock_stream) -> None:
+    """Release an archive lock; closing the handle also releases it after an OS error."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_stream.seek(0)
+            msvcrt.locking(lock_stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        lock_stream.close()
+
+
+def verify_local_web_release(release_root: Path) -> dict:
+    """Smoke the packaged loopback UI and return a compact, serializable receipt."""
     executable = release_root / "Fluke8845A-Web.dist" / "Fluke8845A-Web.exe"
     if not executable.is_file():
         raise RuntimeError("Portable package has no Fluke8845A-Web.exe")
@@ -474,13 +596,18 @@ def verify_local_web_release(release_root: Path) -> None:
         cwd=release_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     deadline = time.monotonic() + WEB_STARTUP_TIMEOUT_SECONDS
+    started = time.monotonic()
     try:
         health = None
+        health_http_status = None
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"Packaged web UI exited before startup with {process.returncode}")
             try:
                 with urlopen(base_url + "/api/health", timeout=1.0) as response:
+                    health_http_status = int(response.status)
+                    if health_http_status != 200:
+                        raise RuntimeError(f"Packaged web UI health returned HTTP {health_http_status}")
                     health = json.loads(response.read().decode("utf-8"))
                 break
             except (URLError, TimeoutError, OSError):
@@ -490,23 +617,47 @@ def verify_local_web_release(release_root: Path) -> None:
                 "Packaged web UI did not start on IPv4 loopback within "
                 f"{WEB_STARTUP_TIMEOUT_SECONDS} seconds"
             )
-        try:
-            validate_local_web_resources(
-                base_url,
-                release_root / "Fluke8845A-Web.dist" / "fluke8845a" / "web",
-            )
-        except ValueError as exc:
-            raise RuntimeError(f"Packaged localhost UI resources are stale or incomplete: {exc}") from exc
+        resources = validate_local_web_resources(
+            base_url,
+            release_root / "Fluke8845A-Web.dist" / "fluke8845a" / "web",
+        )
+        asset_results = {
+            route: {
+                "sha256": hashlib.sha256(resources[asset]).hexdigest().upper(),
+                "bytes": len(resources[asset]),
+            }
+            for route, asset in LOCAL_WEB_STATIC_RESOURCES
+        }
         body = json.dumps({"action": "shutdown", "payload": {}}, ensure_ascii=False).encode("utf-8")
         request = Request(
             base_url + "/api/command", data=body, method="POST",
             headers={"Content-Type": "application/json", "Origin": base_url},
         )
         with urlopen(request, timeout=2.0) as response:
+            shutdown_http_status = int(response.status)
             result = json.loads(response.read().decode("utf-8"))
+        if shutdown_http_status != 200:
+            raise RuntimeError(f"Packaged localhost shutdown returned HTTP {shutdown_http_status}")
         if result.get("success") is not True:
             raise RuntimeError("Packaged localhost exit command was rejected")
-        process.wait(timeout=5.0)
+        process_exit_code = process.wait(timeout=5.0)
+        if process_exit_code is None:
+            process_exit_code = process.returncode
+        if process_exit_code != 0:
+            raise RuntimeError(f"Packaged localhost Web process exited with {process_exit_code}")
+        return {
+            "schema_version": 1,
+            "status": "ok",
+            "health": health,
+            "health_http_status": health_http_status,
+            "assets": asset_results,
+            "shutdown": {
+                "acknowledged": True,
+                "http_status": shutdown_http_status,
+                "process_exit_code": process_exit_code,
+            },
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+        }
     finally:
         if process.poll() is None:
             process.terminate()
@@ -565,6 +716,14 @@ def _release_files(app_dist: Path) -> list[tuple[Path, str]]:
             files[relative] = ensure_regular_file_within(source, ROOT)
     portable_readme = ROOT / "docs" / "portable-windows-quick-start.md"
     files["README.md"] = ensure_regular_file_within(portable_readme, ROOT)
+    examples_root = ROOT / "examples" / "mock_experiments"
+    if examples_root.is_dir():
+        for mode in MOCK_EXAMPLE_MODES:
+            for filename in MOCK_EXAMPLE_FILES:
+                path = examples_root / mode / filename
+                if path.exists():
+                    relative = path.relative_to(ROOT).as_posix()
+                    files[relative] = ensure_regular_file_within(path, ROOT)
     return [(path, name) for name, path in sorted(files.items())]
 
 
@@ -664,12 +823,34 @@ def _validated_runtime_license_doc_paths(docs_target: Path, app_dist: Path) -> s
     return generated
 
 
+def _desktop_only_readme() -> str:
+    return """# Fluke 8845A Lab Windows 桌面候选便携版
+
+本包仅包含 Windows x64 桌面程序，无需安装 Python。本地候选包尚未完成全部真机验收与公开二进制发布审查。
+
+1. 完整解压 ZIP，保留全部文件和子目录，双击 Fluke8845A.exe。
+2. 点击“新建测量”，填写名称并选择单次测量或连续采集。新实验开始后自动换图，旧 CSV 保留。
+3. 无仪器时使用明确标记的 MOCK 模拟器；模拟数据不是真实仪器读数。
+4. 连接真实仪器前核对 RS-232 / COMPUTER 模式、串口参数和接线。
+5. 实验保存到软件中选择的数据目录。请勿只移动 EXE；升级前先停止并保存实验。
+
+详细说明、已知限制与第三方声明见 docs/。本次桌面候选包不包含 localhost 网页程序。
+
+## English
+
+Extract the entire ZIP and run Fluke8845A.exe. Python is not required. Keep all runtime files together.
+This local Windows x64 desktop candidate does not include a Web executable. Mock readings are simulated.
+Real-instrument validation and public binary distribution review are not complete; see docs/.
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app-dist", type=Path, default=APP_DIST, help="Nuitka .dist directory")
     parser.add_argument("--archive", type=Path, default=ARCHIVE, help="portable ZIP destination under dist/")
     parser.add_argument("--mock-report", type=Path, default=ROOT / MOCK_E2E_REPORT)
     parser.add_argument("--provenance", type=Path, help="shared BUILD-PROVENANCE.json for this build")
+    parser.add_argument("--desktop-only", action="store_true", help="package only a desktop-only build; reject bundled Web files")
     parser.add_argument(
         "--prune-unused-qt-pdf",
         action="store_true",
@@ -718,6 +899,8 @@ def main(argv: list[str] | None = None) -> int:
         candidate_name = candidate_name_from_archive(archive_path, WINDOWS_ARCHIVE_SUFFIX)
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         validate_provenance(provenance, expected_candidate_build_name=candidate_name)
+        if args.desktop_only != (provenance.get("artifact_scope") == "desktop_only"):
+            raise ValueError("--desktop-only must match the build provenance artifact scope")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         print(f"Invalid Windows build provenance: {exc}", file=sys.stderr)
         return 2
@@ -727,24 +910,63 @@ def main(argv: list[str] | None = None) -> int:
     if not docs_source.is_dir():
         print(f"Documentation directory not found: {docs_source}", file=sys.stderr)
         return 2
+    validation_report_path = (
+        ROOT / "output" / "mock_validation" / f"{candidate_name}_portable_validation.json"
+    )
+
     try:
-        _copy_release_docs(docs_source, docs_target)
-    except (OSError, ValueError) as exc:
-        print(f"Documentation contains an unsafe release path: {exc}", file=sys.stderr)
+        # The report name is the true shared publication identity: distinct ZIP
+        # paths with the same candidate basename must not race on one receipt.
+        archive_lock = _acquire_publication_lock(validation_report_path)
+    except (OSError, RuntimeError) as exc:
+        print(f"Unable to lock portable validation report destination: {exc}", file=sys.stderr)
         return 2
 
     try:
+        _copy_release_docs(docs_source, docs_target)
+    except (OSError, ValueError) as exc:
+        _release_archive_lock(archive_lock)
+        print(f"Documentation contains an unsafe release path: {exc}", file=sys.stderr)
+        return 2
+    except BaseException:
+        _release_archive_lock(archive_lock)
+        raise
+
+    archive_preexisted = False
+    archive_backup_path = None
+    archive_committed = False
+    preserve_archive_backup = False
+    candidate_archive_sha256 = None
+    try:
         archive_path.relative_to(DIST.resolve())
+        validation_receipt = None
+        archive_preexisted = archive_path.exists()
+        if archive_preexisted:
+            descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{archive_path.name}.", suffix=".rollback.zip", dir=archive_path.parent,
+            )
+            os.close(descriptor)
+            archive_backup_path = Path(backup_name)
+            shutil.copy2(archive_path, archive_backup_path)
         with atomic_archive_path(archive_path) as candidate_archive:
             with ZipFile(candidate_archive, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
                 for source, member in _release_files(app_dist):
+                    if args.desktop_only and member.startswith("Fluke8845A-Web.dist/"):
+                        raise ValueError("desktop-only package must not include bundled Web files")
+                    if args.desktop_only and member == "README.md":
+                        archive.writestr(member, _desktop_only_readme())
+                        continue
                     archive.write(source, member)
                 archive.write(mock_report_path, MOCK_E2E_REPORT)
                 archive.writestr(BUILD_PROVENANCE_NAME, provenance_path.read_bytes())
 
             with ZipFile(candidate_archive, "r") as archive:
                 names = set(archive.namelist())
-                missing = sorted(REQUIRED_ENTRIES - names)
+                required_entries = {
+                    entry for entry in REQUIRED_ENTRIES
+                    if not args.desktop_only or not entry.startswith("Fluke8845A-Web.dist/")
+                }
+                missing = sorted(required_entries - names)
                 unsafe = sorted(
                     name for name in names
                     if any(part in EXCLUDED_PATH_PARTS for part in Path(name).parts)
@@ -753,11 +975,12 @@ def main(argv: list[str] | None = None) -> int:
                 damaged = archive.testzip()
                 if missing:
                     raise RuntimeError("Portable package is missing required files: " + ", ".join(missing))
-                validate_web_archive_resources(
-                    archive,
-                    "Fluke8845A-Web.dist/fluke8845a/web",
-                    ROOT / "src" / "fluke8845a" / "web",
-                )
+                if not args.desktop_only:
+                    validate_web_archive_resources(
+                        archive,
+                        "Fluke8845A-Web.dist/fluke8845a/web",
+                        ROOT / "src" / "fluke8845a" / "web",
+                    )
                 validate_portable_runtime_components(names)
                 license_manifest = json.loads(archive.read("docs/licenses/windows-runtime-license-manifest.json").decode("utf-8"))
                 if not isinstance(license_manifest, dict):
@@ -792,19 +1015,33 @@ def main(argv: list[str] | None = None) -> int:
                     archived_provenance,
                     {
                         "Fluke8845A.exe": archive.read("Fluke8845A.exe"),
-                        "Fluke8845A-Web.dist/Fluke8845A-Web.exe": archive.read(
-                            "Fluke8845A-Web.dist/Fluke8845A-Web.exe"
-                        ),
+                        **({} if args.desktop_only else {
+                            "Fluke8845A-Web.dist/Fluke8845A-Web.exe": archive.read(
+                                "Fluke8845A-Web.dist/Fluke8845A-Web.exe"
+                            ),
+                        }),
                     },
                     expected_candidate_build_name=candidate_name,
                 )
                 report = json.loads(archive.read(MOCK_E2E_REPORT).decode("utf-8-sig"))
                 validate_packaged_mock_e2e_report(report, exe_hash, archived_provenance)
-            verify_extracted_portable_release(
+            validation_receipt = verify_extracted_portable_release(
                 candidate_archive,
                 exe_hash,
                 str(archived_provenance["source_tree_sha256"]),
             )
+            candidate_archive_sha256 = _sha256_file(candidate_archive)
+        archive_committed = True
+        if validation_receipt is None:
+            raise RuntimeError("Portable package verification did not produce a validation receipt")
+        published_archive_sha256 = _sha256_file(archive_path)
+        if published_archive_sha256 != candidate_archive_sha256:
+            raise RuntimeError("Portable ZIP changed after extracted-package verification")
+        validation_receipt["portable_archive"] = {
+            "filename": archive_path.name,
+            "sha256": candidate_archive_sha256,
+        }
+        _write_portable_validation_report(validation_report_path, validation_receipt)
     except (
         OSError,
         RuntimeError,
@@ -813,11 +1050,61 @@ def main(argv: list[str] | None = None) -> int:
         json.JSONDecodeError,
         ValueError,
         subprocess.SubprocessError,
+        KeyboardInterrupt,
     ) as exc:
-        print(f"Unable to create or validate portable release: {exc}", file=sys.stderr)
-        return 2
+        if isinstance(exc, KeyboardInterrupt) and candidate_archive_sha256 is not None:
+            try:
+                archive_matches_candidate = (
+                    archive_path.is_file() and _sha256_file(archive_path) == candidate_archive_sha256
+                )
+                if archive_matches_candidate:
+                    archive_committed = True
+                    saved_report = json.loads(validation_report_path.read_text(encoding="utf-8"))
+                    report_matches_candidate = (
+                        isinstance(saved_report, dict)
+                        and saved_report.get("portable_archive", {}).get("sha256") == candidate_archive_sha256
+                    )
+                    if report_matches_candidate:
+                        archive_committed = False
+                        print("Portable ZIP and validation report were committed before interruption.")
+                        return 0
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                pass
+            # The candidate hash is set only after full verification. Restore the
+            # prior pair even if interruption landed between os.replace() and the
+            # normal archive_committed assignment.
+            archive_committed = True
+        rollback_error = None
+        if archive_committed:
+            try:
+                if archive_backup_path is not None:
+                    os.replace(archive_backup_path, archive_path)
+                    archive_backup_path = None
+                elif not archive_preexisted:
+                    archive_path.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                rollback_error = rollback_exc
+                preserve_archive_backup = archive_backup_path is not None
+        if isinstance(exc, KeyboardInterrupt):
+            message = "Portable release packaging was interrupted"
+        else:
+            message = f"Unable to create or validate portable release: {exc}"
+        if rollback_error is not None:
+            message += f"; archive rollback also failed: {rollback_error}"
+            if preserve_archive_backup:
+                message += f"; previous archive preserved at {archive_backup_path}"
+        print(message, file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 2
+    finally:
+        if archive_backup_path is not None and not preserve_archive_backup:
+            try:
+                archive_backup_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                print(f"Could not remove archive rollback copy {archive_backup_path}: {cleanup_error}", file=sys.stderr)
+        _release_archive_lock(archive_lock)
 
     print(f"Created and verified {archive_path} ({len(names)} files; EXE SHA256 {exe_hash})")
+    print(f"Saved portable validation report {validation_report_path}")
     return 0
 
 

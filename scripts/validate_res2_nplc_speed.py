@@ -36,20 +36,23 @@ from fluke8845a.storage import ExperimentRecorder
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", default="COM3", help="8845A RS-232 COM port")
-    parser.add_argument("--duration", type=float, default=30.0, help="capture duration in seconds")
+    parser.add_argument("--duration", type=float, default=30.0,
+                        help="capture duration in seconds (maximum: 60; default: 30)")
     parser.add_argument("--output", type=Path, default=Path("output/hardware_validation"))
     parser.add_argument("--nplc", type=float, choices=(0.02, 0.2, 1, 10, 100), default=0.02,
                         help="documented 8845A integration setting to measure (default: 0.02)")
     parser.add_argument(
-        "--confirm-front-2w-30mohm",
-        action="store_true",
-        help="confirm the front-panel 2W inputs are connected to the user's 30 MOhm resistor",
+        "--confirm-front-2w-30-megaohm", "--confirm-front-2w-30mohm",
+        dest="confirm_front_2w_30mohm", action="store_true",
+        help="confirm the front-panel 2W inputs are connected to the user's 30 MΩ resistor (legacy name also accepted)",
     )
     args = parser.parse_args()
     if not args.confirm_front_2w_30mohm:
-        parser.error("must confirm the currently wired front-panel 2W 30 MOhm resistor")
+        parser.error("must confirm the currently wired front-panel 2W 30 MΩ resistor")
     if not math.isfinite(args.duration) or args.duration <= 0:
         parser.error("duration must be positive")
+    if args.duration > 60.0:
+        parser.error("duration must not exceed 60 seconds")
     return args
 
 

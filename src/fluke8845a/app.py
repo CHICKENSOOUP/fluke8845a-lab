@@ -26,6 +26,7 @@ from .modes import (
     Mode, descriptor, mode_from_scpi_function,
     mode_transition_requires_wiring_confirmation,
 )
+from .probe_provenance import capture_runtime_source_identity
 from .scpi import FlowControl, ModeSettings, Serial8845A, SerialSettings
 from .worker import ACTUAL_RATE_WINDOW_POINTS
 
@@ -34,6 +35,11 @@ MAX_HARDWARE_PROBE_DURATION_S = 50.0
 HARDWARE_PROBE_WALL_LIMIT_S = 55.0
 HARDWARE_PROBE_CLEANUP_RESERVE_S = 15.0
 HARDWARE_PROBE_GUI_DRAIN_RESERVE_S = 0.25
+ACV_MAX_RMS_V = 750.0
+ACV_MAX_PEAK_V = 1000.0
+ACV_MAX_VOLT_HZ = 8e7
+ACV_MAX_FREQUENCY_HZ = 300_000.0
+ACI_MAX_FREQUENCY_HZ = 10_000.0
 
 
 class _MockE2EReceiver(QObject):
@@ -93,20 +99,41 @@ def _reconstruct_gui_rate_from_rows(rows: list[dict], visible_sample_count: int)
     for row in visible:
         if row.get("read_duration_s", "") == "":
             raise ValueError("有效CSV读数缺少读取耗时，无法重建接收时刻")
-        receipt_elapsed.append(float(row["elapsed_s"]) + float(row["read_duration_s"]))
+        elapsed_s = float(row["elapsed_s"])
+        read_duration_s = float(row["read_duration_s"])
+        if (
+            not math.isfinite(elapsed_s) or not math.isfinite(read_duration_s)
+            or elapsed_s < 0 or read_duration_s < 0
+        ):
+            raise ValueError("CSV接收时间戳字段必须是非负有限数")
+        receipt_elapsed.append(elapsed_s + read_duration_s)
     rate_window = receipt_elapsed[-ACTUAL_RATE_WINDOW_POINTS:]
+    if any(right <= left for left, right in zip(rate_window, rate_window[1:])):
+        raise ValueError("CSV receipt timestamps must be strictly increasing")
     span = rate_window[-1] - rate_window[0]
     if span <= 0:
         raise ValueError("CSV接收时间戳不是严格递增")
     return (len(rate_window) - 1) / span, len(rate_window)
 
 
-def _probe_speed_change_values(mode: Mode, ac_bandwidth_hz: int | None = None) -> tuple[float | int, float | int]:
+def _probe_speed_change_values(
+    mode: Mode,
+    ac_bandwidth_hz: int | None = None,
+    ac_frequency_hz: float | None = None,
+) -> tuple[float | int, float | int]:
     """Return two documented speed settings for a bounded real GUI probe."""
     spec = descriptor(mode)
     if spec.ac_bandwidths_hz:
         if ac_bandwidth_hz not in spec.ac_bandwidths_hz:
             raise ValueError(f"{mode.value}短测必须指定8845A支持的交流带宽")
+        if ac_frequency_hz is not None:
+            usable_bands = [band for band in spec.ac_bandwidths_hz if band <= ac_frequency_hz]
+            if ac_bandwidth_hz not in usable_bands:
+                raise ValueError(f"{mode.value}信号频率低于所选交流带宽")
+            alternatives = [band for band in usable_bands if band != ac_bandwidth_hz]
+            if not alternatives:
+                raise ValueError(f"{mode.value}短测信号频率至少须支持两个交流带宽档")
+            return max(alternatives), ac_bandwidth_hz
         return (200 if ac_bandwidth_hz != 200 else 20, ac_bandwidth_hz)
     if spec.nplc_values:
         return 0.2, 1
@@ -259,8 +286,15 @@ def run_real_gui_speed_probe(
     restore_wiring_confirmed: bool = False,
     measurement_mode: Mode = Mode.RES2,
     voltage_source_confirmed: bool = False,
+    acv_voltage_source_confirmed: bool = False,
     dci_current_source_confirmed: bool = False,
     aci_current_source_confirmed: bool = False,
+    res4_four_wire_confirmed: bool = False,
+    acv_source_vrms: float | None = None,
+    acv_source_vpeak: float | None = None,
+    acv_source_frequency_hz: float | None = None,
+    acv_range_v: float | None = None,
+    res4_range_ohm: float | None = None,
     aci_source_current_arms: float | None = None,
     aci_source_frequency_hz: float | None = None,
     aci_range_a: float | None = None,
@@ -269,16 +303,26 @@ def run_real_gui_speed_probe(
     """Exercise GUI acquisition on an already selected, explicitly confirmed 8845A mode."""
     invocation_started = time.monotonic()
     wall_deadline = invocation_started + HARDWARE_PROBE_WALL_LIMIT_S
-    if measurement_mode not in (Mode.RES2, Mode.DCV, Mode.DCI, Mode.ACI):
-        raise ValueError("实时硬件GUI探测仅支持RES2、DCV、DCI或ACI")
+    if measurement_mode not in (Mode.RES2, Mode.RES4, Mode.DCV, Mode.ACV, Mode.DCI, Mode.ACI):
+        raise ValueError("实时硬件GUI探测仅支持六种8845A测量模式")
     if restore_wiring_confirmed and measurement_mode not in (Mode.DCI, Mode.ACI):
         raise ValueError("探测前电流量程恢复确认只适用于DCI或ACI")
     aci_values_present = any(value is not None for value in (
-        aci_source_current_arms, aci_source_frequency_hz, aci_range_a, ac_bandwidth_hz,
+        aci_source_current_arms, aci_source_frequency_hz, aci_range_a,
     ))
+    ac_bandwidth_present = ac_bandwidth_hz is not None
+    acv_values_present = any(value is not None for value in (
+        acv_source_vrms, acv_source_vpeak, acv_source_frequency_hz, acv_range_v,
+    ))
+    res4_values_present = res4_range_ohm is not None
     if measurement_mode == Mode.RES2:
-        if voltage_source_confirmed or dci_current_source_confirmed or aci_current_source_confirmed or aci_values_present:
-            raise ValueError("RES2探测不能使用电压/电流源确认")
+        if (
+            voltage_source_confirmed or acv_voltage_source_confirmed
+            or dci_current_source_confirmed or aci_current_source_confirmed
+            or res4_four_wire_confirmed or aci_values_present or ac_bandwidth_present or acv_values_present
+            or res4_values_present
+        ):
+            raise ValueError("RES2探测不能使用其他模式的接线确认或参数")
         if wiring_confirmed and shorted_leads_confirmed:
             raise ValueError("30 MΩ电阻与短接线确认不能同时使用")
         confirmation = (
@@ -288,21 +332,63 @@ def run_real_gui_speed_probe(
     elif measurement_mode == Mode.DCV:
         if (
             not voltage_source_confirmed or wiring_confirmed or shorted_leads_confirmed
-            or dci_current_source_confirmed or aci_current_source_confirmed or aci_values_present
+            or acv_voltage_source_confirmed or dci_current_source_confirmed
+            or aci_current_source_confirmed or res4_four_wire_confirmed
+            or aci_values_present or ac_bandwidth_present or acv_values_present or res4_values_present
         ):
             raise ValueError("DCV探测只接受可调电压源确认，且不能带入其他模式的确认或参数")
         confirmation = "front_panel_voltage_input_adjustable_source"
+    elif measurement_mode == Mode.ACV:
+        if (
+            not acv_voltage_source_confirmed or wiring_confirmed or shorted_leads_confirmed
+            or voltage_source_confirmed or dci_current_source_confirmed
+            or aci_current_source_confirmed or res4_four_wire_confirmed
+            or aci_values_present or res4_values_present
+        ):
+            raise ValueError("ACV探测只接受交流电压源确认和ACV参数")
+        if (
+            acv_range_v not in descriptor(Mode.ACV).ranges_si
+            or ac_bandwidth_hz not in descriptor(Mode.ACV).ac_bandwidths_hz
+        ):
+            raise ValueError("ACV探测须选择8845A支持的固定量程和3/20/200 Hz带宽")
+        if (
+            acv_source_vrms is None or not math.isfinite(acv_source_vrms)
+            or acv_source_vrms <= 0 or acv_source_vrms > ACV_MAX_RMS_V
+            or acv_source_vrms > acv_range_v
+        ):
+            raise ValueError("ACV源RMS电压须为正值、不超过所选量程且不超过750 V RMS")
+        if (
+            acv_source_vpeak is None or not math.isfinite(acv_source_vpeak)
+            or acv_source_vpeak < acv_source_vrms or acv_source_vpeak > ACV_MAX_PEAK_V
+        ):
+            raise ValueError("ACV源峰值须不低于RMS值且不超过1000 V peak")
+        if (
+            acv_source_frequency_hz is None or not math.isfinite(acv_source_frequency_hz)
+            or acv_source_frequency_hz < max(20, ac_bandwidth_hz)
+            or acv_source_frequency_hz > ACV_MAX_FREQUENCY_HZ
+            or acv_source_vrms * acv_source_frequency_hz > ACV_MAX_VOLT_HZ
+        ):
+            raise ValueError("ACV源频率须符合所选带宽，且满足3–300 kHz与8×10^7 V·Hz限制")
+        try:
+            _probe_speed_change_values(Mode.ACV, ac_bandwidth_hz, acv_source_frequency_hz)
+        except ValueError as exc:
+            raise ValueError(f"ACV探测无法在该信号频率下切换速度：{exc}") from exc
+        confirmation = "front_panel_acv_voltage_source"
     elif measurement_mode == Mode.DCI:
         if (
             not dci_current_source_confirmed or wiring_confirmed or shorted_leads_confirmed
-            or voltage_source_confirmed or aci_current_source_confirmed or aci_values_present
+            or voltage_source_confirmed or acv_voltage_source_confirmed
+            or aci_current_source_confirmed or res4_four_wire_confirmed
+            or aci_values_present or ac_bandwidth_present or acv_values_present or res4_values_present
         ):
             raise ValueError("DCI探测只接受5 mA串联接线确认，且不能带入其他模式的确认或参数")
         confirmation = "front_panel_dci_5ma_series"
-    else:
+    elif measurement_mode == Mode.ACI:
         if (
             not aci_current_source_confirmed or wiring_confirmed or shorted_leads_confirmed
-            or voltage_source_confirmed or dci_current_source_confirmed
+            or voltage_source_confirmed or acv_voltage_source_confirmed
+            or dci_current_source_confirmed or res4_four_wire_confirmed or acv_values_present
+            or ac_bandwidth_present or res4_values_present
         ):
             raise ValueError("ACI探测只接受交流电流串联接线确认")
         if (
@@ -319,10 +405,31 @@ def run_real_gui_speed_probe(
         if (
             aci_source_frequency_hz is None
             or not math.isfinite(aci_source_frequency_hz)
-            or aci_source_frequency_hz <= 0
+            or aci_source_frequency_hz < max(20, ac_bandwidth_hz)
+            or aci_source_frequency_hz > ACI_MAX_FREQUENCY_HZ
         ):
-            raise ValueError("ACI探测须提供有效的交流源频率")
+            raise ValueError("ACI源频率须符合所选带宽并处于8845A支持范围")
+        try:
+            _probe_speed_change_values(Mode.ACI, ac_bandwidth_hz, aci_source_frequency_hz)
+        except ValueError as exc:
+            raise ValueError(f"ACI探测无法在该信号频率下切换速度：{exc}") from exc
         confirmation = "front_panel_aci_current_series"
+    else:
+        if (
+            not res4_four_wire_confirmed or wiring_confirmed or shorted_leads_confirmed
+            or voltage_source_confirmed or acv_voltage_source_confirmed
+            or dci_current_source_confirmed or aci_current_source_confirmed
+            or aci_values_present or ac_bandwidth_present or acv_values_present
+        ):
+            raise ValueError("RES4探测只接受前面板四线电阻接线确认和RES4量程")
+        if res4_range_ohm not in descriptor(Mode.RES4).ranges_si:
+            raise ValueError("RES4探测须选择8845A支持的100 Ω至100 MΩ固定量程")
+        confirmation = "front_panel_res4_four_wire_unpowered_dut"
+    try:
+        runtime_source_identity = capture_runtime_source_identity()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"无法核验本次GUI硬件探测的软件来源：{exc}", file=sys.stderr)
+        return 1
     report_path = report_path.expanduser().resolve()
     report: dict = {
         "software_version": __version__,
@@ -340,6 +447,7 @@ def run_real_gui_speed_probe(
         "started_local": datetime.now().astimezone().isoformat(timespec="microseconds"),
         "operator_wiring_confirmation": confirmation,
         "restore_wiring_confirmation": bool(restore_wiring_confirmed),
+        "runtime_source_identity": runtime_source_identity,
     }
     try:
         if confirmation is None:
@@ -350,6 +458,21 @@ def run_real_gui_speed_probe(
                 "frequency_hz": aci_source_frequency_hz,
                 "range_a": aci_range_a,
                 "ac_bandwidth_hz": ac_bandwidth_hz,
+            }
+        elif measurement_mode == Mode.ACV:
+            report["acv_source"] = {
+                "nominal_voltage_rms_v": acv_source_vrms,
+                "declared_voltage_peak_v": acv_source_vpeak,
+                "frequency_hz": acv_source_frequency_hz,
+                "range_v": acv_range_v,
+                "ac_bandwidth_hz": ac_bandwidth_hz,
+                "waveform_independently_verified": False,
+            }
+        elif measurement_mode == Mode.RES4:
+            report["res4_dut"] = {
+                "range_ohm": res4_range_ohm,
+                "operator_confirmed_unpowered_isolated_discharged": True,
+                "four_wire_topology_independently_verified": False,
             }
         if not MIN_HARDWARE_PROBE_DURATION_S <= duration_s <= MAX_HARDWARE_PROBE_DURATION_S:
             raise ValueError("GUI硬件探测采集时间必须在8到50秒之间；总运行硬上限55秒")
@@ -484,15 +607,17 @@ def run_real_gui_speed_probe(
                 100 if measurement_mode == Mode.RES2 and shorted_leads_confirmed
                 else 100e6 if measurement_mode == Mode.RES2
                 else 10.0 if measurement_mode == Mode.DCV
+                else float(acv_range_v) if measurement_mode == Mode.ACV
                 else 10e-3 if measurement_mode == Mode.DCI
-                else float(aci_range_a)
+                else float(aci_range_a) if measurement_mode == Mode.ACI
+                else float(res4_range_ohm)
             )
             window.autorange_check.setChecked(False)
             range_index = window.range_combo.findData(target_range)
             if range_index < 0:
                 unit = (
                     "A" if measurement_mode in (Mode.DCI, Mode.ACI)
-                    else "Ω" if measurement_mode == Mode.RES2 else "V"
+                    else "Ω" if measurement_mode in (Mode.RES2, Mode.RES4) else "V"
                 )
                 raise RuntimeError(f"GUI没有提供8845A支持的{target_range:g} {unit}固定量程")
             window.range_combo.setCurrentIndex(range_index)
@@ -551,10 +676,19 @@ def run_real_gui_speed_probe(
                 "用户确认前面板2W输入端子短接。" if measurement_mode == Mode.RES2 and shorted_leads_confirmed
                 else "用户确认前面板2W端子连接标称30 MΩ电阻。" if measurement_mode == Mode.RES2
                 else "用户确认前面板DCV HI/LO接着可调直流电压源。" if measurement_mode == Mode.DCV
+                else (
+                    "用户确认交流电压源接在前面板HI/LO；"
+                    f"标称{acv_source_vrms:g} V RMS、声明峰值{acv_source_vpeak:g} V、"
+                    f"{acv_source_frequency_hz:g} Hz。"
+                ) if measurement_mode == Mode.ACV
                 else "用户确认5 mA直流源串联，红线接mA/400 mA、黑线接LO。" if measurement_mode == Mode.DCI
                 else (
                     "用户确认交流电流源串联，红线接mA/400 mA、黑线接LO；"
                     f"标称{aci_source_current_arms:g} A RMS、{aci_source_frequency_hz:g} Hz。"
+                ) if measurement_mode == Mode.ACI
+                else (
+                    "用户确认前面板INPUT HI/LO FORCE与SENSE HI/LO四线接线，"
+                    "被测电阻已断电、隔离、放电且无外加电压；软件无法检测真实表线拓扑。"
                 )
             )
             report["initial_configuration_readback"] = applied
@@ -574,7 +708,14 @@ def run_real_gui_speed_probe(
             second_change_at = min(6.0, duration_s * 0.55)
             first_interval_at = min(1.25, duration_s * 0.16)
             second_interval_at = min(4.5, duration_s * 0.45)
-            speed_first, speed_second = _probe_speed_change_values(measurement_mode, ac_bandwidth_hz)
+            ac_source_frequency = (
+                acv_source_frequency_hz if measurement_mode == Mode.ACV
+                else aci_source_frequency_hz if measurement_mode == Mode.ACI
+                else None
+            )
+            speed_first, speed_second = _probe_speed_change_values(
+                measurement_mode, ac_bandwidth_hz, ac_source_frequency,
+            )
             speed_combo = window.bandwidth_combo if spec.ac_bandwidths_hz else window.nplc_combo
             capture_deadline = min(
                 run_started + duration_s,
@@ -753,6 +894,12 @@ def run_real_gui_speed_probe(
     report["errors"] = errors
     report["finished_local"] = datetime.now().astimezone().isoformat(timespec="microseconds")
     report["experiment_directory"] = experiment_directories[-1] if experiment_directories else report.get("experiment_directory")
+    try:
+        if capture_runtime_source_identity() != runtime_source_identity:
+            raise RuntimeError("探测运行期间源码、EXE或构建来源标识发生变化")
+        report["runtime_source_identity_verified_at_finish"] = True
+    except (OSError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        run_error = run_error or f"无法确认探测期间软件来源保持不变：{exc}"
     try:
         if run_error is not None:
             report.update(status="error", error=run_error)
@@ -1179,8 +1326,10 @@ def main(argv: list[str] | None = None) -> int:
     backend.add_argument("--probe-real-gui", action="store_true", help="隐藏GUI验证RES2实时采集、速度/间隔变化与CSV记录")
     backend.add_argument("--probe-real-gui-visible", action="store_true", help="显示GUI验证RES2曲线刷新；保存窗口截图")
     backend.add_argument("--probe-real-gui-dcv", action="store_true", help="仅当仪表已处于DCV时，短时验证GUI/CSV")
+    backend.add_argument("--probe-real-gui-acv", action="store_true", help="仅当仪表已处于ACV时，短时验证GUI/CSV")
     backend.add_argument("--probe-real-gui-dci", action="store_true", help="仅当仪表已处于DCI时，短时验证GUI/CSV")
     backend.add_argument("--probe-real-gui-aci", action="store_true", help="仅当仪表已处于ACI时，短时验证GUI/CSV")
+    backend.add_argument("--probe-real-gui-res4", action="store_true", help="仅当仪表已处于四线电阻时，短时验证GUI/CSV")
     backend.add_argument("--serial-smoke", action="store_true", help="无GUI地导入pyserial并枚举端口；用于打包检查")
     parser.add_argument("--port", help="--probe-real使用的串口，例如COM3")
     parser.add_argument(
@@ -1194,16 +1343,23 @@ def main(argv: list[str] | None = None) -> int:
         help="DCI/ACI探测前的量程与探测设置不同时，确认恢复报告读取到的原自动/固定量程",
     )
     wiring = parser.add_mutually_exclusive_group()
-    wiring.add_argument("--confirm-front-2w-30mohm", action="store_true",
-                        help="确认前面板2W端子当前接着标称30 MOhm电阻")
+    wiring.add_argument(
+        "--confirm-front-2w-30-megaohm", "--confirm-front-2w-30mohm",
+        dest="confirm_front_2w_30mohm", action="store_true",
+        help="确认前面板2W端子当前接着标称30 MΩ电阻（旧名称仍可用）",
+    )
     wiring.add_argument("--confirm-front-2w-short", action="store_true",
                         help="确认前面板2W输入端子当前短接；探测后恢复原仪器测量设置")
     wiring.add_argument("--confirm-front-voltage-source", action="store_true",
                         help="确认前面板HI/LO端子接着可调直流电压源；只用于DCV短测")
+    wiring.add_argument("--confirm-front-acv-voltage-source", action="store_true",
+                        help="确认交流电压源已接前面板HI/LO，且源条件符合ACV限制；只用于ACV短测")
     wiring.add_argument("--confirm-front-dci-5ma-series", action="store_true",
                         help="确认5 mA直流源串联，红线接mA/400 mA、黑线接LO；只用于DCI短测")
     wiring.add_argument("--confirm-front-aci-current-series", action="store_true",
                         help="确认交流电流源串联，红线接mA/400 mA、黑线接LO；只用于ACI短测")
+    wiring.add_argument("--confirm-front-res4-four-wire", action="store_true",
+                        help="确认前面板INPUT HI/LO FORCE与SENSE HI/LO四线接好，DUT断电隔离放电且无外压；只用于RES4短测")
     parser.add_argument("--duration", type=float, default=12.0,
                         help="GUI硬件短测采集秒数（8至50秒；程序总运行硬上限55秒，默认12秒）")
     parser.add_argument("--aci-current-arms", type=float, help="ACI交流源标称RMS电流（A）")
@@ -1211,18 +1367,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aci-range-a", type=float, choices=(10e-3, 100e-3, 400e-3),
                         help="ACI固定量程（只允许前面板mA/400 mA输入的10/100/400 mA档）")
     parser.add_argument("--ac-bandwidth-hz", type=int, choices=(3, 20, 200),
-                        help="ACI交流检测带宽（Hz）")
+                        help="ACV/ACI交流检测带宽（Hz）")
+    parser.add_argument("--acv-source-vrms", type=float, help="ACV交流源标称RMS电压（V）")
+    parser.add_argument("--acv-source-vpeak", type=float, help="ACV交流源声明峰值电压（V）")
+    parser.add_argument("--acv-frequency-hz", type=float, help="ACV交流源频率（Hz）")
+    parser.add_argument("--acv-range-v", type=float, choices=descriptor(Mode.ACV).ranges_si,
+                        help="ACV固定量程（V）")
+    parser.add_argument("--res4-range-ohm", type=float, choices=descriptor(Mode.RES4).ranges_si,
+                        help="RES4固定量程（Ω）")
     parser.add_argument("--smoke", action="store_true", help="启动界面短暂检查后退出")
     parser.add_argument("--version", action="version", version=f"Fluke8845A {__version__}")
     args = parser.parse_args(argv)
+    acv_options_present = any(value is not None for value in (
+        args.acv_source_vrms, args.acv_source_vpeak, args.acv_frequency_hz, args.acv_range_v,
+    ))
+    res4_options_present = args.res4_range_ohm is not None
     if args.serial_smoke:
         if (
             args.smoke or args.port or args.report or args.confirm_front_2w_30mohm
             or args.confirm_front_2w_short or args.confirm_front_voltage_source
-            or args.confirm_front_dci_5ma_series or args.confirm_front_aci_current_series
+            or args.confirm_front_acv_voltage_source or args.confirm_front_dci_5ma_series
+            or args.confirm_front_aci_current_series or args.confirm_front_res4_four_wire
             or args.confirm_restore_current_settings
             or args.aci_current_arms is not None or args.aci_frequency_hz is not None
             or args.aci_range_a is not None or args.ac_bandwidth_hz is not None
+            or acv_options_present or res4_options_present
             or args.baudrate != 9600
         ):
             parser.error("--serial-smoke cannot be combined with other runtime modes or hardware options")
@@ -1231,10 +1400,12 @@ def main(argv: list[str] | None = None) -> int:
         if (
             args.smoke or args.port or args.confirm_front_2w_30mohm
             or args.confirm_front_2w_short or args.confirm_front_voltage_source
-            or args.confirm_front_dci_5ma_series or args.confirm_front_aci_current_series
+            or args.confirm_front_acv_voltage_source or args.confirm_front_dci_5ma_series
+            or args.confirm_front_aci_current_series or args.confirm_front_res4_four_wire
             or args.confirm_restore_current_settings
             or args.aci_current_arms is not None or args.aci_frequency_hz is not None
             or args.aci_range_a is not None or args.ac_bandwidth_hz is not None
+            or acv_options_present or res4_options_present
             or args.baudrate != 9600
         ):
             parser.error("--mock-e2e不能与--smoke或真实硬件选项组合")
@@ -1246,35 +1417,41 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--probe-real cannot be combined with --smoke")
         if (
             args.confirm_front_voltage_source or args.confirm_front_dci_5ma_series
-            or args.confirm_front_aci_current_series or args.aci_current_arms is not None
+            or args.confirm_front_acv_voltage_source or args.confirm_front_aci_current_series
+            or args.confirm_front_res4_four_wire or args.aci_current_arms is not None
             or args.confirm_restore_current_settings
             or args.aci_frequency_hz is not None or args.aci_range_a is not None
-            or args.ac_bandwidth_hz is not None
+            or args.ac_bandwidth_hz is not None or acv_options_present or res4_options_present
         ):
             parser.error("DCV/DCI/ACI confirmation and settings are only valid with their GUI probe")
         if not args.report:
             parser.error("--probe-real requires --report PATH")
         if not args.confirm_front_2w_30mohm and not args.confirm_front_2w_short:
-            parser.error("--probe-real requires --confirm-front-2w-30mohm or --confirm-front-2w-short")
+            parser.error("--probe-real requires --confirm-front-2w-30-megaohm or --confirm-front-2w-short")
         return run_real_hardware_probe(args.port or "COM3", args.report,
                                        wiring_confirmed=args.confirm_front_2w_30mohm,
                                        shorted_leads_confirmed=args.confirm_front_2w_short,
                                        baudrate=args.baudrate)
     gui_probe_mode = (
         Mode.DCV if args.probe_real_gui_dcv
+        else Mode.ACV if args.probe_real_gui_acv
         else Mode.DCI if args.probe_real_gui_dci
         else Mode.ACI if args.probe_real_gui_aci
+        else Mode.RES4 if args.probe_real_gui_res4
         else Mode.RES2
     )
     if (
         args.probe_real_gui or args.probe_real_gui_visible or args.probe_real_gui_dcv
-        or args.probe_real_gui_dci or args.probe_real_gui_aci
+        or args.probe_real_gui_acv or args.probe_real_gui_dci or args.probe_real_gui_aci
+        or args.probe_real_gui_res4
     ):
         probe_name = (
             "--probe-real-gui-visible" if args.probe_real_gui_visible
             else "--probe-real-gui-dcv" if args.probe_real_gui_dcv
+            else "--probe-real-gui-acv" if args.probe_real_gui_acv
             else "--probe-real-gui-dci" if args.probe_real_gui_dci
             else "--probe-real-gui-aci" if args.probe_real_gui_aci
+            else "--probe-real-gui-res4" if args.probe_real_gui_res4
             else "--probe-real-gui"
         )
         if args.smoke:
@@ -1288,14 +1465,45 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--duration must be between 8 and 50 seconds for {probe_name}; total probe wall limit is 55 seconds")
         if gui_probe_mode == Mode.RES2:
             if not args.confirm_front_2w_30mohm and not args.confirm_front_2w_short:
-                parser.error(f"{probe_name} requires --confirm-front-2w-30mohm or --confirm-front-2w-short")
+                parser.error(f"{probe_name} requires --confirm-front-2w-30-megaohm or --confirm-front-2w-short")
         elif gui_probe_mode == Mode.DCV:
             if not args.confirm_front_voltage_source:
                 parser.error("--probe-real-gui-dcv requires --confirm-front-voltage-source")
+        elif gui_probe_mode == Mode.ACV:
+            if not args.confirm_front_acv_voltage_source:
+                parser.error("--probe-real-gui-acv requires --confirm-front-acv-voltage-source")
+            if any(value is None for value in (
+                args.acv_source_vrms, args.acv_source_vpeak, args.acv_frequency_hz,
+                args.acv_range_v, args.ac_bandwidth_hz,
+            )):
+                parser.error(
+                    "--probe-real-gui-acv requires --acv-source-vrms, --acv-source-vpeak, "
+                    "--acv-frequency-hz, --acv-range-v and --ac-bandwidth-hz"
+                )
+            if (
+                not math.isfinite(args.acv_source_vrms) or args.acv_source_vrms <= 0
+                or args.acv_source_vrms > ACV_MAX_RMS_V
+                or args.acv_source_vrms > args.acv_range_v
+                or not math.isfinite(args.acv_source_vpeak)
+                or args.acv_source_vpeak < args.acv_source_vrms
+                or args.acv_source_vpeak > ACV_MAX_PEAK_V
+                or not math.isfinite(args.acv_frequency_hz)
+                or args.acv_frequency_hz < max(20, args.ac_bandwidth_hz)
+                or args.acv_frequency_hz > ACV_MAX_FREQUENCY_HZ
+                or args.acv_source_vrms * args.acv_frequency_hz > ACV_MAX_VOLT_HZ
+            ):
+                parser.error(
+                    "ACV source must fit its range and satisfy 750 Vrms, 1000 Vpeak, "
+                    "8e7 V·Hz, selected bandwidth and 20 Hz–300 kHz probe limits"
+                )
+            try:
+                _probe_speed_change_values(Mode.ACV, args.ac_bandwidth_hz, args.acv_frequency_hz)
+            except ValueError as exc:
+                parser.error(f"ACV source cannot support the probe's bandwidth changes: {exc}")
         elif gui_probe_mode == Mode.DCI:
             if not args.confirm_front_dci_5ma_series:
                 parser.error("--probe-real-gui-dci requires --confirm-front-dci-5ma-series")
-        else:
+        elif gui_probe_mode == Mode.ACI:
             if not args.confirm_front_aci_current_series:
                 parser.error("--probe-real-gui-aci requires --confirm-front-aci-current-series")
             if any(value is None for value in (
@@ -1305,19 +1513,44 @@ def main(argv: list[str] | None = None) -> int:
             if (
                 not math.isfinite(args.aci_current_arms) or args.aci_current_arms <= 0
                 or args.aci_current_arms > 400e-3 or args.aci_current_arms >= args.aci_range_a
-                or not math.isfinite(args.aci_frequency_hz) or args.aci_frequency_hz <= 0
+                or not math.isfinite(args.aci_frequency_hz)
+                or args.aci_frequency_hz < max(20, args.ac_bandwidth_hz)
+                or args.aci_frequency_hz > ACI_MAX_FREQUENCY_HZ
             ):
-                parser.error("ACI RMS current must be positive, below its fixed range and <=400 mA; frequency must be positive")
+                parser.error(
+                    "ACI RMS current must be positive and below its fixed range; frequency must "
+                    "match the selected bandwidth and remain at or below 10 kHz"
+                )
+            try:
+                _probe_speed_change_values(Mode.ACI, args.ac_bandwidth_hz, args.aci_frequency_hz)
+            except ValueError as exc:
+                parser.error(f"ACI source cannot support the probe's bandwidth changes: {exc}")
+        elif gui_probe_mode == Mode.RES4:
+            if not args.confirm_front_res4_four_wire:
+                parser.error("--probe-real-gui-res4 requires --confirm-front-res4-four-wire")
+            if args.res4_range_ohm is None:
+                parser.error("--probe-real-gui-res4 requires --res4-range-ohm")
+
+        if gui_probe_mode not in (Mode.ACV, Mode.ACI) and args.ac_bandwidth_hz is not None:
+            parser.error("--ac-bandwidth-hz is only valid with ACV or ACI GUI probes")
         if gui_probe_mode != Mode.ACI and any(value is not None for value in (
-            args.aci_current_arms, args.aci_frequency_hz, args.aci_range_a, args.ac_bandwidth_hz,
+            args.aci_current_arms, args.aci_frequency_hz, args.aci_range_a,
         )):
             parser.error("--aci-* options are only valid with --probe-real-gui-aci")
+        if gui_probe_mode != Mode.ACV and acv_options_present:
+            parser.error("--acv-* options are only valid with --probe-real-gui-acv")
+        if gui_probe_mode != Mode.RES4 and res4_options_present:
+            parser.error("--res4-range-ohm is only valid with --probe-real-gui-res4")
         if gui_probe_mode != Mode.DCV and args.confirm_front_voltage_source:
             parser.error("--confirm-front-voltage-source is only valid with --probe-real-gui-dcv")
+        if gui_probe_mode != Mode.ACV and args.confirm_front_acv_voltage_source:
+            parser.error("--confirm-front-acv-voltage-source is only valid with --probe-real-gui-acv")
         if gui_probe_mode != Mode.DCI and args.confirm_front_dci_5ma_series:
             parser.error("--confirm-front-dci-5ma-series is only valid with --probe-real-gui-dci")
         if gui_probe_mode != Mode.ACI and args.confirm_front_aci_current_series:
             parser.error("--confirm-front-aci-current-series is only valid with --probe-real-gui-aci")
+        if gui_probe_mode != Mode.RES4 and args.confirm_front_res4_four_wire:
+            parser.error("--confirm-front-res4-four-wire is only valid with --probe-real-gui-res4")
         if args.confirm_restore_current_settings and gui_probe_mode not in (Mode.DCI, Mode.ACI):
             parser.error("--confirm-restore-current-settings is only valid with --probe-real-gui-dci/aci")
         if gui_probe_mode != Mode.RES2 and (args.confirm_front_2w_30mohm or args.confirm_front_2w_short):
@@ -1335,6 +1568,15 @@ def main(argv: list[str] | None = None) -> int:
             probe_kwargs["measurement_mode"] = gui_probe_mode
         if gui_probe_mode == Mode.DCV:
             probe_kwargs["voltage_source_confirmed"] = True
+        elif gui_probe_mode == Mode.ACV:
+            probe_kwargs.update(
+                acv_voltage_source_confirmed=True,
+                acv_source_vrms=args.acv_source_vrms,
+                acv_source_vpeak=args.acv_source_vpeak,
+                acv_source_frequency_hz=args.acv_frequency_hz,
+                acv_range_v=args.acv_range_v,
+                ac_bandwidth_hz=args.ac_bandwidth_hz,
+            )
         elif gui_probe_mode == Mode.DCI:
             probe_kwargs["dci_current_source_confirmed"] = True
         elif gui_probe_mode == Mode.ACI:
@@ -1345,14 +1587,21 @@ def main(argv: list[str] | None = None) -> int:
                 aci_range_a=args.aci_range_a,
                 ac_bandwidth_hz=args.ac_bandwidth_hz,
             )
+        elif gui_probe_mode == Mode.RES4:
+            probe_kwargs.update(
+                res4_four_wire_confirmed=True,
+                res4_range_ohm=args.res4_range_ohm,
+            )
         return run_real_gui_speed_probe(args.port or "COM3", args.report, **probe_kwargs)
     if (
         args.port or args.report or args.confirm_front_2w_30mohm
         or args.confirm_front_2w_short or args.confirm_front_voltage_source
-        or args.confirm_front_dci_5ma_series or args.confirm_front_aci_current_series
+        or args.confirm_front_acv_voltage_source or args.confirm_front_dci_5ma_series
+        or args.confirm_front_aci_current_series or args.confirm_front_res4_four_wire
         or args.confirm_restore_current_settings
         or args.aci_current_arms is not None or args.aci_frequency_hz is not None
         or args.aci_range_a is not None or args.ac_bandwidth_hz is not None
+        or acv_options_present or res4_options_present
         or args.baudrate != 9600
     ):
         parser.error("hardware connection options are only valid with a hardware probe")

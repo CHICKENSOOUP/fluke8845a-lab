@@ -17,13 +17,15 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication, QObject, QThread, QUrl, Qt, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 
-from .filter_policy import digital_filter_enable_error
+from .filter_policy import digital_filter_setting_error
 from .mock import Mock8845A, MockScenario
 from .modes import DESCRIPTORS, Mode, descriptor, range_label
+from .path_security import resolve_safe_child_file
 from .scpi import (
     CURRENT_RANGE_FIRMWARE_MINIMUM, FRONT_ONLY_CURRENT_RANGES,
     FlowControl, ModeSettings, SerialSettings,
-    current_autorange_block_reason, select_range_firmware, unsupported_current_ranges,
+    current_autorange_block_reason, current_firmware_gate_evidence_note,
+    select_range_firmware, unsupported_current_ranges,
 )
 from .versioning import compare_firmware
 from .storage import (
@@ -293,17 +295,7 @@ class WebChartHistory:
         directory_text = state.get("experiment_dir") or state.get("last_experiment_dir") or ""
         if not isinstance(directory_text, str) or not directory_text.strip():
             return None
-        try:
-            directory = Path(directory_text).expanduser().resolve(strict=True)
-            candidate = directory / "measurements.csv"
-            resolved = candidate.resolve(strict=True)
-            if not directory.is_dir() or resolved.name != "measurements.csv" or resolved.parent != directory:
-                return None
-            if not resolved.is_file():
-                return None
-            return resolved
-        except (OSError, RuntimeError, ValueError):
-            return None
+        return resolve_safe_child_file(directory_text, "measurements.csv")
 
     def _job_is_current(self, path: Path) -> bool:
         state = self._store.snapshot()
@@ -721,8 +713,9 @@ def mode_settings_from_payload(payload: dict) -> ModeSettings:
         raise ValueError(f"{spec.label}不支持交流带宽设置")
     if not spec.analog_filter and payload.get("analog_filter", False) not in (False, None):
         raise ValueError(f"{spec.label}不支持直流模拟滤波器")
-    if payload.get("digital_filter", False) not in (False, None):
-        raise ValueError(digital_filter_enable_error(mode))
+    digital_filter = _required_bool(payload, "digital_filter", False)
+    if digital_filter and not spec.digital_filter:
+        raise ValueError(f"{spec.label}不支持直流数字滤波")
     raw_input_impedance = payload.get("input_impedance_auto")
     if spec.input_impedance_auto:
         input_impedance_auto = _required_bool(payload, "input_impedance_auto", False)
@@ -735,6 +728,9 @@ def mode_settings_from_payload(payload: dict) -> ModeSettings:
     range_si = None if autorange or raw_range in (None, "") else _finite_number(raw_range, "量程")
     nplc = payload.get("nplc") if spec.nplc_values else None
     nplc = None if nplc in (None, "") else _finite_number(nplc, "NPLC")
+    filter_error = digital_filter_setting_error(mode, digital_filter, nplc=nplc)
+    if filter_error:
+        raise ValueError(filter_error)
     bandwidth = payload.get("ac_bandwidth_hz") if spec.ac_bandwidths_hz else None
     if bandwidth in (None, ""):
         bandwidth = None
@@ -748,7 +744,7 @@ def mode_settings_from_payload(payload: dict) -> ModeSettings:
         ac_bandwidth_hz=bandwidth,
         analog_filter=_required_bool(payload, "analog_filter") if spec.analog_filter else False,
         autozero=_required_bool(payload, "autozero", True),
-        digital_filter=False,
+        digital_filter=digital_filter,
         input_impedance_auto=input_impedance_auto,
     )
     settings.validate()
@@ -1263,11 +1259,20 @@ class WebCommandRouter(QObject):
                 reasons.append(
                     f"{firmware_source}版本 {firmware} 低于 400 mA 档要求 {required}"
                 )
+                evidence_note = current_firmware_gate_evidence_note(settings.mode)
+                if evidence_note:
+                    reasons.append(evidence_note)
             if value in FRONT_ONLY_CURRENT_RANGES and not terminals.strip().upper().startswith("FRON"):
                 reasons.append(f"端子 {terminals or '未确认'} 不支持该前面板档位")
             if reasons:
+                conflict_dimensions = []
+                if value == 0.4 and minimum and compare_firmware(firmware, minimum) is False:
+                    conflict_dimensions.append("固件")
+                if value in FRONT_ONLY_CURRENT_RANGES and not terminals.strip().upper().startswith("FRON"):
+                    conflict_dimensions.append("端子")
+                dimension_label = "/".join(conflict_dimensions) or "仪器"
                 conflicts.append(
-                    f"量程：{range_label(value, spec.unit_si)} 与最近回读的固件/端子冲突（{'；'.join(reasons)}）"
+                    f"量程：{range_label(value, spec.unit_si)} 与最近回读的{dimension_label}状态冲突（{'；'.join(reasons)}）"
                 )
         return conflicts, basis
 

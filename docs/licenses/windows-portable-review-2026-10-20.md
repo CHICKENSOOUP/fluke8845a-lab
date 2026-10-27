@@ -4,7 +4,7 @@
 
 ## English
 
-This is the current local review record for Windows portable candidates. It is an engineering inventory, not legal advice or approval to distribute a binary. The exact build is identified by the archived `BUILD-PROVENANCE.json`; the generated runtime manifest and Qt inventory are the per-build file records. The 2026-10-15 review and CSV inventory are historical snapshots and must not be used as the current candidate inventory.
+This record documents an engineering review performed on 2026-10-20; it is not a package-specific review of candidates built on or after 2026-10-21. It is an engineering inventory, not legal advice or approval to distribute a binary. The reviewed build must be identified by its archived `BUILD-PROVENANCE.json`; the generated runtime manifest and Qt inventory are the per-build file records. Every later build requires a separate review against its own provenance and package contents. The 2026-10-15 review and CSV inventory are historical snapshots and must not be used as a newer candidate's inventory.
 
 ### Mechanical checks
 
@@ -24,7 +24,7 @@ Until these items are closed with candidate-specific evidence, the Windows porta
 
 ## 简体中文
 
-本文件是 Windows 便携候选包的当前本地审查记录，属于工程库存审查，不构成法律意见或二进制公开发布批准。每个确切构建由归档内的 `BUILD-PROVENANCE.json` 标识；运行时清单和 Qt 清单按构建生成。2026-10-15 的审查记录和 CSV 是历史快照，不能当作当前候选包的清单。
+本文件记录 2026-10-20 执行的工程审查，不是对 2026-10-21 或之后构建的逐包审查或批准，也不构成法律意见或二进制公开发布许可。经审查的构建必须由归档内的 `BUILD-PROVENANCE.json` 标识；运行时清单和 Qt 清单按构建生成。每个后续构建都需根据自身来源信息和包内容单独审查。2026-10-15 的审查记录和 CSV 是历史快照，不能当作更新候选包的清单。
 
 ### 已执行的机械核对
 

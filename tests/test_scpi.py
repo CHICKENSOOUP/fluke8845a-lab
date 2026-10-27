@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sys
+import math
+
 import pytest
 
-from fluke8845a.filter_policy import digital_filter_enable_error
 from fluke8845a.modes import Mode, descriptor, mode_from_scpi_function, range_label
 from fluke8845a.scpi import (
     FlowControl, InstrumentError, InstrumentIdentityError, InstrumentLocalModeError, ModeSettings, PySerialTransport, ReadingError, Rs232TerminalModeError,
@@ -60,6 +62,69 @@ def test_connect_reports_port_and_8845a_identification_stages_and_enters_remote_
         ("identify", "running"), ("identify", "success"),
     ]
     assert transport.commands[:2] == ["SYST:REM", "*IDN?"]
+    instrument.close()
+
+
+def test_connect_drains_an_exactly_full_8845a_error_queue():
+    transport = FakeTransport()
+    logs = []
+    transport.error_queue.extend(
+        f'-100,"queued error {index}"' for index in range(16)
+    )
+    instrument = Serial8845A(
+        "COM3", SerialSettings(), log_callback=logs.append,
+        transport_factory=lambda *_: transport,
+    )
+
+    info = instrument.connect()
+
+    assert info.model == "8845A"
+    assert instrument.connected
+    assert transport.commands.count("SYST:ERR?") == 17
+    assert sum(line.startswith("! 连接时仪器已有错误：") for line in logs) == 16
+    assert not transport.error_queue
+    instrument.close()
+
+
+@pytest.mark.parametrize("error_count", [15, 16])
+def test_error_drain_at_capacity_reports_meter_errors_after_empty_terminator(error_count):
+    transport = FakeTransport()
+    instrument = Serial8845A("COM3", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    transport.commands.clear()
+    transport.error_queue.extend(
+        f'-100,"queued error {index}"' for index in range(error_count)
+    )
+
+    with pytest.raises(ScpiProtocolError, match="配置后仪器报告错误") as error:
+        instrument._drain_errors("配置后仪器报告错误", fail=True)
+
+    assert "错误队列超过16条" not in str(error.value)
+    assert transport.commands.count("SYST:ERR?") == error_count + 1
+    assert not transport.error_queue
+    instrument.close()
+
+
+def test_error_drain_does_not_record_a_seventeenth_error():
+    transport = FakeTransport()
+    logs = []
+    instrument = Serial8845A(
+        "COM3", SerialSettings(), log_callback=logs.append,
+        transport_factory=lambda *_: transport,
+    )
+    instrument.connect()
+    transport.commands.clear()
+    logs.clear()
+    transport.error_queue.extend(
+        f'-100,"queued error {index}"' for index in range(17)
+    )
+
+    with pytest.raises(ScpiProtocolError, match="错误队列超过16条"):
+        instrument._drain_errors("连接诊断", fail=True)
+
+    assert transport.commands.count("SYST:ERR?") == 17
+    assert sum(line.startswith("! 连接诊断：") for line in logs) == 16
+    assert not transport.error_queue
     instrument.close()
 
 
@@ -384,6 +449,85 @@ def test_default_serial_settings_match_confirmed_instrument_parameters():
     assert settings.eol == "CRLF"
 
 
+@pytest.mark.parametrize(
+    ("flow_control", "expected_flow"),
+    [
+        (FlowControl.NONE, {"xonxoff": False, "rtscts": False}),
+        (FlowControl.XONXOFF, {"xonxoff": True, "rtscts": False}),
+        (FlowControl.RTSCTS, {"xonxoff": False, "rtscts": True}),
+    ],
+)
+def test_pyserial_transport_maps_windows_serial_settings_without_opening_hardware(
+    monkeypatch, flow_control, expected_flow
+):
+    from types import SimpleNamespace
+
+    captured = {}
+    opened_port = SimpleNamespace(is_open=True)
+
+    def serial_factory(**kwargs):
+        captured.update(kwargs)
+        return opened_port
+
+    serial_stub = SimpleNamespace(
+        PARITY_NONE="N",
+        PARITY_EVEN="E",
+        PARITY_ODD="O",
+        STOPBITS_ONE=1,
+        STOPBITS_TWO=2,
+        Serial=serial_factory,
+    )
+    monkeypatch.setitem(sys.modules, "serial", serial_stub)
+    settings = SerialSettings(
+        baudrate=115200,
+        bytesize=8,
+        parity="N",
+        stopbits=1,
+        flow_control=flow_control,
+        eol="CRLF",
+        timeout_s=1.25,
+    )
+    transport = PySerialTransport("COM3", settings)
+
+    transport.open()
+
+    assert captured == {
+        "port": "COM3",
+        "baudrate": 115200,
+        "bytesize": 8,
+        "parity": "N",
+        "stopbits": 1,
+        "timeout": 1.25,
+        "write_timeout": 1.25,
+        **expected_flow,
+        "dsrdtr": False,
+    }
+    assert transport._port is opened_port
+
+
+def test_pyserial_transport_leaves_no_open_port_when_serial_constructor_fails(monkeypatch):
+    from types import SimpleNamespace
+
+    def fail_open(**_kwargs):
+        raise OSError("simulated COM3 unavailable")
+
+    serial_stub = SimpleNamespace(
+        PARITY_NONE="N",
+        PARITY_EVEN="E",
+        PARITY_ODD="O",
+        STOPBITS_ONE=1,
+        STOPBITS_TWO=2,
+        Serial=fail_open,
+    )
+    monkeypatch.setitem(sys.modules, "serial", serial_stub)
+    transport = PySerialTransport("COM3", SerialSettings())
+
+    with pytest.raises(InstrumentError, match="打开串口COM3失败"):
+        transport.open()
+
+    assert transport._port is None
+
+
 @pytest.mark.parametrize(("bytesize", "parity"), [(8, "N"), (7, "E"), (7, "O")])
 def test_serial_settings_accept_only_documented_data_and_parity_pairs(bytesize, parity):
     settings = SerialSettings(bytesize=bytesize, parity=parity)
@@ -528,7 +672,7 @@ def test_read_response_boundary_is_before_the_following_range_query(monkeypatch)
     events = []
     clock_value = 0
 
-    def monotonic_ns():
+    def perf_counter_ns():
         nonlocal clock_value
         clock_value += 1_000_000
         events.append("host-clock")
@@ -547,7 +691,7 @@ def test_read_response_boundary_is_before_the_following_range_query(monkeypatch)
     instrument.connect()
     instrument.configure(ModeSettings(Mode.DCV))
     events.clear()
-    monkeypatch.setattr(scpi_module.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(scpi_module.time, "perf_counter_ns", perf_counter_ns)
 
     reading = instrument.read()
 
@@ -611,7 +755,7 @@ def test_range_query_failure_does_not_replace_read_response_timing(monkeypatch):
 
     clock_value = 0
 
-    def monotonic_ns():
+    def perf_counter_ns():
         nonlocal clock_value
         clock_value += 1_000_000
         return clock_value
@@ -622,7 +766,7 @@ def test_range_query_failure_does_not_replace_read_response_timing(monkeypatch):
     instrument.configure(ModeSettings(Mode.DCV))
     transport.timeouts.add("SENS:VOLT:DC:RANG?")
     transport.commands.clear()
-    monkeypatch.setattr(scpi_module.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(scpi_module.time, "perf_counter_ns", perf_counter_ns)
 
     with pytest.raises(ScpiTimeout) as caught:
         instrument.read()
@@ -727,16 +871,62 @@ def test_dcv_configuration_explicitly_restores_default_10_megohm_input_impedance
     instrument.close()
 
 
-def test_serial_digital_filter_enable_is_rejected_until_read_timeout_is_validated():
+def test_known_pre_2_outguard_rejects_digital_filter_before_changing_mode():
     transport = FakeTransport()
     instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
     instrument.connect()
+    instrument.set_firmware_versions("1.9.0.0", "")
 
-    with pytest.raises(UnsupportedRange, match="最大READ\\?响应时间"):
+    with pytest.raises(UnsupportedRange, match="OutG SW.*早于 2.0"):
         instrument.configure(ModeSettings(Mode.DCV, nplc=10, digital_filter=True))
 
     assert not any(command.startswith("CONF:") for command in transport.commands)
     assert not any(":FILT:DIG ON" in command for command in transport.commands)
+    instrument.close()
+
+
+def test_unknown_outguard_allows_filter_probe_and_keeps_read_timeout_finite():
+    transport = FakeTransport(idn="FLUKE,8845A,TEST8845A001,02/14/08-08:54")
+    instrument = Serial8845A("COM7", SerialSettings(timeout_s=2), transport_factory=lambda *_: transport)
+    instrument.connect()
+
+    result = instrument.configure(ModeSettings(Mode.DCV, nplc=10, digital_filter=True))
+
+    assert result["digital_filter_response"] == "1"
+    assert math.isfinite(result["measurement_read_timeout_s"])
+    assert result["measurement_read_timeout_s"] >= 2
+    assert instrument._active_settings.digital_filter is True
+    instrument.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "prefix"),
+    [
+        (Mode.DCV, "SENS:VOLT:DC"),
+        (Mode.DCI, "SENS:CURR:DC"),
+        (Mode.RES2, "SENS:RES"),
+        (Mode.RES4, "SENS:FRES"),
+    ],
+)
+def test_slow_dc_configuration_enables_and_verifies_requested_digital_filter(mode, prefix):
+    transport = FakeTransport(idn="FLUKE,8845A,TEST8845A001,02/14/08-08:54")
+    instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.set_firmware_versions("2.10.882.24", "")
+    transport.commands.clear()
+
+    settings = ModeSettings(mode, nplc=10, digital_filter=True)
+    result = instrument.configure(settings)
+
+    off = f"{prefix}:FILT:DIG OFF"
+    readback = f"{prefix}:FILT:DIG?"
+    nplc = f"{prefix}:NPLC 10"
+    on = f"{prefix}:FILT:DIG ON"
+    assert transport.commands.index(off) < transport.commands.index(readback) < transport.commands.index(nplc)
+    assert transport.commands.index(nplc) < transport.commands.index(on)
+    assert transport.commands.index(on) < len(transport.commands) - 1 - transport.commands[::-1].index(readback)
+    assert result["digital_filter_response"] == "1"
+    assert instrument.read_settings(mode).digital_filter is True
     instrument.close()
 
 
@@ -1009,13 +1199,41 @@ def test_digital_filter_rejects_inapplicable_modes_and_fast_nplc(settings):
 
 
 @pytest.mark.parametrize("nplc", [10, 100])
-def test_mode_settings_rejects_digital_filter_request_at_slow_nplc(nplc):
+def test_mode_settings_accepts_digital_filter_request_at_slow_nplc(nplc):
     settings = ModeSettings(Mode.DCV, nplc=nplc, digital_filter=True)
 
-    with pytest.raises(ValueError) as error:
-        settings.validate()
+    assert settings.validate() == descriptor(Mode.DCV)
 
-    assert str(error.value) == digital_filter_enable_error(Mode.DCV)
+
+def test_live_measurement_speed_can_enable_and_disable_digital_filter():
+    transport = FakeTransport()
+    instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.set_firmware_versions("2.10.882.24", "")
+    instrument.configure(ModeSettings(Mode.DCV, nplc=1))
+    transport.commands.clear()
+
+    enabled = instrument.set_measurement_speed(
+        ModeSettings(Mode.DCV, nplc=10, digital_filter=True)
+    )
+
+    off = "SENS:VOLT:DC:FILT:DIG OFF"
+    readback = "SENS:VOLT:DC:FILT:DIG?"
+    nplc = "SENS:VOLT:DC:NPLC 10"
+    on = "SENS:VOLT:DC:FILT:DIG ON"
+    assert transport.commands.index(off) < transport.commands.index(readback) < transport.commands.index(nplc)
+    assert transport.commands.index(nplc) < transport.commands.index(on)
+    assert enabled["digital_filter_response"] == "1"
+    assert instrument._active_settings.digital_filter is True
+
+    transport.commands.clear()
+    disabled = instrument.set_measurement_speed(ModeSettings(Mode.DCV, nplc=1))
+    assert transport.commands.index(off) < transport.commands.index(readback) < transport.commands.index(
+        "SENS:VOLT:DC:NPLC 1"
+    )
+    assert disabled["digital_filter_response"] == "0"
+    assert instrument._active_settings.digital_filter is False
+    instrument.close()
 
 
 def test_read_settings_reports_the_instrument_setup_without_reconfiguring():
@@ -1443,6 +1661,30 @@ def test_400ma_aci_allows_unknown_or_supported_outguard_version(outguard_version
     instrument.close()
 
 
+def test_400ma_aci_is_not_gated_by_outguard_when_spec_field_is_ambiguous():
+    transport = FakeTransport("FLUKE,8845A,123,1.0.700.17", terminals="FRONT")
+    instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.set_firmware_versions("1.0.700.17", "ad300210")
+
+    instrument.configure(ModeSettings(Mode.ACI, autorange=False, range_si=0.4, ac_bandwidth_hz=20))
+
+    assert "SENS:CURR:AC:RANG 0.4" in transport.commands
+    instrument.close()
+
+
+def test_aci_autorange_is_not_gated_by_unmapped_outguard_version():
+    transport = FakeTransport("FLUKE,8845A,123,1.0.700.17", terminals="FRONT")
+    instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
+    instrument.connect()
+    instrument.set_firmware_versions("1.0.700.17", "ad300210")
+
+    instrument.configure(ModeSettings(Mode.ACI, autorange=True, ac_bandwidth_hz=20))
+
+    assert "SENS:CURR:AC:RANG:AUTO ON" in transport.commands
+    instrument.close()
+
+
 def test_firmware_compare_returns_unknown_instead_of_guessing():
     assert compare_firmware("version unknown", (2, 0)) is None
     assert compare_firmware("1.0.0", (2, 0)) is None
@@ -1572,7 +1814,6 @@ def test_old_outguard_only_blocks_fixed_400ma_range(mode, outguard_version, rang
     ("mode", "outguard_version", "terminals"),
     [
         (Mode.DCI, "1.0", "FRONT"),
-        (Mode.ACI, "1.0.700.17", "FRONT"),
         (Mode.DCI, "2.0", "REAR"),
         (Mode.ACI, "1.0.700.18", "REAR"),
     ],
@@ -1605,7 +1846,6 @@ def test_current_autorange_allows_date_coded_idn_firmware_on_front_terminals():
     ("mode", "outguard_version", "terminals", "range_si"),
     [
         (Mode.DCI, "1.0.700.18", "FRONT", 0.4),
-        (Mode.ACI, "1.0.700.17", "FRONT", 0.4),
         (Mode.DCI, "2.0", "REAR", 1.0),
         (Mode.ACI, "1.0.700.18", "REAR", 10.0),
     ],
@@ -1617,7 +1857,7 @@ def test_current_fixed_range_limits_are_rejected_before_mode_configuration(mode,
     instrument.set_firmware_versions(outguard_version, "")
     before = len(transport.commands)
 
-    with pytest.raises(UnsupportedRange):
+    with pytest.raises(UnsupportedRange) as exc_info:
         instrument.configure(ModeSettings(mode, autorange=False, range_si=range_si))
 
     assert not any(command.startswith("CONF:") for command in transport.commands[before:])
@@ -1626,9 +1866,9 @@ def test_current_fixed_range_limits_are_rejected_before_mode_configuration(mode,
 
 @pytest.mark.parametrize(
     ("mode", "outguard_version"),
-    [(Mode.DCI, "2.0"), (Mode.ACI, "1.0.700.18")],
+    [(Mode.DCI, "2.0"), (Mode.ACI, "1.0.700.17")],
 )
-def test_current_autorange_is_allowed_when_outguard_and_front_terminals_are_confirmed(mode, outguard_version):
+def test_current_autorange_is_allowed_on_front_with_mode_specific_firmware_evidence(mode, outguard_version):
     transport = FakeTransport("FLUKE,8845A,123,1.0", terminals="FRONT")
     instrument = Serial8845A("COM7", SerialSettings(), transport_factory=lambda *_: transport)
     instrument.connect()

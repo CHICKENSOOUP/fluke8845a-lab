@@ -306,6 +306,111 @@ test("disabled Web controls explain Local mode and active acquisition locks", ()
   assert.match(element(elements, "disconnect").title, /采集中/);
 });
 
+test("Web serial controls explain that disconnecting unlocks connection settings", () => {
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ simulation: false, control_mode: "computer" }));
+
+  for (const id of ["port", "portList", "baudrate", "bytesize", "parity", "stopbits", "eol", "flow", "serialTimeout", "scanPorts"]) {
+    assert.equal(element(elements, id).disabled, true, `${id} is locked while connected`);
+    assert.match(element(elements, id).title, /断开.*修改/);
+  }
+
+  api.updateStateDisplay(connectedState({ connected: false, simulation: false, status: "未连接" }));
+  assert.equal(element(elements, "baudrate").disabled, false);
+  assert.doesNotMatch(element(elements, "baudrate").title, /已连接.*断开/);
+});
+
+test("Web firmware fields and clear action explain disconnected, Mock, and acquisition locks", () => {
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ connected: false, simulation: false, status: "未连接" }));
+  assert.equal(element(elements, "outguardSoftware").disabled, true);
+  assert.match(element(elements, "outguardSoftware").title, /连接真实仪器/);
+
+  api.updateStateDisplay(connectedState({ simulation: true, status: "MOCK 模拟器已连接" }));
+  assert.match(element(elements, "outguardSoftware").title, /MOCK.*不使用/);
+
+  api.updateStateDisplay(connectedState({
+    simulation: false, status: "连续采集中", device: { serial_number: "TEST8845A001" },
+  }));
+  assert.match(element(elements, "outguardSoftware").title, /采集中.*停止/);
+  assert.match(element(elements, "clearManualSoftware").title, /采集中.*停止/);
+
+  api.updateStateDisplay(connectedState({
+    simulation: false, status: "就绪", device: { serial_number: "TEST8845A001" },
+  }));
+  assert.equal(element(elements, "outguardSoftware").disabled, false);
+  assert.match(element(elements, "clearManualSoftware").title, /没有.*记录/);
+});
+
+test("Web safe exports explain when a saved run is required and when acquisition must stop", () => {
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({ connected: false, simulation: false, status: "未连接" }));
+  for (const id of ["downloadEventsSafe", "downloadMeasurementsSafe", "downloadSharePackage"]) {
+    assert.equal(element(elements, id).disabled, true);
+    assert.match(element(elements, id).title, /完成.*实验/);
+  }
+
+  api.updateStateDisplay(connectedState({
+    experiment_dir: "C:/experiments/run-1", last_experiment_dir: "C:/experiments/run-1",
+    status: "连续采集中",
+  }));
+  for (const id of ["downloadEventsSafe", "downloadMeasurementsSafe", "downloadSharePackage"]) {
+    assert.equal(element(elements, id).disabled, true);
+    assert.match(element(elements, id).title, /停止.*采集/);
+  }
+
+  api.updateStateDisplay(connectedState({ last_experiment_dir: "C:/experiments/run-1", status: "就绪" }));
+  assert.equal(element(elements, "downloadEventsSafe").disabled, false);
+  assert.match(element(elements, "downloadEventsSafe").title, /原始 events\.csv 不会更改/);
+});
+
+test("fixed range tooltip updates on auto toggle and combines Local acquisition locks", async () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.populateModeOptions(dcv);
+  element(elements, "autorange").checked = true;
+
+  api.updateStateDisplay(connectedState({
+    active_settings: { mode: "DCV", autorange: true, range_si: null },
+  }));
+
+  assert.equal(element(elements, "range").disabled, true);
+  assert.match(element(elements, "range").title, /自动量程.*关闭.*固定量程/);
+
+  api.updateStateDisplay(connectedState({
+    connected: false, simulation: false, status: "未连接",
+    active_settings: { mode: "DCV", autorange: true, range_si: null },
+  }));
+  assert.doesNotMatch(element(elements, "range").title, /请先连接/);
+
+  api.app.state = connectedState({
+    simulation: false, control_mode: "local", status: "连续采集中",
+    active_settings: { mode: "DCV", autorange: true, range_si: null },
+  });
+  api.updateStateDisplay(api.app.state);
+  assert.match(element(elements, "range").title, /Local/);
+  assert.match(element(elements, "range").title, /采集中/);
+
+  api.updateStateDisplay(connectedState({
+    simulation: false, control_mode: "computer", status: "就绪",
+    active_settings: { mode: "DCV", autorange: true, range_si: null },
+  }));
+  assert.equal(element(elements, "mode").disabled, false);
+  assert.doesNotMatch(element(elements, "mode").title, /Local|采集中/);
+
+  api.app.state = connectedState({ active_settings: { mode: "DCV", autorange: true, range_si: null } });
+  api.updateStateDisplay(api.app.state);
+  await element(elements, "autorange").dispatch("change");
+  assert.match(element(elements, "range").title, /自动量程.*关闭.*固定量程/);
+
+  element(elements, "autorange").checked = false;
+  await element(elements, "autorange").dispatch("change");
+
+  assert.equal(element(elements, "range").disabled, false);
+  assert.doesNotMatch(element(elements, "range").title, /自动量程/);
+});
+
 test("mode settings bind only controls supported by the selected mode", () => {
   const { api, context, elements } = createFrontend();
   const getElementById = context.document.getElementById;
@@ -362,34 +467,62 @@ test("wide Web empty plot shortens the chart and keeps its actions visible", asy
     .replace('<link rel="stylesheet" href="/app.css">', `<style>${css}</style>`)
     .replace(/\s*<script[^>]*>[\s\S]*?<\/script>|\s*<script[^>]*><\/script>/g, "")
     .replace(/\s*<script[^>]*src="[^"]*"[^>]*><\/script>/g, "");
+  const appScript = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
+  const stateTransitionStart = appScript.indexOf("function updateEmptyPlotState(");
+  const stateTransitionEnd = appScript.indexOf("\nfunction drawChart(", stateTransitionStart);
+  assert.ok(stateTransitionStart >= 0 && stateTransitionEnd > stateTransitionStart, "extract the actual empty-state transition from app.js");
+  const stateTransition = [
+    "const app = { state: null, chartCleared: false };",
+    "const el = (id) => document.getElementById(id);",
+    "const validPoints = () => [];",
+    appScript.slice(stateTransitionStart, stateTransitionEnd),
+  ].join("\n");
+  const page = source.replace(
+    "</body>",
+    `<script>${stateTransition}</script></body>`,
+  );
+  const serializedPage = JSON.stringify(page).replace(/<\/script/gi, "<\\/script");
   const probe = `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script>
     const frame = document.createElement("iframe");
     frame.style.cssText = "display:block;border:0;width:1440px;height:900px";
-    frame.srcdoc = ${JSON.stringify(source)};
-    document.body.appendChild(frame);
+    const report = (value) => { document.getElementById("result").textContent = JSON.stringify(value); };
     frame.addEventListener("load", () => requestAnimationFrame(() => {
-      const doc = frame.contentDocument;
-      const area = doc.querySelector("#measurementArea");
-      const chart = doc.querySelector(".chart-panel");
-      const fullHeight = chart.getBoundingClientRect().height;
-      area.classList.add("chart-empty");
-      requestAnimationFrame(() => {
-        const actions = ["emptyOpenSettings", "emptyConnectMock"].map((id) => {
-          const node = doc.getElementById(id);
-          const rect = node.getBoundingClientRect();
-          return getComputedStyle(node).display !== "none" && rect.width > 0 && rect.height > 0;
+      try {
+        const doc = frame.contentDocument;
+        const updateEmptyPlotState = frame.contentWindow.updateEmptyPlotState;
+        if (typeof updateEmptyPlotState !== "function") throw new Error("frontend empty-state transition is unavailable");
+        const chart = doc.querySelector(".chart-panel");
+        const fullHeight = chart.getBoundingClientRect().height;
+        updateEmptyPlotState(false);
+        requestAnimationFrame(() => {
+          try {
+            const actions = ["emptyOpenSettings", "emptyConnectMock"].map((id) => {
+              const node = doc.getElementById(id);
+              const rect = node.getBoundingClientRect();
+              return getComputedStyle(node).display !== "none" && rect.width > 0 && rect.height > 0;
+            });
+            report({
+              fullHeight,
+              emptyHeight: chart.getBoundingClientRect().height,
+              actions,
+              emptyTitle: doc.getElementById("emptyTitle").textContent,
+            });
+          } catch (error) {
+            report({ error: String(error), stack: error?.stack || "" });
+          }
         });
-        document.getElementById("result").textContent = JSON.stringify({
-          fullHeight,
-          emptyHeight: chart.getBoundingClientRect().height,
-          actions,
-        });
-      });
+      } catch (error) {
+        report({ error: String(error), stack: error?.stack || "" });
+      }
     }));
+    frame.srcdoc = ${serializedPage};
+    document.body.appendChild(frame);
   </script>`;
   const metrics = await inspectChromiumDom(browser, probe);
+  assert.equal(metrics.error, undefined, `frontend empty-state geometry probe runs: ${JSON.stringify(metrics)}`);
   assert.ok(metrics.emptyHeight >= 220 && metrics.emptyHeight <= 320, `wide empty chart is compact: ${JSON.stringify(metrics)}`);
   assert.ok(metrics.emptyHeight < metrics.fullHeight * 0.6, `wide empty chart is shorter than the data layout: ${JSON.stringify(metrics)}`);
+  assert.equal(metrics.emptyTitle, "图表还没有数据", "geometry is measured after the real frontend empty-state transition");
   assert.deepEqual(metrics.actions, [true, true], "settings and Mock connection remain available in the empty chart");
 });
 
@@ -591,6 +724,53 @@ test("mode changes keep NPLC choices enabled without firmware guard metadata", (
   );
 });
 
+test("digital filter is available for slow DC settings and clears when NPLC becomes fast", async () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.populateModeOptions(dcv);
+  element(elements, "nplc").value = "10";
+  await element(elements, "nplc").dispatch("change");
+
+  const filter = element(elements, "digitalFilter");
+  assert.equal(filter.disabled, false);
+  assert.match(filter.title, /OutG SW.*2\.0/);
+  filter.checked = true;
+  element(elements, "nplc").value = "1";
+  await element(elements, "nplc").dispatch("change");
+
+  assert.equal(filter.checked, false, "NPLC at or below one cannot retain the filter selection");
+  assert.equal(filter.disabled, true);
+  assert.match(filter.title, /NPLC.*10.*100/);
+});
+
+test("known pre-2.0 OutG firmware disables digital filter selection", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.populateModeOptions(dcv);
+  element(elements, "nplc").value = "10";
+  api.updateStateDisplay(connectedState({ simulation: false, device: {
+    range_firmware: "1.9.0.0", range_firmware_source: "面板核对的 OutG SW",
+  } }));
+
+  assert.equal(element(elements, "digitalFilter").disabled, true);
+  assert.match(element(elements, "digitalFilter").title, /OutG SW.*早于 2\.0/);
+});
+
+test("empty settings comparison stays readable in Chinese before a mode is available", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.clear();
+  api.app.selectedMode = "";
+  element(elements, "mode").value = "";
+
+  api.renderSettingsComparison(connectedState());
+
+  const message = element(elements, "settingsComparison").textContent;
+  assert.match(message, /请先选择测量模式/);
+  assert.doesNotMatch(message, /[\uac00-\ud7af]/);
+});
+
 test("disabled digital filter reports no difference when both active and pending are off", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
@@ -770,16 +950,19 @@ test("IDN version candidates are explicitly unverified and separate from manual 
   const automatic = element(elements, "idnFirmwareInfo").textContent;
   const manual = element(elements, "manualSoftwareInfo").textContent;
   assert.match(automatic, /IDN\?.*候选.*2\.0\.1.*未验证.*OutG SW/);
+  assert.match(automatic, /DCI.*OutG SW.*ACI.*未明确.*OutG SW.*InG SW.*不根据.*自动拒绝/);
   assert.match(manual, /仪表面板人工核对/);
   assert.match(element(elements, "outguardSoftware").value, /2\.10\.882\.24/);
   assert.match(element(elements, "inguardSoftware").value, /ad300210/);
-  assert.doesNotMatch(automatic, /InG|ad300210|2\.10\.882\.24/);
+  assert.doesNotMatch(automatic, /ad300210|2\.10\.882\.24/);
 
   api.updateStateDisplay(connectedState({ simulation: false, device: {
     idn: "FLUKE,8845A,TEST8845A001,02/14/08-08:54", serial_number: "TEST8845A001",
     idn_version_candidate: null, idn_revision: "02/14/08-08:54",
   } }));
-  assert.match(element(elements, "idnFirmwareInfo").textContent, /修订字段.*02\/14\/08-08:54.*不将.*作为.*固件/);
+  const unversionedRevision = element(elements, "idnFirmwareInfo").textContent;
+  assert.match(unversionedRevision, /修订字段.*02\/14\/08-08:54.*不将.*作为.*固件/);
+  assert.match(unversionedRevision, /DCI.*OutG SW.*ACI.*未明确.*OutG SW.*InG SW.*不根据.*自动拒绝/);
   assert.match(element(elements, "manualSoftwareInfo").textContent, /仪表面板人工核对/);
 });
 
@@ -1350,6 +1533,16 @@ test("settings dialog keeps its sections balanced in a responsive two-column lay
   assert.equal(new Set(ids).size, ids.length, "page element IDs remain unique after moving footer actions");
 });
 
+test("experiment name hint explains explicit duplicate-name choices", () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+
+  assert.doesNotMatch(html, /同名实验自动使用独立时间戳目录/);
+  assert.match(
+    html,
+    /发现同名实验时[\s\S]{0,100}覆盖（先备份）[\s\S]{0,100}新建独立目录[\s\S]{0,100}修改名称[\s\S]{0,100}取消[\s\S]{0,40}不会自动覆盖/,
+  );
+});
+
 test("settings cards stack independently in desktop columns and reflow at 820 px in Chromium", async (t) => {
   const candidates = [
     process.env.CHROME_BIN,
@@ -1465,6 +1658,234 @@ test("empty plot actions open settings, connect Mock, and start acquisition", as
   assert.deepEqual(requests.map(({ options }) => JSON.parse(options.body).action), ["connect_mock", "preflight", "start"]);
 });
 
+test("cleared Web chart offers a direct new-measurement action that opens experiment settings", async () => {
+  const { api, elements } = createFrontend();
+  api.app.chartCleared = true;
+  api.updateEmptyPlotState(false);
+  assert.equal(element(elements, "emptyNewMeasurement").classList.contains("hidden"), false);
+  assert.equal(element(elements, "emptyOpenSettings").classList.contains("hidden"), true);
+  assert.match(element(elements, "emptyDetail").textContent, /旧实验 CSV 保留/);
+  assert.match(element(elements, "emptyDetail").textContent, /无需先清空/);
+
+  api.bindControls();
+  await element(elements, "emptyNewMeasurement").dispatch("click");
+
+  assert.equal(element(elements, "settingsDialog").showModalCalled, true);
+  assert.equal(element(elements, "experimentName").focusCalled, true);
+  assert.equal(element(elements, "experimentName").selectCalled, true);
+});
+
+test("new measurement action opens experiment setup without clearing the old chart first", async () => {
+  const { api, elements } = createFrontend();
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const actionBar = html.indexOf('<section class="action-bar"');
+  const newMeasurement = html.indexOf('id="newMeasurement"');
+  const settingsDialog = html.indexOf('<dialog id="settingsDialog"');
+  assert.ok(actionBar >= 0 && newMeasurement > actionBar && newMeasurement < settingsDialog);
+  assert.match(html, /新建测量：点“新建测量”→ 填名称 → 点“单次测量”或“开始连续采集”。新测量开始后自动换图，旧 CSV 保留/);
+  assert.match(html, /id="newMeasurement"[^>]*class="button button-primary"[^>]*>新建测量</);
+  assert.match(html, /id="clearPlot"[^>]*>清空图表/);
+  assert.match(html, /id="singleFromSettings"[^>]*>单次测量/);
+  assert.match(html, /id="startFromSettings"[^>]*>开始连续采集/);
+
+  api.app.points = [{ x: 1, y: 2, status: "ok" }];
+  api.bindControls();
+  await element(elements, "newMeasurement").dispatch("click");
+
+  assert.equal(element(elements, "settingsDialog").showModalCalled, true);
+  assert.equal(element(elements, "experimentName").focusCalled, true);
+  assert.equal(element(elements, "experimentName").selectCalled, true);
+  assert.equal(api.app.points.length, 1);
+});
+
+test("settings window starts a new continuous measurement directly and closes after acceptance", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState();
+  api.updateStateDisplay(api.app.state);
+  element(elements, "experimentName").value = "新一轮测量";
+  const requests = mockSuccessfulCommand(context);
+  api.bindControls();
+
+  await element(elements, "newMeasurement").dispatch("click");
+  await element(elements, "startFromSettings").dispatch("click");
+
+  const commands = requests.map(({ options }) => JSON.parse(options.body));
+  assert.deepEqual(commands.map(({ action }) => action), ["preflight", "start"]);
+  assert.equal(commands[0].payload.name, "新一轮测量");
+  assert.equal(commands[1].payload.name, "新一轮测量");
+  assert.equal(element(elements, "settingsDialog").closeCalled, true);
+});
+
+test("settings window starts a single measurement through the existing preflight", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState();
+  api.updateStateDisplay(api.app.state);
+  element(elements, "experimentName").value = "单次重测";
+  const requests = mockSuccessfulCommand(context);
+  api.bindControls();
+
+  await element(elements, "newMeasurement").dispatch("click");
+  await element(elements, "singleFromSettings").dispatch("click");
+
+  const commands = requests.map(({ options }) => JSON.parse(options.body));
+  assert.deepEqual(commands.map(({ action }) => action), ["preflight", "single"]);
+  assert.equal(commands[1].payload.name, "单次重测");
+  assert.equal(element(elements, "settingsDialog").closeCalled, true);
+});
+
+test("settings start actions match the main controls' connection and acquisition locks", () => {
+  const { api, elements } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  element(elements, "experimentName").value = "状态联动检查";
+  element(elements, "startFromSettings").disabled = true;
+  element(elements, "singleFromSettings").disabled = true;
+
+  api.updateStateDisplay(connectedState({ connected: false, simulation: false, control_mode: "disconnected" }));
+  assert.equal(element(elements, "startFromSettings").disabled, true);
+  assert.equal(element(elements, "singleFromSettings").disabled, true);
+
+  api.updateStateDisplay(connectedState({ status: "等待开始" }));
+  assert.equal(element(elements, "startFromSettings").disabled, false);
+  assert.equal(element(elements, "singleFromSettings").disabled, false);
+
+  api.updateStateDisplay(connectedState({ simulation: false, control_mode: "local" }));
+  assert.equal(element(elements, "startFromSettings").disabled, true);
+  assert.equal(element(elements, "singleFromSettings").disabled, true);
+
+  api.updateStateDisplay(connectedState({ status: "连续采集中" }));
+  assert.equal(element(elements, "startFromSettings").disabled, true);
+  assert.equal(element(elements, "singleFromSettings").disabled, true);
+});
+
+test("settings window stays open when the new-measurement preflight rejects", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState();
+  api.updateStateDisplay(api.app.state);
+  element(elements, "experimentName").value = "新一轮测量";
+  const requests = [];
+  context.fetch = async (_url, options = {}) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true, json: async () => ({ success: false, message: "预检拒绝" }) };
+  };
+  api.bindControls();
+
+  await element(elements, "newMeasurement").dispatch("click");
+  await element(elements, "singleFromSettings").dispatch("click");
+
+  assert.deepEqual(requests.map(({ action }) => action), ["preflight"]);
+  assert.notEqual(element(elements, "settingsDialog").closeCalled, true);
+  assert.match(element(elements, "preflightSummary").textContent, /预检未通过/);
+});
+
+test("rejected start command explains that no new measurement started and preserves the old chart", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState();
+  api.app.points = [{ id: 4, x: 3, y: 1.25, status: "ok", unit: "V" }];
+  api.app.lastSample = 4;
+  api.app.generation = 2;
+  api.updateStateDisplay(api.app.state);
+  element(elements, "experimentName").value = "新测量启动被拒绝";
+  const actions = [];
+  context.fetch = async (_url, options) => {
+    const { action } = JSON.parse(options.body);
+    actions.push(action);
+    return { ok: true, json: async () => action === "preflight"
+      ? { success: true, message: "预检通过", checks: ["仪器已连接", "配置已回读", "保存目录可写"] }
+      : { success: false, message: "启动请求被服务拒绝" } };
+  };
+  api.bindControls();
+
+  await element(elements, "newMeasurement").dispatch("click");
+  await element(elements, "singleFromSettings").dispatch("click");
+
+  assert.deepEqual(actions, ["preflight", "single"]);
+  assert.notEqual(element(elements, "settingsDialog").closeCalled, true);
+  assert.equal(api.app.points.length, 1);
+  assert.equal(api.app.points[0].y, 1.25);
+  assert.match(element(elements, "preflightSummary").textContent, /采集未启动/);
+});
+
+test("clear-plot action clears only the displayed curve and preserves the sample cursor", async () => {
+  const { api, elements, context } = createFrontend();
+  const requests = [];
+  context.fetch = async (...args) => { requests.push(args); throw new Error("unexpected request"); };
+  api.app.state = connectedState({ generation: 7, status: "已停止", events: [] });
+  api.app.generation = 7;
+  api.app.lastSample = 12;
+  api.app.points = [{ id: 12, x: 5, y: 1.25, status: "ok", unit: "V" }];
+  api.app.chartOverview = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }];
+  api.app.chartOverviewJobId = "overview-7";
+  api.bindControls();
+
+  await element(elements, "clearPlot").dispatch("click");
+
+  assert.equal(api.app.chartCleared, true);
+  assert.equal(api.app.points.length, 0);
+  assert.equal(api.chartPointsForPlot().length, 0);
+  assert.equal(api.app.lastSample, 12, "clearing the view must not make the next poll reload old samples");
+  assert.equal(api.app.chartOverview.length, 0);
+  assert.equal(api.app.chartOverviewJobId, null);
+  assert.equal(requests.length, 0, "clearing the view does not issue a server command or delete saved data");
+  assert.match(element(elements, "toast").textContent, /measurements\.csv.*events\.csv.*保留/);
+});
+
+test("clear-plot action is disabled during acquisition and preserves the curve", async () => {
+  const { api, elements } = createFrontend();
+  api.app.points = [{ id: 1, x: 0, y: 1.25, status: "ok", unit: "V" }];
+  api.bindControls();
+  api.updateStateDisplay(connectedState({ status: "连续采集中" }));
+
+  assert.equal(element(elements, "clearPlot").disabled, true);
+  await element(elements, "clearPlot").dispatch("click");
+
+  assert.equal(api.app.points.length, 1);
+  assert.match(element(elements, "toast").textContent, /先停止并保存/);
+});
+
+test("a new experiment generation makes the live curve visible again after clearing", async () => {
+  const { api, context } = createFrontend();
+  api.app.generation = 4;
+  api.app.chartCleared = true;
+  api.app.lastSample = 12;
+  api.app.state = connectedState({ generation: 4 });
+  context.fetch = async () => ({
+    ok: true,
+    json: async () => connectedState({
+      generation: 5,
+      sample_buffer_start: 1,
+      samples: [{ sample_index: 1, elapsed_s: 0, value_si: 1.1, status: "ok", unit_si: "V", mode: "DCV" }],
+      logs: [], log_seq: 0, events: [],
+    }),
+  });
+
+  await api.pollState();
+
+  assert.equal(api.app.chartCleared, false);
+  assert.equal(api.app.points.length, 1);
+  assert.equal(api.app.points[0].y, 1.1);
+  assert.equal(api.app.lastSample, 1);
+});
+
+test("new measurement action is locked during an active acquisition", async () => {
+  const { api, elements } = createFrontend();
+  api.bindControls();
+  api.updateStateDisplay(connectedState({ status: "连续采集中" }));
+
+  assert.equal(element(elements, "newMeasurement").disabled, true);
+  assert.match(element(elements, "newMeasurement").title, /先停止并保存当前实验/);
+  await element(elements, "newMeasurement").dispatch("click");
+  assert.notEqual(element(elements, "settingsDialog").showModalCalled, true);
+});
+
 test("starting acquisition shows the completed preflight checklist before submitting start", async () => {
   const { api, elements, context } = createFrontend();
   api.app.modes.set("DCV", dcv);
@@ -1484,6 +1905,32 @@ test("starting acquisition shows the completed preflight checklist before submit
 
   assert.deepEqual(requests, ["preflight", "start"]);
   assert.match(element(elements, "preflightSummary").textContent, /仪器已连接.*配置已回读.*保存目录可写.*MOCK无需实体接线/);
+});
+
+test("Mock preflight status does not imply a physical wiring check", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState({ simulation: true });
+  api.updateStateDisplay(api.app.state);
+  element(elements, "experimentName").value = "模拟预检文案";
+  let releasePreflight;
+  let markPreflightStarted;
+  const preflightStarted = new Promise((resolve) => { markPreflightStarted = resolve; });
+  context.fetch = async (_url, options) => {
+    assert.equal(JSON.parse(options.body).action, "preflight");
+    return new Promise((resolve) => {
+      releasePreflight = () => resolve({ ok: true, json: async () => ({ success: false, message: "测试结束" }) });
+      markPreflightStarted();
+    });
+  };
+
+  const pendingStart = api.startSingle();
+  await preflightStarted;
+
+  assert.doesNotMatch(element(elements, "preflightSummary").textContent, /接线确认|实体接线/);
+  releasePreflight();
+  await pendingStart;
 });
 
 test("failed acquisition preflight prevents start submission", async () => {
@@ -1652,7 +2099,37 @@ test("current-range guidance follows selected range, cached firmware source, and
   assert.match(unknownReadback, /端子.*未回读|未回读.*端子/);
   assert.match(unknownReadback, /版本.*未核实|未核实.*版本/);
   assert.doesNotMatch(unknownReadback, /已确认 FRONT|已确认支持/);
+
+  const aci = { ...dcv, value: "ACI", label: "交流电流", quantity: "current", unit: "A", ranges: [.01, .1, .4, 1, 3, 10], nplc: [], bandwidths: [3, 20, 200] };
+  api.app.modes.set("ACI", aci);
+  api.populateModeOptions(aci);
+  element(elements, "autorange").checked = false;
+  element(elements, "range").value = "0.4";
+  api.updateStateDisplay(connectedState({ simulation: false, device: {
+    serial_number: "TEST8845A001", range_firmware: "1.0.700.17", range_firmware_source: "面板核对的 OutG SW",
+  }, configuration: { input_terminals: "FRONT" }, active_settings: {
+    mode: "ACI", autorange: false, range_si: .4,
+  } }));
+  const aciFirmware = element(elements, "rangeLimitHint").textContent;
+  assert.match(aciFirmware, /ACI.*1\.0\.700\.18/);
+  assert.match(aciFirmware, /官方资料未明确.*OutG SW.*InG SW/);
+  assert.match(aciFirmware, /本软件不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档/);
+  assert.match(aciFirmware, /请在仪表面板核对软件版本/);
+  assert.doesNotMatch(aciFirmware, /低于门槛 1\.0\.700\.18/);
+  assert.doesNotMatch(aciFirmware, /ACI 400 mA 档要求 OutG SW/);
   assert.equal(requests, 0, "guidance is rendered from cached state without a device request");
+});
+
+test("firmware version field tooltips distinguish DCI and ACI source evidence", () => {
+  const html = fs.readFileSync(path.join(ROOT, "src", "fluke8845a", "web", "index.html"), "utf8");
+  const outguard = html.match(/<label title="([^"]*)">OutG SW/);
+  const inguard = html.match(/<label title="([^"]*)">InG SW/);
+  assert.ok(outguard, "OutG version tooltip exists");
+  assert.ok(inguard, "InG version tooltip exists");
+  assert.match(outguard[1], /DCI.*OutG SW/);
+  assert.match(outguard[1], /ACI.*未明确.*OutG.*InG.*不根据.*自动拒绝/);
+  assert.match(inguard[1], /DCI.*不依据 InG SW/);
+  assert.match(inguard[1], /ACI.*未明确.*不根据.*自动拒绝/);
 });
 
 test("NPLC and bandwidth can be prepared before acquisition and tuned during supported live acquisition", () => {
@@ -1726,45 +2203,57 @@ test("settings labels remain readable and secondary text meets contrast target",
   assert.match(statCountRule[1], /font-size:\s*12px/);
   const hintRule = css.match(/\.field-hint, \.rail-footnote\s*\{([^}]*)\}/);
   assert.ok(hintRule, "settings hint rule exists");
-  const colorMatch = hintRule[1].match(/color:\s*(#[\da-fA-F]{6})/);
-  assert.ok(colorMatch, "settings hint has an explicit color");
   const luminance = (hex) => {
-    const channels = hex.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    const normalized = hex.length === 4
+      ? `#${[...hex.slice(1)].map((value) => `${value}${value}`).join("")}`
+      : hex;
+    const channels = normalized.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
     return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  };
+  const declaredTextColor = (declarations, description) => {
+    const color = declarations.split(";")
+      .map((declaration) => declaration.trim().match(/^color\s*:\s*(#[\da-fA-F]{3}(?:[\da-fA-F]{3})?)$/))
+      .find(Boolean);
+    assert.ok(color, `${description} has an explicit foreground color`);
+    return color[1];
   };
   const contrast = (foreground, background) => {
     const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
     return (values[0] + 0.05) / (values[1] + 0.05);
   };
-  assert.ok(contrast(colorMatch[1], "#f7f6ef") >= 4.5, `${colorMatch[1]} contrast must be at least 4.5:1`);
+  assert.equal(declaredTextColor("border-color: #ff0000; color: #123", "parser regression"), "#123");
+  const screenColor = css.match(/--screen:\s*(#[\da-fA-F]{6})/);
+  assert.ok(screenColor, "main measurement readout color token exists");
+  assert.ok(contrast(screenColor[1], "#1d262a") >= 3.0, "large numeric readout contrast must be at least 3:1");
+  const hintColor = declaredTextColor(hintRule[1], "settings hint");
+  assert.ok(contrast(hintColor, "#f7f6ef") >= 4.5, `${hintColor} contrast must be at least 4.5:1`);
   const sectionKickerRule = css.match(/\.section-kicker\s*\{([^}]*)\}/);
-  const sectionKickerColor = sectionKickerRule?.[1].match(/color:\s*(#[\da-fA-F]{6})/);
-  assert.ok(sectionKickerColor);
-  assert.ok(contrast(sectionKickerColor[1], "#f1efe6") >= 4.5, "section labels must meet 4.5:1 on the chart and dialog background");
+  assert.ok(sectionKickerRule);
+  const sectionKickerColor = declaredTextColor(sectionKickerRule[1], "section label");
+  assert.ok(contrast(sectionKickerColor, "#f1efe6") >= 4.5, "section labels must meet 4.5:1 on the chart and dialog background");
   const stageRule = css.match(/\.connection-stages li\s*\{([^}]*)\}/);
-  const stageColor = stageRule?.[1].match(/color:\s*(#[\da-fA-F]{6})/);
-  assert.ok(stageColor);
-  assert.ok(contrast(stageColor[1], "#f4f6f2") >= 4.5, "connection stage labels must meet 4.5:1 on their badge background");
+  assert.ok(stageRule);
+  const stageColor = declaredTextColor(stageRule[1], "connection stage");
+  assert.ok(contrast(stageColor, "#f4f6f2") >= 4.5, "connection stage labels must meet 4.5:1 on their badge background");
   const eventValueRule = css.match(/\.event-list \.event-value\s*\{([^}]*)\}/);
-  const eventValueColor = eventValueRule?.[1].match(/color:\s*(#[\da-fA-F]{6})/);
-  assert.ok(eventValueColor);
-  assert.ok(contrast(eventValueColor[1], "#fffefa") >= 4.5, "event-value labels must meet 4.5:1 on the event list background");
+  assert.ok(eventValueRule);
+  const eventValueColor = declaredTextColor(eventValueRule[1], "event value");
+  assert.ok(contrast(eventValueColor, "#fffefa") >= 4.5, "event-value labels must meet 4.5:1 on the event list background");
   const darkTextRule = css.match(/\.raw-value\s*\{([^}]*)\}/);
-  const darkTextColor = darkTextRule?.[1].match(/color:\s*(#[\da-fA-F]{6})/);
-  assert.ok(darkTextColor);
-  assert.ok(contrast(darkTextColor[1], "#1d262a") >= 4.5, "dark readout auxiliary text contrast must be at least 4.5:1");
+  assert.ok(darkTextRule);
+  const darkTextColor = declaredTextColor(darkTextRule[1], "dark readout auxiliary text");
+  assert.ok(contrast(darkTextColor, "#1d262a") >= 4.5, "dark readout auxiliary text contrast must be at least 4.5:1");
   const placeholderRule = css.match(/input::placeholder\s*\{([^}]*)\}/);
-  const placeholderColor = placeholderRule?.[1].match(/color:\s*(#[\da-fA-F]{6})/);
-  assert.ok(placeholderColor);
-  assert.ok(contrast(placeholderColor[1], "#fffefa") >= 4.5, "input hint contrast must be at least 4.5:1");
+  assert.ok(placeholderRule);
+  const placeholderColor = declaredTextColor(placeholderRule[1], "input hint");
+  assert.ok(contrast(placeholderColor, "#fffefa") >= 4.5, "input hint contrast must be at least 4.5:1");
 
   const readableTextRule = (selector, background, description) => {
     const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const rule = css.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`));
     assert.ok(rule, `${description} style exists`);
-    const color = rule[1].match(/color:\s*(#[\da-fA-F]{6})/);
-    assert.ok(color, `${description} has an explicit foreground color`);
-    assert.ok(contrast(color[1], background) >= 4.5, `${description} contrast must be at least 4.5:1`);
+    const color = declaredTextColor(rule[1], description);
+    assert.ok(contrast(color, background) >= 4.5, `${description} contrast must be at least 4.5:1`);
     return rule[1];
   };
   const shortcutRule = readableTextRule(".application-shortcut-help", "#252d31", "acquisition shortcut help");
@@ -1774,6 +2263,27 @@ test("settings labels remain readable and secondary text meets contrast target",
   readableTextRule(".mock-note p", "#e9f4ed", "Mock explanatory text");
   readableTextRule("#chartGestureHint", "#f1efe6", "plot gesture hint");
   readableTextRule(".stat-card .stat-count", "#f5f5ee", "statistic sample count");
+
+  const statusAndReadoutPairs = [
+    [".reading-mode", "#1d262a", "readout mode"],
+    [".reading-unit", "#1d262a", "readout unit"],
+    [".eyebrow", "#1d262a", "readout eyebrow"],
+    [".quick-metrics span", "#1d262a", "readout metric label"],
+    [".connection-badge.connected", "#2b443a", "connected badge"],
+    [".connection-badge.mock", "#51422d", "Mock badge"],
+    [".connection-summary.mock", "#1d262a", "Mock connection summary"],
+    [".connection-summary.connected", "#1d262a", "connected summary"],
+    [".command-status", "#30383c", "command status"],
+    [".critical-error", "#472f2d", "critical error"],
+    ['.connection-stages li[data-status="running"]', "#e6f5f4", "running connection stage"],
+    ['.connection-stages li[data-status="success"]', "#eaf5ed", "successful connection stage"],
+    ['.connection-stages li[data-status="failure"]', "#fbeeee", "failed connection stage"],
+    [".button-primary", "#167b80", "primary action"],
+    [".scenario-badge", "#51422d", "Mock scenario badge"],
+  ];
+  for (const [selector, background, description] of statusAndReadoutPairs) {
+    readableTextRule(selector, background, description);
+  }
 
   const chartSource = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
   const chartScaleLabels = chartSource.slice(chartSource.indexOf('ctx.fillStyle = "#faf9f2"'), chartSource.indexOf("const plottedMode = app.modes.get(rows[0]?.mode || app.selectedMode)"));
@@ -1909,7 +2419,7 @@ test("command requests show progress and suppress duplicate submissions", async 
   };
   const first = api.command("diagnose");
   assert.equal(element(elements, "commandStatus").classList.contains("hidden"), false);
-  assert.match(element(elements, "commandStatus").textContent, /诊断.*进行中/);
+  assert.match(element(elements, "commandStatus").textContent, /正在读取仪器身份.*诊断结果/);
   assert.equal(element(elements, "diagnose").disabled, true);
   const second = await api.command("diagnose");
   assert.equal(second.success, false);
@@ -1932,6 +2442,57 @@ test("long Web commands show the concrete work and expected result without inven
   assert.doesNotMatch(element(elements, "commandStatus").textContent, /预计.*秒|ETA/i);
   finish({ json: async () => ({ success: true, message: "采集已停止" }) });
   await pending;
+});
+
+test("instrument diagnosis progress names the readbacks and visible result", async () => {
+  const { api, elements, context } = createFrontend();
+  let finish;
+  context.fetch = () => new Promise((resolve) => { finish = resolve; });
+
+  const pending = api.command("diagnose");
+
+  assert.match(element(elements, "commandStatus").textContent, /读取仪器身份.*测量功能.*输入端子.*错误队列/);
+  assert.match(element(elements, "commandStatus").textContent, /显示诊断结果/);
+  finish({ json: async () => ({ success: true, message: "诊断查询已完成" }) });
+  await pending;
+});
+
+test("long command progress text remains fully readable instead of being clipped", async (t) => {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.EDGE_BIN,
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  ].filter(Boolean);
+  const browser = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!browser) return t.skip("Chromium is not installed; command progress wrapping cannot be measured here");
+
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  const message = "停止并保存：正在停止采集，等待采集线程完成写入并关闭 CSV；完成后报告有效样本数、异常样本数、实际文件路径及保存结果。";
+  const probe = `<!doctype html><meta charset="utf-8"><style>${css}</style>
+    <section class="action-bar" style="width:480px">
+      <button class="button button-danger">停止并保存</button>
+      <span id="commandStatus" class="command-status">${message}</span>
+    </section><pre id="result">pending</pre><script>
+      requestAnimationFrame(() => {
+        const status = document.querySelector("#commandStatus");
+        const rect = status.getBoundingClientRect();
+        document.querySelector("#result").textContent = JSON.stringify({
+          text: status.textContent,
+          clientWidth: status.clientWidth,
+          scrollWidth: status.scrollWidth,
+          clientHeight: status.clientHeight,
+          scrollHeight: status.scrollHeight,
+          height: rect.height,
+        });
+      });
+    </script>`;
+  const metrics = await inspectChromiumDom(browser, probe);
+
+  assert.equal(metrics.text, message);
+  assert.ok(metrics.scrollWidth <= metrics.clientWidth + 1, `progress text is not clipped horizontally: ${JSON.stringify(metrics)}`);
+  assert.ok(metrics.clientHeight >= metrics.scrollHeight - 1, `progress text is not clipped vertically: ${JSON.stringify(metrics)}`);
+  assert.ok(metrics.height > 20, `long progress text wraps onto visible lines: ${JSON.stringify(metrics)}`);
 });
 
 test("started Web commands are polled to completion instead of being reported as failures", async () => {
@@ -2608,7 +3169,63 @@ test("the chart draws a horizontal reference line for the active baseline", () =
   api.drawChart();
 
   const strokes = element(elements, "plot").canvasContext.strokes;
-  assert.ok(strokes.some((stroke) => stroke.color === "#c7842f" && stroke.dash.length > 0 && stroke.path.some(([kind], i, path) => kind === "M" && path[i + 1]?.[0] === "L")));
+  assert.ok(strokes.some((stroke) => stroke.dash.length > 0 && stroke.path.length === 2
+    && stroke.path[0][0] === "M" && stroke.path[1][0] === "L"
+    && Math.abs(stroke.path[0][2] - stroke.path[1][2]) < 1e-8));
+});
+
+test("web chart text and reference markers meet contrast targets", () => {
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  const luminance = (hex) => {
+    const channels = hex.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255);
+    const linear = channels.map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  };
+  const contrast = (foreground, background) => {
+    const [first, second] = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+    return (first + 0.05) / (second + 0.05);
+  };
+  const bodyRule = css.match(/body\s*\{([^}]*)\}/);
+  assert.ok(bodyRule, "body style exists");
+  const token = (name) => {
+    const value = css.match(new RegExp(`${name}:\\s*(#[\\da-fA-F]{6})`));
+    assert.ok(value, `${name} color token exists`);
+    return value[1];
+  };
+  const bodyTextToken = bodyRule[1].match(/color:\s*var\((--[\w-]+)\)/);
+  const bodyBackgroundToken = bodyRule[1].match(/background:\s*var\((--[\w-]+)\)/);
+  assert.ok(bodyTextToken && bodyBackgroundToken, "body uses explicit foreground and background tokens");
+  assert.ok(contrast(token(bodyTextToken[1]), token(bodyBackgroundToken[1])) >= 4.5, "default body text must contrast with the dark canvas");
+
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", { ...dcv, quantity: "voltage" });
+  api.app.selectedMode = "DCV";
+  api.app.points = [
+    { id: 1, x: 0, y: 1, status: "ok", unit: "V" },
+    { id: 2, x: 1, y: 2, status: "ok", unit: "V" },
+    { id: 3, x: 2, y: 3, status: "ok", unit: "V" },
+  ];
+  api.app.state = connectedState({ events: [{ elapsed_s: 1, text: "负载切换" }] });
+  api.app.baseline = 1.5;
+  element(elements, "autoFollow").checked = false;
+  const context = element(elements, "plot").canvasContext;
+  const textDraws = [];
+  context.fillText = (text, x, y) => textDraws.push({ text: String(text), color: context.fillStyle, x, y });
+  api.drawChart();
+
+  const chartBackground = "#faf9f2";
+  for (const label of ["电压 (V)", "实验经过时间"]) {
+    const draw = textDraws.find((item) => item.text === label);
+    assert.ok(draw, `chart renders ${label}`);
+    assert.ok(contrast(draw.color, chartBackground) >= 4.5, `${label} must meet normal-text contrast`);
+  }
+  const dashedSegments = context.strokes.filter((stroke) => stroke.dash.length > 0 && stroke.path.length >= 2);
+  const baseline = dashedSegments.find((stroke) => Math.abs(stroke.path[0][2] - stroke.path[1][2]) < 1e-8);
+  const event = dashedSegments.find((stroke) => Math.abs(stroke.path[0][1] - stroke.path[1][1]) < 1e-8);
+  assert.ok(baseline, "the active baseline is drawn");
+  assert.ok(event, "the experiment event marker is drawn");
+  assert.ok(contrast(baseline.color, chartBackground) >= 3.0, "baseline line must meet non-text contrast");
+  assert.ok(contrast(event.color, chartBackground) >= 3.0, "event line must meet non-text contrast");
 });
 
 test("failed readings leave a visible gap instead of joining surrounding samples", () => {
@@ -2912,10 +3529,29 @@ test("history events are imported only when the experiment identifier matches", 
   assert.equal(api.app.importedEvents[0].text, "load switched");
 });
 
+test("history event units are escaped before rendering imported CSV values", async () => {
+  const { api, elements } = createFrontend();
+  api.app.imported = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }];
+  api.app.importedExperimentId = "run-a";
+  const unit = '<img src=x onerror="alert(1)">';
+  const csvUnit = unit.replaceAll('"', '""');
+  const csv = `experiment_id,elapsed_s,event,sample_index,value_si,unit_si\nrun-a,1,step,1,1,"${csvUnit}"\n`;
+
+  await api.loadHistoryEvents({ name: "events.csv", size: csv.length, text: async () => csv });
+
+  assert.equal(api.app.importedEvents.length, 1);
+  assert.equal(api.app.importedEvents[0].unit_si, unit);
+  const html = element(elements, "eventList").innerHTML;
+  assert.doesNotMatch(html, /<img\s+src=x/i);
+  assert.match(html, /&lt;img\s+src=x/i);
+});
+
 test("history directory import pairs only a same-directory events.csv", async () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   assert.match(html, /id="historyDirectory"[^>]*webkitdirectory/);
-  assert.match(html, /普通文件选择.*不能.*同目录/);
+  assert.match(html, /加载测量 CSV 后，可单独选择配套 events\.csv（会核对实验标识）/);
+  assert.match(html, /id="eventsHistoryFile"[^>]*accept="\.csv,text\/csv"/);
+  assert.match(html, /单独加载测量 CSV 后.*配套 events\.csv.*核对实验标识.*加载实验文件夹.*自动配对同目录文件/);
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   const measurementText = "experiment_id,sample_index,elapsed_s,value_si,unit_si,mode,status,raw_reading\nrun-7,1,0,1,V,DCV,ok,1.0\n";
@@ -2988,6 +3624,64 @@ test("experiment files workspace renders names as text and shows byte sizes", as
   assert.equal(rows[0].children[1].textContent, "1,234 B");
   assert.equal(rows[1].children[0].textContent, "<script>.csv");
   assert.equal(rows[1].innerHTML, "");
+});
+
+test("browser download results are listed separately from experiment directory files", async () => {
+  const { api, elements, context } = createFrontend();
+  api.bindControls();
+  context.URL = { createObjectURL: () => "blob:safe-events", revokeObjectURL() {} };
+  context.fetch = async () => ({
+    ok: true,
+    headers: { get: (name) => name.toLowerCase() === "content-disposition"
+      ? "attachment; filename*=UTF-8''events_excel_safe.csv" : null },
+    blob: async () => ({ type: "text/csv" }),
+  });
+
+  await element(elements, "downloadEventsSafe").dispatch("click");
+
+  const results = element(elements, "filesExportResults").children;
+  assert.equal(results.length, 1);
+  assert.match(results[0].textContent, /事件安全副本.*events_excel_safe\.csv.*浏览器下载/);
+  assert.equal(results[0].innerHTML, "");
+
+  await api.refreshExperimentFiles();
+  assert.equal(element(elements, "filesExportResults").children.length, 1);
+});
+
+test("experiment file dialog centralizes the file list, history imports, and result exports", async (t) => {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.EDGE_BIN,
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  ].filter(Boolean);
+  const browser = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!browser) return t.skip("Chromium is not installed; experiment file ownership cannot be checked in a DOM");
+
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const embeddedHtml = JSON.stringify(html).replace(/</g, "\\u003c");
+  const probe = `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script>
+    const parsed = new DOMParser().parseFromString(${embeddedHtml}, "text/html");
+    const filesDialog = parsed.querySelector("#filesDialog");
+    const importArea = filesDialog?.querySelector("#filesImportActions");
+    const exportArea = filesDialog?.querySelector("#filesExportActions");
+    const importIds = ["historyFile", "historyDirectory", "eventsHistoryFile", "historyImportProgress", "cancelHistoryImport"];
+    const exportIds = ["downloadCsv", "downloadEventsSafe", "downloadMeasurementsSafe", "downloadSharePackage", "savePlot", "filesExportResults", "csvFormulaExportWarning"];
+    document.querySelector("#result").textContent = JSON.stringify({
+      hasDirectory: !!filesDialog?.querySelector("#filesDirectory"),
+      hasFileList: !!filesDialog?.querySelector("#filesList"),
+      importsCentralized: importIds.every((id) => importArea?.querySelector("#" + id)),
+      exportsCentralized: exportIds.every((id) => exportArea?.querySelector("#" + id)),
+      chartHasFileActions: [...importIds, ...exportIds].some((id) => parsed.querySelector(".chart-actions #" + id)),
+    });
+  </script>`;
+  const result = await inspectChromiumDom(browser, probe);
+
+  assert.equal(result.hasDirectory, true, "the file area identifies the experiment directory");
+  assert.equal(result.hasFileList, true, "the file area lists files from the experiment directory");
+  assert.equal(result.importsCentralized, true, "measurement, folder, and companion-event imports share one area");
+  assert.equal(result.exportsCentralized, true, "measurement, event, plot, and sharing exports share one area");
+  assert.equal(result.chartHasFileActions, false, "file operations are kept out of the chart toolbar");
 });
 
 test("an oversized replacement events file cancels an older pending import", async () => {
@@ -3096,6 +3790,44 @@ test("event entries identify their chart location and selecting one centers the 
   assert.match(element(elements, "pointCursor").textContent, /事件.*load switched/);
 });
 
+test("hovering a chart event marker shows its time, local timestamp, and label", async () => {
+  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
+  const event = {
+    elapsed_s: 5,
+    text: "load switched",
+    timestamp_local: "2026-10-15T12:34:56+08:00",
+  };
+  api.app.modes.set("DCV", dcv);
+  api.app.selectedMode = "DCV";
+  api.app.state = connectedState({ events: [event] });
+  api.app.points = [
+    { id: 1, x: 0, y: 1, status: "ok", unit: "V" },
+    { id: 2, x: 10, y: 2, status: "ok", unit: "V" },
+  ];
+  element(elements, "autoFollow").checked = false;
+  api.drawChart();
+
+  const marker = api.app.chartEventHits[0];
+  assert.ok(marker, "the event is represented by a chart marker");
+  const scale = api.app.chartScale;
+  await element(elements, "plot").dispatch("pointermove", {
+    clientX: marker.x,
+    clientY: (scale.top + scale.bottom) / 2,
+  });
+  while (animationFrames.length) animationFrames.shift()();
+
+  assert.equal(api.app.hoveredEventIndex, 0);
+  assert.equal(api.app.cursor, null, "hovering the marker suppresses the measurement point cursor");
+  const cursorText = element(elements, "pointCursor").textContent;
+  assert.match(cursorText, /事件 · t=5 s/);
+  assert.ok(cursorText.includes(expectedLocalDateTime(event.timestamp_local)), "the cursor includes the event's local timestamp");
+  assert.match(cursorText, /load switched/);
+  assert.ok(
+    element(elements, "plotOverlay").canvasContext.calls.some(([, text]) => text === event.text),
+    "the overlay labels the hovered marker with the event name",
+  );
+});
+
 test("chart points can be selected and locked as baseline with the keyboard", async () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("DCV", dcv);
@@ -3136,12 +3868,12 @@ test("Web application shortcuts invoke acquisition actions and leave editable fi
   const { api, elements, context } = createFrontend();
   api.bindControls();
   const clicked = [];
-  const actionIds = ["start", "pause", "resume", "stop", "openSettings", "markEvent"];
+  const actionIds = ["newMeasurement", "start", "pause", "resume", "stop", "openSettings", "markEvent"];
   for (const id of actionIds) element(elements, id).click = () => clicked.push(id);
   element(elements, "resume").classList.add("hidden");
 
   const shortcuts = [
-    ["r", "start"], ["p", "pause"], ["s", "stop"], [",", "openSettings"], ["Enter", "markEvent"],
+    ["n", "newMeasurement"], ["r", "start"], ["p", "pause"], ["s", "stop"], [",", "openSettings"], ["Enter", "markEvent"],
   ];
   for (const [key, actionId] of shortcuts) {
     let prevented = false;
@@ -3190,7 +3922,8 @@ test("Web application shortcuts invoke acquisition actions and leave editable fi
     assert.equal(prevented, false);
   }
 
-  assert.match(html, /id="applicationShortcutHelp"[^>]*>[\s\S]*?Ctrl\+Alt\+R[\s\S]*?Ctrl\+Alt\+Enter/);
+  assert.match(html, /id="applicationShortcutHelp"[^>]*>[\s\S]*?Ctrl\+Alt\+N[\s\S]*?Ctrl\+Alt\+R[\s\S]*?Ctrl\+Alt\+Enter/);
+  assert.match(html, /id="newMeasurement"[^>]*aria-keyshortcuts="Control\+Alt\+N"/);
   assert.match(html, /id="openSettings"[^>]*aria-keyshortcuts="Control\+Alt\+Comma"/);
   assert.match(html, /id="start"[^>]*aria-keyshortcuts="Control\+Alt\+R"/);
   assert.match(html, /id="pause"[^>]*aria-keyshortcuts="Control\+Alt\+P"/);
@@ -3469,7 +4202,8 @@ test("fine-scale Y-axis cursor, baseline, and raw sample share the same origin o
   const scale = api.app.chartScale;
   assert.equal(scale.yOrigin, 30e6, "chartScale exposes the stable absolute-to-offset origin");
   assert.ok(Math.abs(scale.yToPixel(30e6) - (scale.top + scale.bottom) / 2) < 1e-8, "the raw reading maps through its origin offset");
-  const baselineStroke = element(elements, "plot").canvasContext.strokes.find((stroke) => stroke.color === "#c7842f");
+  const baselineStroke = element(elements, "plot").canvasContext.strokes.find((stroke) => stroke.dash.length > 0
+    && stroke.path.length === 2 && Math.abs(stroke.path[0][2] - stroke.path[1][2]) < 1e-8);
   assert.ok(baselineStroke && Math.abs(baselineStroke.path[0][2] - (scale.top + scale.bottom) / 2) < 1e-8, "the absolute baseline is translated into the same offset view");
   api.app.cursor = { x: (scale.left + scale.right) / 2, y: (scale.top + scale.bottom) / 2 };
   api.drawChart();
@@ -4107,7 +4841,7 @@ test("manual pointer panning turns off auto-follow and updates the visible statu
   assert.match(element(elements, "viewModeStatus").textContent, /自动跟随已关闭/);
 });
 
-test("full Web layout fits 280–351 px viewports and honors the 350 px boundary in Chromium", async (t) => {
+test("full Web layout fits narrow and tablet viewports and keeps touch targets accessible in Chromium", async (t) => {
   const candidates = [
     process.env.CHROME_BIN,
     process.env.EDGE_BIN,
@@ -4122,10 +4856,11 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
     .replace('<link rel="stylesheet" href="/app.css">', `<style>${css}</style>`)
     .replace(/\s*<script[^>]*>[\s\S]*?<\/script>|\s*<script[^>]*><\/script>|\s*<script[^>]*><\/script>/g, "")
     .replace(/\s*<script[^>]*src="[^"]*"[^>]*><\/script>/g, "");
+  assert.match(html, /<button id="openFiles"[^>]*aria-label="实验文件"/);
   const childDocument = html.replace("</body>", "</body>").replace(/<script[\s\S]*?<\/script>/g, "");
   const probe = `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script>
     const source = ${JSON.stringify(childDocument)};
-    const widths = [280, 349, 350, 351];
+    const widths = [280, 349, 350, 351, 580, 581, 600, 640, 641, 820, 821, 900, 901];
     const frames = widths.map((width) => {
       const frame = document.createElement("iframe");
       frame.style.cssText = "display:block;border:0;width:" + width + "px;height:900px";
@@ -4136,10 +4871,10 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
     Promise.all(frames.map(({frame}) => new Promise((resolve) => frame.addEventListener("load", () => {
       const doc = frame.contentDocument;
       const viewport = frame.contentWindow.innerWidth;
-      const scenarioBadge = doc.querySelector("#scenarioBadge");
-      scenarioBadge.classList.remove("hidden");
-      scenarioBadge.textContent = "模拟模式 · 温漂与阶跃";
-      const measured = [".topbar", ".workspace", ".measurement-area", ".readout-panel", ".chart-panel", ".plot-wrap", ".chart-context", ".chart-context-actions", "#pointCursor", "#chartGestureHint", ".chart-actions .toggle-label"]
+      const connectionBadge = doc.querySelector("#connectionBadge");
+      connectionBadge.classList.add("connected");
+      connectionBadge.querySelector("span").textContent = "已连接 · FLUKE,8845A,TEST8845A001,02/14/08-08:54";
+      const measured = [".topbar", ".topbar-right", "#connectionBadge", "#openFiles", "#openSettings", "#shutdownService", ".workspace", ".measurement-area", ".readout-panel", ".chart-panel", ".plot-wrap", ".chart-context", ".chart-context-actions", "#pointCursor", "#chartGestureHint", ".chart-actions .toggle-label"]
         .map((selector) => { const node = doc.querySelector(selector); const rect = node.getBoundingClientRect(); return [selector, rect.left, rect.right]; });
       const overflowing = [...doc.body.querySelectorAll("*")].map((node) => {
         const rect = node.getBoundingClientRect();
@@ -4180,18 +4915,20 @@ test("full Web layout fits 280–351 px viewports and honors the 350 px boundary
     })))).then((metrics) => { document.getElementById("result").textContent = JSON.stringify(metrics); });
   </script>`;
   const metrics = await inspectChromiumDom(browser, probe);
-  assert.equal(metrics.length, 4);
+  assert.equal(metrics.length, 13);
   for (const layout of metrics) {
     assert.equal(layout.bodyScroll, layout.bodyClient, `${layout.viewport}px body has no horizontal overflow: ${JSON.stringify(layout)}`);
     assert.equal(layout.documentScroll, layout.documentClient, `${layout.viewport}px document has no horizontal overflow`);
     assert.ok(layout.documentClient <= layout.viewport, `${layout.viewport}px document client area stays within the viewport`);
     assert.deepEqual(layout.overflowing, [], `${layout.viewport}px visible content does not cross the viewport edge`);
     assert.equal(layout.bodyMinWidth, layout.viewport <= 350 ? "0px" : "280px", `${layout.viewport}px min-width breakpoint is applied at the intended boundary`);
-    assert.ok(layout.touchTarget[0] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px wide`);
-    assert.ok(layout.touchTarget[1] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px tall`);
-    for (const [selector, width, height] of layout.touchTargets) {
-      assert.ok(width >= 44, `${layout.viewport}px ${selector} target is at least 44 CSS px wide, got ${width}`);
-      assert.ok(height >= 44, `${layout.viewport}px ${selector} target is at least 44 CSS px tall, got ${height}`);
+    if (layout.viewport <= 820) {
+      assert.ok(layout.touchTarget[0] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px wide`);
+      assert.ok(layout.touchTarget[1] >= 44, `${layout.viewport}px chart toggle target is at least 44 CSS px tall`);
+      for (const [selector, width, height] of layout.touchTargets) {
+        assert.ok(width >= 44, `${layout.viewport}px ${selector} target is at least 44 CSS px wide, got ${width}`);
+        assert.ok(height >= 44, `${layout.viewport}px ${selector} target is at least 44 CSS px tall, got ${height}`);
+      }
     }
     for (const dialog of layout.dialogs) {
       assert.ok(dialog.left >= -1 && dialog.right <= layout.documentClient + 1, `${layout.viewport}px ${dialog.id} fits the viewport`);
@@ -4296,23 +5033,32 @@ test("events export is a separate safety copy and stays disabled during acquisit
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   const javascript = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
   assert.match(html, /id="downloadEventsSafe"[^>]*disabled[^>]*安全处理；原始 events\.csv 不会更改/);
-  assert.match(javascript, /downloadEventsSafe"\)\.disabled = !state\.last_experiment_dir \|\| !!state\.experiment_dir/);
   assert.match(javascript, /\/api\/latest-events-safe\.csv/);
   assert.match(javascript, /已导出事件安全副本；原始 events\.csv 未修改/);
+  const { api, elements } = createFrontend();
+  api.updateStateDisplay(connectedState({
+    status: "连续采集中", experiment_dir: "D:\\experiments\\active", last_experiment_dir: "D:\\experiments\\active",
+  }));
+  assert.equal(element(elements, "downloadEventsSafe").disabled, true);
+  assert.match(element(elements, "downloadEventsSafe").title, /停止.*采集/);
+  api.updateStateDisplay(connectedState({ status: "等待开始", experiment_dir: "", last_experiment_dir: "D:\\experiments\\done" }));
+  assert.equal(element(elements, "downloadEventsSafe").disabled, false);
+  assert.match(element(elements, "downloadEventsSafe").title, /原始 events\.csv 不会更改/);
 });
 
 test("measurement export is a separate safety copy and stays disabled during acquisition", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
   const javascript = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
   assert.match(html, /id="downloadMeasurementsSafe"[^>]*disabled[^>]*原始 measurements\.csv 不会更改/);
-  assert.match(javascript, /downloadMeasurementsSafe"\)\.disabled = !state\.last_experiment_dir \|\| !!state\.experiment_dir/);
   assert.match(javascript, /\/api\/latest-measurements-safe\.csv/);
   assert.match(javascript, /已导出测量安全副本；原始 measurements\.csv 未修改/);
   const { api, elements } = createFrontend();
-  api.updateStateDisplay(connectedState({ experiment_dir: "D:\\experiments\\active", last_experiment_dir: "D:\\experiments\\active" }));
+  api.updateStateDisplay(connectedState({ status: "连续采集中", experiment_dir: "D:\\experiments\\active", last_experiment_dir: "D:\\experiments\\active" }));
   assert.equal(element(elements, "downloadMeasurementsSafe").disabled, true);
-  api.updateStateDisplay(connectedState({ experiment_dir: "", last_experiment_dir: "D:\\experiments\\done" }));
+  assert.match(element(elements, "downloadMeasurementsSafe").title, /停止.*采集/);
+  api.updateStateDisplay(connectedState({ status: "等待开始", experiment_dir: "", last_experiment_dir: "D:\\experiments\\done" }));
   assert.equal(element(elements, "downloadMeasurementsSafe").disabled, false);
+  assert.match(element(elements, "downloadMeasurementsSafe").title, /原始 measurements\.csv 不会更改/);
 });
 
 test("PNG export includes experiment, mode, time range, local export time, and baseline context", () => {

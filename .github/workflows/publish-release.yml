@@ -107,6 +107,8 @@ jobs:
             $env:QT_QPA_PLATFORM = "offscreen"
             python "scripts\launch_windows.py" desktop --mock --smoke
             if ($LASTEXITCODE -ne 0) { throw "Extracted source ZIP first-launch smoke failed (exit $LASTEXITCODE)." }
+            python "$env:GITHUB_WORKSPACE\scripts\package_source.py" --smoke-extracted-source-web "$extractRoot" --timeout-seconds 20
+            if ($LASTEXITCODE -ne 0) { throw "Extracted source ZIP Web smoke failed (exit $LASTEXITCODE)." }
           }
           finally {
             Pop-Location

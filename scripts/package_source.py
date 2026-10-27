@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import os
 import re
+import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from zipfile import ZIP_DEFLATED, ZipFile
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -66,6 +75,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "src/fluke8845a/web/index.html",
     "src/fluke8845a/web/history_worker.js",
     "docs/qt-licensing-and-third-party-notices.md",
+    "docs/licenses/GPL-3.0.txt",
     "docs/licenses/LGPL-3.0.txt",
     "docs/licenses/windows-portable-review-2026-10-15.md",
     "docs/licenses/windows-portable-review-2026-10-20.md",
@@ -91,6 +101,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "tests/test_worker.py",
     "scripts/collect_windows_runtime_licenses.py",
     "scripts/release_metadata.py",
+    "scripts/build_path_helpers.ps1",
     "scripts/release_publication.py",
     "scripts/archive_paths.py",
     "scripts/run_tests_sharded.py",
@@ -183,6 +194,189 @@ def validate_web_archive_resources(archive: ZipFile, member_prefix: str, source_
     validate_packaged_web_resources(html, javascript)
 
 
+SOURCE_WEB_SMOKE_RESOURCES = (
+    ("/", "index.html"),
+    ("/app.css", "app.css"),
+    ("/app.js", "app.js"),
+    ("/history_worker.js", "history_worker.js"),
+)
+SOURCE_WEB_SMOKE_SERVER_CODE = """\
+import sys
+source = sys.argv.pop(1)
+sys.path.insert(0, source)
+from fluke8845a.webapp import main
+raise SystemExit(main(["--port", sys.argv[1], "--no-browser"]))
+"""
+
+
+def _source_web_smoke_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        return int(reservation.getsockname()[1])
+
+
+def _stop_source_web_smoke_process(process: subprocess.Popen[str], base_url: str) -> str:
+    if process.poll() is None:
+        body = b'{"action":"shutdown","payload":{}}'
+        request = Request(
+            f"{base_url}/api/command",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": base_url,
+                "Sec-Fetch-Site": "same-origin",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=2.0) as response:
+                response.read()
+        except (HTTPError, URLError, TimeoutError, OSError):
+            # A failed check may leave the service unavailable; process cleanup below is authoritative.
+            pass
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=4.0)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+    try:
+        output, _ = process.communicate(timeout=4.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate(timeout=4.0)
+    return output.strip()
+
+
+def smoke_extracted_source_web(
+    extracted_root: Path,
+    *,
+    expected_web_root: Path | None = None,
+    timeout_seconds: float = 20.0,
+) -> dict:
+    """Launch the extracted source tree's Web app and compare its live HTTP assets to this checkout."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("Web smoke timeout must be a finite positive number of seconds")
+
+    source_root = Path(extracted_root).resolve()
+    source_package = source_root / "src" / "fluke8845a"
+    if not (source_package / "webapp.py").is_file():
+        raise ValueError(f"Extracted source tree has no Web service module: {source_package / 'webapp.py'}")
+
+    expected_web_root = Path(expected_web_root or ROOT / "src" / "fluke8845a" / "web").resolve()
+    expected_assets: dict[str, tuple[bytes, str]] = {}
+    for route, filename in SOURCE_WEB_SMOKE_RESOURCES:
+        source_path = expected_web_root / filename
+        if not source_path.is_file():
+            raise ValueError(f"Current source Web asset is missing: {source_path}")
+        content = source_path.read_bytes()
+        expected_assets[route] = (content, hashlib.sha256(content).hexdigest())
+
+    validate_packaged_web_resources(
+        expected_assets["/"][0].decode("utf-8"),
+        expected_assets["/app.js"][0].decode("utf-8"),
+    )
+    expected_version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+
+    port = _source_web_smoke_port()
+    base_url = f"http://127.0.0.1:{port}"
+    child_env = os.environ.copy()
+    extracted_python_path = str((source_root / "src").resolve())
+    existing_python_path = child_env.get("PYTHONPATH")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (extracted_python_path, existing_python_path) if part
+    )
+    child_env["PYTHONUNBUFFERED"] = "1"
+
+    process: subprocess.Popen[str] | None = None
+    report: dict | None = None
+    failure: Exception | None = None
+    output = ""
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", SOURCE_WEB_SMOKE_SERVER_CODE, extracted_python_path, str(port)],
+            cwd=source_root,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        last_startup_error = "no HTTP response yet"
+        health: dict | None = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            remaining = deadline - time.monotonic()
+            try:
+                with urlopen(f"{base_url}/api/health", timeout=min(1.0, max(0.1, remaining))) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"/api/health returned HTTP {response.status}")
+                    health = json.loads(response.read().decode("utf-8"))
+                break
+            except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                last_startup_error = f"{type(exc).__name__}: {exc}"
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"extracted Web service exited before health check (exit {process.returncode})"
+            )
+        if health is None:
+            raise RuntimeError(
+                f"/api/health did not become ready within {timeout_seconds:g} seconds; "
+                f"last startup error: {last_startup_error}"
+            )
+        if health.get("status") != "ok" or health.get("bind") != "127.0.0.1":
+            raise RuntimeError(f"/api/health returned unexpected payload: {health!r}")
+        if health.get("version") != expected_version:
+            raise RuntimeError(
+                f"/api/health version mismatch: expected {expected_version!r}, "
+                f"got {health.get('version')!r}"
+            )
+
+        asset_results: dict[str, dict[str, int | str]] = {}
+        for route, (_expected_content, expected_sha256) in expected_assets.items():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Web smoke exceeded its {timeout_seconds:g}-second overall verification timeout "
+                    f"before checking {route}"
+                )
+            try:
+                with urlopen(f"{base_url}{route}", timeout=min(3.0, remaining)) as response:
+                    actual_content = response.read()
+                    status = response.status
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                raise RuntimeError(f"Web smoke request {route} failed: {type(exc).__name__}: {exc}") from exc
+            actual_sha256 = hashlib.sha256(actual_content).hexdigest()
+            if status != 200:
+                raise RuntimeError(f"Web smoke request {route} returned HTTP {status}")
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"Web smoke resource {route} SHA-256 mismatch: "
+                    f"expected {expected_sha256} ({len(_expected_content)} bytes), "
+                    f"got {actual_sha256} ({len(actual_content)} bytes)"
+                )
+            asset_results[route] = {"sha256": actual_sha256, "bytes": len(actual_content)}
+
+        report = {"health": health, "assets": asset_results, "base_url": base_url}
+    except Exception as exc:
+        failure = exc
+    finally:
+        if process is not None:
+            output = _stop_source_web_smoke_process(process, base_url)
+
+    if failure is not None:
+        diagnostic = f"\nExtracted Web service output:\n{output}" if output else ""
+        raise RuntimeError(f"Source Web smoke failed: {failure}{diagnostic}") from failure
+    assert report is not None
+    return report
+
+
 def files_for_archive(root: Path = ROOT) -> list[Path]:
     root = Path(root).resolve()
     files: set[Path] = set()
@@ -268,13 +462,39 @@ def create_archive(destination: Path, *, provenance_path: Path) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--smoke-extracted-source-web",
+        type=Path,
+        help="launch and verify the Web service from an extracted source ZIP directory",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=20.0,
+        help="overall startup and HTTP verification timeout for extracted Web smoke (default: 20)",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=ROOT / "dist" / "Fluke8845A_Source_Project.zip",
         help="output archive path (defaults to dist/Fluke8845A_Source_Project.zip)",
     )
-    parser.add_argument("--provenance", type=Path, required=True, help="the shared BUILD-PROVENANCE.json for this build")
+    parser.add_argument("--provenance", type=Path, help="the shared BUILD-PROVENANCE.json for this build")
     args = parser.parse_args()
+
+    if args.smoke_extracted_source_web is not None:
+        try:
+            report = smoke_extracted_source_web(
+                args.smoke_extracted_source_web,
+                expected_web_root=ROOT / "src" / "fluke8845a" / "web",
+                timeout_seconds=args.timeout_seconds,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            parser.exit(1, f"Source ZIP Web smoke failed: {exc}\n")
+        print("Source ZIP Web smoke passed: " + json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.provenance is None:
+        parser.error("--provenance is required when building a source archive")
     destination = args.output.resolve()
     try:
         destination.relative_to(ROOT.resolve())

@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import gc
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +66,164 @@ def test_experiment_writes_csv_incrementally_with_full_value_and_time(tmp_path):
     assert config["sample_count"] == 2
     assert config["completion_status"] == "stopped"
     assert config["mode_settings"]["input_impedance_auto"] is True
+
+
+def test_new_experiment_includes_a_spreadsheet_safety_notice_for_raw_csv(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "csv safety notice", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    try:
+        notice = recorder.directory / "CSV_打开说明.txt"
+        assert notice.is_file()
+        text = notice.read_text(encoding="utf-8")
+        assert "events.csv" in text
+        assert "measurements.csv" in text
+        assert "不要直接用 Excel" in text
+        assert "公式" in text
+        assert "events_excel_safe.csv" in text
+        assert "measurements_excel_safe.csv" in text
+        assert "原始读数和错误文本" in text
+        assert "原始 CSV 不会被修改" in text
+    finally:
+        recorder.finish("test")
+
+
+def test_csv_safety_notice_open_failure_does_not_block_raw_recording(tmp_path, monkeypatch):
+    original_open = Path.open
+
+    def fail_notice_open(path, *args, **kwargs):
+        if path.name.startswith("CSV_打开说明.txt"):
+            raise OSError("simulated notice open failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_notice_open)
+    recorder = ExperimentRecorder.create(
+        tmp_path, "csv notice open failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    try:
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+        recorder.append_event("=1+1")
+        assert not (recorder.directory / "CSV_打开说明.txt").exists()
+        assert "无法创建 CSV_打开说明.txt" in (recorder.directory / "run.log").read_text(encoding="utf-8")
+        with (recorder.directory / "events.csv").open(newline="", encoding="utf-8-sig") as stream:
+            events = list(csv.DictReader(stream))
+        assert events[0]["event"] == "=1+1"
+    finally:
+        recorder.finish("test")
+
+
+def test_csv_safety_notice_partial_write_is_removed_without_changing_raw_csv(
+    tmp_path, monkeypatch,
+):
+    original_open = Path.open
+
+    class PartialFailingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self.stream.__exit__(exc_type, exc_value, traceback)
+
+        def write(self, text):
+            self.stream.write(text[:12])
+            self.stream.flush()
+            raise OSError("simulated notice write failure")
+
+        def flush(self):
+            self.stream.flush()
+
+    def partially_fail_notice_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path.name.startswith("CSV_打开说明.txt"):
+            return PartialFailingStream(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", partially_fail_notice_open)
+    recorder = ExperimentRecorder.create(
+        tmp_path, "csv notice write failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    try:
+        event = recorder.append_event("=1+1")
+        assert not (recorder.directory / "CSV_打开说明.txt").exists()
+        assert "无法创建 CSV_打开说明.txt" in (recorder.directory / "run.log").read_text(encoding="utf-8")
+        with (recorder.directory / "events.csv").open(newline="", encoding="utf-8-sig") as stream:
+            events = list(csv.DictReader(stream))
+        assert events[0]["event"] == "=1+1"
+        assert event["event"] == "=1+1"
+    finally:
+        recorder.finish("test")
+
+
+def test_failed_cleanup_of_partial_notice_never_leaves_a_complete_notice_path(
+    tmp_path, monkeypatch,
+):
+    original_open = Path.open
+    original_unlink = Path.unlink
+
+    class PartialFailingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self.stream.__exit__(exc_type, exc_value, traceback)
+
+        def write(self, text):
+            self.stream.write(text[:12])
+            self.stream.flush()
+            raise OSError("simulated notice write failure")
+
+        def flush(self):
+            self.stream.flush()
+
+    def partially_fail_notice_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path.name.startswith("CSV_打开说明.txt"):
+            return PartialFailingStream(stream)
+        return stream
+
+    def fail_partial_notice_cleanup(path, *args, **kwargs):
+        if path.name.startswith("CSV_打开说明.txt"):
+            raise PermissionError("simulated notice cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", partially_fail_notice_open)
+    monkeypatch.setattr(Path, "unlink", fail_partial_notice_cleanup)
+    recorder = ExperimentRecorder.create(
+        tmp_path, "csv notice cleanup failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    try:
+        assert not (recorder.directory / "CSV_打开说明.txt").exists()
+        recorder.append_event("=1+1")
+        assert "无法创建 CSV_打开说明.txt" in (recorder.directory / "run.log").read_text(encoding="utf-8")
+    finally:
+        recorder.finish("test")
+
+
+def test_existing_csv_notice_is_preserved_and_not_replaced(tmp_path):
+    directory = tmp_path / "existing experiment"
+    directory.mkdir()
+    notice = directory / "CSV_打开说明.txt"
+    original_notice = "用户已有说明\n"
+    notice.write_text(original_notice, encoding="utf-8")
+    recorder = storage_module.ExperimentRecorder(
+        directory, {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    try:
+        assert notice.read_text(encoding="utf-8") == original_notice
+        assert not list(directory.glob("CSV_打开说明.txt.*.partial"))
+        assert "未覆盖实验目录中已存在的 CSV_打开说明.txt" in (
+            directory / "run.log"
+        ).read_text(encoding="utf-8")
+    finally:
+        recorder.finish("test")
 
 
 def test_large_mock_run_keeps_every_attempt_and_periodic_progress_metadata(tmp_path):
@@ -172,18 +332,36 @@ def test_speed_change_preserves_all_measurement_mode_settings(tmp_path):
     )
 
     recorder.record_measurement_speed_change(
-        nplc=100, ac_bandwidth_hz=None, device_configuration={"nplc": 100}
+        nplc=100, ac_bandwidth_hz=None, digital_filter=False,
+        device_configuration={"nplc": 100, "digital_filter_response": "0"},
     )
 
     assert recorder.settings.nplc == 100
-    assert recorder.settings.digital_filter is True
+    assert recorder.settings.digital_filter is False
     assert recorder.settings.input_impedance_auto is True
     assert recorder.settings.analog_filter is True
     assert recorder.settings.autozero is False
     recorder.finish()
     config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
-    assert config["mode_settings"]["digital_filter"] is True
+    assert config["mode_settings"]["digital_filter"] is False
     assert config["mode_settings"]["input_impedance_auto"] is True
+    assert config["measurement_speed_changes"][0]["previous_digital_filter"] is True
+    assert config["measurement_speed_changes"][0]["digital_filter"] is False
+
+
+def test_measurement_csv_records_digital_filter_state_for_each_attempt(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "digital filter csv", {"simulation": True},
+        ModeSettings(Mode.DCV, nplc=10, digital_filter=True),
+    )
+
+    row = recorder.append_reading(make_reading(), mode=Mode.DCV)
+    recorder.finish("stopped")
+
+    assert row["digital_filter"] is True
+    with (recorder.directory / "measurements.csv").open(newline="", encoding="utf-8-sig") as stream:
+        saved = next(csv.DictReader(stream))
+    assert saved["digital_filter"] == "True"
 
 
 def test_experiment_periodically_syncs_csv_rows_and_syncs_events_and_finish(
@@ -209,12 +387,13 @@ def test_experiment_periodically_syncs_csv_rows_and_syncs_events_and_finish(
     assert len(sync_calls) >= 2
 
 
-def test_csv_fsync_uses_the_five_second_monotonic_interval_without_sleep(tmp_path, monkeypatch):
+def test_csv_fsync_uses_the_one_second_monotonic_interval_without_sleep(tmp_path, monkeypatch):
     recorder = ExperimentRecorder.create(
         tmp_path, "fsync throttle", {"simulation": True}, ModeSettings(Mode.DCV)
     )
-    assert storage_module.CSV_FSYNC_INTERVAL_NS == 5_000_000_000
+    assert storage_module.CSV_FSYNC_INTERVAL_NS == 1_000_000_000
     baseline_ns = recorder._last_csv_fsync_ns
+    recorder._last_log_fsync_ns = baseline_ns
     now_ns = [baseline_ns + storage_module.CSV_FSYNC_INTERVAL_NS - 1]
     real_fsync = storage_module.os.fsync
     synced_fds = []
@@ -223,7 +402,7 @@ def test_csv_fsync_uses_the_five_second_monotonic_interval_without_sleep(tmp_pat
         synced_fds.append(fd)
         return real_fsync(fd)
 
-    monkeypatch.setattr(storage_module.time, "monotonic_ns", lambda: now_ns[0])
+    monkeypatch.setattr(storage_module.time, "perf_counter_ns", lambda: now_ns[0])
     monkeypatch.setattr(storage_module.os, "fsync", capture_fsync)
 
     try:
@@ -232,9 +411,102 @@ def test_csv_fsync_uses_the_five_second_monotonic_interval_without_sleep(tmp_pat
 
         now_ns[0] = baseline_ns + storage_module.CSV_FSYNC_INTERVAL_NS
         recorder.append_reading(make_reading(), mode=Mode.DCV)
-        assert len(synced_fds) == 2  # measurements.csv and events.csv
+        recorder.sync_log_if_due()
+        assert len(synced_fds) == 3  # measurements.csv, events.csv, and run.log
+        assert recorder._log_stream.fileno() in synced_fds
     finally:
         recorder.finish("stopped")
+
+
+def test_background_run_log_fsync_failure_is_reported_and_keeps_run_incomplete(
+    tmp_path, monkeypatch
+):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "periodic run log sync failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    errors = []
+    failure_reported = threading.Event()
+    log_fd = recorder._log_stream.fileno()
+    real_fsync = storage_module.os.fsync
+    failed_once = threading.Event()
+
+    def fail_first_run_log_sync(fd):
+        if fd == log_fd and not failed_once.is_set():
+            failed_once.set()
+            raise OSError("injected periodic run.log fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(storage_module, "LOG_FSYNC_INTERVAL_NS", 1, raising=False)
+    monkeypatch.setattr(storage_module.os, "fsync", fail_first_run_log_sync)
+    recorder.start_periodic_sync(
+        lambda exc: (errors.append(exc), failure_reported.set())
+    )
+
+    try:
+        assert failure_reported.wait(1), "background run.log sync failure was not reported"
+        assert isinstance(recorder.log_sync_error, OSError)
+        assert "periodic run.log fsync failure" in str(recorder.log_sync_error)
+        assert errors == [recorder.log_sync_error]
+
+        with pytest.raises(OSError, match="periodic run.log fsync failure"):
+            recorder.finish("stopped")
+
+        config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+        assert config["completion_status"] == "running"
+    finally:
+        if not recorder._log_stream.closed:
+            try:
+                recorder.finish("test_cleanup")
+            except OSError:
+                pass
+
+
+def test_slow_run_log_fsync_does_not_block_measurement_append(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "slow log sync", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 60_000_000_000)
+    log_fd = recorder._log_stream.fileno()
+    real_fsync = storage_module.os.fsync
+    log_fsync_started = threading.Event()
+    release_log_fsync = threading.Event()
+    append_finished = threading.Event()
+    append_errors = []
+
+    def hold_run_log_sync(fd):
+        if fd == log_fd:
+            log_fsync_started.set()
+            if not release_log_fsync.wait(2):
+                raise TimeoutError("test did not release run.log fsync")
+        return real_fsync(fd)
+
+    def append_one_reading():
+        try:
+            recorder.append_reading(make_reading(), mode=Mode.DCV)
+        except Exception as exc:
+            append_errors.append(exc)
+        finally:
+            append_finished.set()
+
+    monkeypatch.setattr(storage_module.os, "fsync", hold_run_log_sync)
+    sync_thread = threading.Thread(target=lambda: recorder.sync_log_if_due(force=True))
+    append_thread = threading.Thread(target=append_one_reading)
+    sync_thread.start()
+
+    try:
+        assert log_fsync_started.wait(1), "run.log fsync did not start"
+        append_thread.start()
+        assert append_finished.wait(0.5), "run.log fsync blocked measurement append"
+        assert not append_errors
+    finally:
+        release_log_fsync.set()
+        sync_thread.join(2)
+        if append_thread.ident is not None:
+            append_thread.join(2)
+        recorder.finish("stopped")
+
+    assert not sync_thread.is_alive()
+    assert not append_thread.is_alive()
 
 
 def test_failed_attempt_stays_blank_and_event_is_saved(tmp_path):
@@ -615,6 +887,8 @@ def test_failed_stream_close_keeps_run_recoverable(tmp_path):
     try:
         with pytest.raises(OSError, match="injected run.log close failure"):
             recorder.finish("stopped")
+        assert log_stream.closed
+        assert recorder._directory_lease is None
     finally:
         if not log_stream.closed:
             log_stream.close()
@@ -854,6 +1128,254 @@ def test_csv_flush_failure_reconciles_count_if_final_flush_succeeds(tmp_path):
     assert config["completion_status"] == "storage_error"
 
 
+@pytest.mark.parametrize(
+    "csv_bytes",
+    [
+        b"sample_index,raw_reading\r\n2,1.25\r\n",
+        b"sample_index,raw_reading\r\nnot-an-index,1.25\r\n",
+    ],
+)
+def test_complete_csv_record_count_rejects_nonsequential_indices(tmp_path, csv_bytes):
+    path = tmp_path / "measurements.csv"
+    path.write_bytes(csv_bytes)
+    prefix_bytes = storage_module.complete_csv_prefix_size(path)
+
+    with pytest.raises(ValueError, match="sample_index.*索引"):
+        storage_module._count_complete_csv_records(path, prefix_bytes, "sample_index")
+
+
+def test_event_flush_failure_counts_only_complete_csv_records_on_finish(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "event flush reconciliation", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    original_stream = recorder._event_stream
+    header_size = (recorder.directory / "events.csv").stat().st_size
+
+    class FlushTruncatesEventOnceStream:
+        def __init__(self):
+            self.failed = False
+
+        def flush(self):
+            original_stream.flush()
+            if not self.failed:
+                self.failed = True
+                os.ftruncate(original_stream.fileno(), header_size)
+                original_stream.seek(header_size)
+                raise OSError("injected event CSV flush failure after partial persistence")
+
+        def __getattr__(self, name):
+            return getattr(original_stream, name)
+
+    failing_stream = FlushTruncatesEventOnceStream()
+    recorder._event_stream = failing_stream
+    recorder._events = csv.DictWriter(
+        failing_stream, fieldnames=storage_module.EVENT_FIELDS, extrasaction="ignore"
+    )
+
+    with pytest.raises(OSError, match="injected event CSV flush failure"):
+        recorder.append_event("partially persisted event")
+
+    recorder.finish("storage_error")
+
+    with (recorder.directory / "events.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+    assert rows == []
+    assert recorder.event_count == 0
+    assert config["event_count"] == 0
+    assert config["completion_status"] == "storage_error"
+
+
+def test_event_flush_failure_preserves_complete_event_on_finish(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "complete event flush failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    original_stream = recorder._event_stream
+
+    class FlushFailsOnceStream:
+        def __init__(self):
+            self.failed = False
+
+        def flush(self):
+            original_stream.flush()
+            if not self.failed:
+                self.failed = True
+                raise OSError("injected event CSV flush failure after write")
+
+        def __getattr__(self, name):
+            return getattr(original_stream, name)
+
+    failing_stream = FlushFailsOnceStream()
+    recorder._event_stream = failing_stream
+    recorder._events = csv.DictWriter(
+        failing_stream, fieldnames=storage_module.EVENT_FIELDS, extrasaction="ignore"
+    )
+
+    with pytest.raises(OSError, match="injected event CSV flush failure"):
+        recorder.append_event("complete despite flush error")
+    assert recorder.event_count == 0
+    with pytest.raises(OSError, match="前一条事件记录的CSV写入状态未确认"):
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+    with pytest.raises(OSError, match="前一条事件记录的CSV写入状态未确认"):
+        recorder.append_event("must not append after ambiguous write")
+
+    recorder.finish("storage_error")
+
+    with (recorder.directory / "events.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["event_index"] == "1"
+    assert recorder.event_count == 1
+    assert config["event_count"] == 1
+    assert config["completion_status"] == "storage_error"
+
+
+def test_sample_flush_failure_reconciles_truncated_record_on_finish(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "truncated sample flush", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    original_stream = recorder._data_stream
+    header_size = (recorder.directory / "measurements.csv").stat().st_size
+
+    class FlushTruncatesSampleOnceStream:
+        def __init__(self):
+            self.failed = False
+
+        def flush(self):
+            original_stream.flush()
+            if not self.failed:
+                self.failed = True
+                os.ftruncate(original_stream.fileno(), header_size)
+                original_stream.seek(header_size)
+                raise OSError("injected measurement CSV flush failure after partial persistence")
+
+        def __getattr__(self, name):
+            return getattr(original_stream, name)
+
+    failing_stream = FlushTruncatesSampleOnceStream()
+    recorder._data_stream = failing_stream
+    recorder._writer = csv.DictWriter(
+        failing_stream, fieldnames=storage_module.SAMPLE_FIELDS, extrasaction="ignore"
+    )
+
+    with pytest.raises(OSError, match="injected measurement CSV flush failure"):
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+    with pytest.raises(OSError, match="前一条测量记录的CSV写入状态未确认"):
+        recorder.append_event("must not append while sample write is unresolved")
+    recorder.finish("storage_error")
+
+    with (recorder.directory / "measurements.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+    assert rows == []
+    assert recorder.sample_count == 0
+    assert config["sample_count"] == 0
+    assert config["completion_status"] == "storage_error"
+
+
+def test_sample_fsync_failure_keeps_pending_and_blocks_event_append(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "sample fsync failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 0)
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_first_fsync(fd):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected CSV fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(storage_module.os, "fsync", fail_first_fsync)
+
+    with pytest.raises(OSError, match="injected CSV fsync failure"):
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+    assert recorder.sample_count == 0
+    with pytest.raises(OSError, match="前一条测量记录的CSV写入状态未确认"):
+        recorder.append_event("must not append while sample fsync is unresolved")
+
+    with pytest.raises(OSError, match="injected CSV fsync failure"):
+        recorder.finish("storage_error")
+    assert json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))[
+        "completion_status"
+    ] == "running"
+    assert all(stream.closed for stream in (recorder._data_stream, recorder._event_stream))
+
+    with (recorder.directory / "measurements.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    with (recorder.directory / "events.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        events = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert events == []
+    assert recorder.sample_count == 1
+    assert config["sample_count"] == 0
+    assert config["event_count"] == 0
+    assert config["completion_status"] == "running"
+
+
+def test_event_csv_fsync_failure_keeps_pending_sample_and_blocks_append(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "event CSV fsync failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    monkeypatch.setattr(storage_module, "CSV_FSYNC_INTERVAL_NS", 0)
+    event_fd = recorder._event_stream.fileno()
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_event_csv_once(fd):
+        nonlocal failed
+        if fd == event_fd and not failed:
+            failed = True
+            raise OSError("injected event CSV fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(storage_module.os, "fsync", fail_event_csv_once)
+
+    with pytest.raises(OSError, match="injected event CSV fsync failure"):
+        recorder.append_reading(make_reading(), mode=Mode.DCV)
+    assert failed
+    assert recorder.sample_count == 0
+    with pytest.raises(OSError, match="前一条测量记录的CSV写入状态未确认"):
+        recorder.append_event("must not append while sample sync is unresolved")
+
+    with pytest.raises(OSError, match="injected event CSV fsync failure"):
+        recorder.finish("storage_error")
+    assert json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))[
+        "completion_status"
+    ] == "running"
+    assert all(stream.closed for stream in (recorder._data_stream, recorder._event_stream))
+
+    with (recorder.directory / "measurements.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    with (recorder.directory / "events.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        events = list(csv.DictReader(stream))
+    config = json.loads((recorder.directory / "config.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert events == []
+    assert recorder.sample_count == 1
+    assert config["sample_count"] == 0
+    assert config["event_count"] == 0
+    assert config["completion_status"] == "running"
+
+
 def test_prepare_experiment_storage_reports_write_probe_failure(tmp_path, monkeypatch):
     root = tmp_path / "unwritable"
     low_water = storage_module.MINIMUM_FREE_SPACE_BYTES
@@ -956,8 +1478,9 @@ def test_stale_run_recovery_marks_interrupted_and_preserves_raw_files(tmp_path):
     directory = tmp_path / "20261019_120000_000001_recover_me"
     directory.mkdir()
     measurement_bytes = (
+        b"\xef\xbb\xbf"
         b"sample_index,raw_reading,status\r\n"
-        b"1,1.000000,ok\r\n"
+        b'1,"first line\r\nsecond, line",ok\r\n'
         b"2,partial"
     )
     event_bytes = b"event_index,event\r\n1,started\r\n2,partial"
@@ -983,8 +1506,13 @@ def test_stale_run_recovery_marks_interrupted_and_preserves_raw_files(tmp_path):
 
     metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     assert metadata["completion_status"] == "interrupted"
-    assert metadata["sample_count"] == 0
+    assert metadata["sample_count"] == 1
+    assert metadata["event_count"] == 1
     assert metadata["recovery"]["sample_count_checkpoint"] == 0
+    assert metadata["recovery"]["recovered_sample_count"] == 1
+    assert metadata["recovery"]["recovered_event_count"] == 1
+    assert recovery["measurements_csv"]["complete_record_count"] == 1
+    assert recovery["events_csv"]["complete_record_count"] == 1
     assert recovery["measurements_csv"]["complete_prefix_bytes"] == measurement_bytes.rfind(b"\n") + 1
     assert recovery["measurements_csv"]["partial_tail_bytes"] == len(b"2,partial")
     assert recovery["events_csv"]["complete_prefix_bytes"] == event_bytes.rfind(b"\n") + 1
@@ -1079,8 +1607,74 @@ with ExperimentNameLock(root, name):
     metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     assert metadata["completion_status"] == "interrupted"
     assert metadata["recovery"]["sample_count_checkpoint"] == 0
+    assert metadata["sample_count"] == 2
+    assert metadata["recovery"]["recovered_sample_count"] == 2
+    assert recovery["measurements_csv"]["complete_record_count"] == 2
     backup = directory / metadata["recovery"]["original_config_backup"]
     assert backup.read_bytes() == original_config
+
+
+def test_stale_recovery_keeps_checkpoint_when_csv_record_count_is_ambiguous(tmp_path):
+    directory = tmp_path / "20261019_120000_000001_ambiguous_run"
+    directory.mkdir()
+    (directory / "measurements.csv").write_bytes(
+        b"sample_index,raw_reading,status\r\n1,1.25\r\n"
+    )
+    (directory / "events.csv").write_bytes(b"event_index,event\r\n")
+    config = {
+        "experiment_name": "ambiguous run",
+        "completion_status": "running",
+        "experiment_name_lock_protocol": 1,
+        "sample_count": 100,
+        "event_count": 0,
+    }
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    with storage_module.ExperimentNameLock(tmp_path, "ambiguous run").acquire() as lock:
+        recovery = storage_module.mark_stale_experiment_interrupted(
+            tmp_path, "ambiguous run", expected_directory=directory, lock=lock,
+        )
+
+    metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    assert recovery is not None
+    assert metadata["sample_count"] == 100
+    assert metadata["recovery"]["sample_count_checkpoint"] == 100
+    assert metadata["recovery"]["recovered_sample_count"] is None
+    assert recovery["measurements_csv"]["complete_record_count"] is None
+    assert "列数与表头不一致" in recovery["measurements_csv"]["record_count_error"]
+
+
+@pytest.mark.parametrize("measurement_bytes", [b"", b"sample_index,raw_reading"])
+def test_stale_recovery_keeps_checkpoint_without_a_complete_csv_header(
+    tmp_path, measurement_bytes,
+):
+    directory = tmp_path / "20261019_120000_000001_incomplete_header"
+    directory.mkdir()
+    measurements_path = directory / "measurements.csv"
+    measurements_path.write_bytes(measurement_bytes)
+    (directory / "events.csv").write_bytes(b"event_index,event\r\n")
+    config = {
+        "experiment_name": "incomplete header",
+        "completion_status": "running",
+        "experiment_name_lock_protocol": 1,
+        "sample_count": 12,
+        "event_count": 0,
+    }
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    with storage_module.ExperimentNameLock(tmp_path, "incomplete header").acquire() as lock:
+        recovery = storage_module.mark_stale_experiment_interrupted(
+            tmp_path, "incomplete header", expected_directory=directory, lock=lock,
+        )
+
+    metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    assert recovery is not None
+    assert metadata["sample_count"] == 12
+    assert metadata["recovery"]["sample_count_checkpoint"] == 12
+    assert metadata["recovery"]["recovered_sample_count"] is None
+    assert recovery["measurements_csv"]["complete_record_count"] is None
+    assert "完整表头" in recovery["measurements_csv"]["record_count_error"]
+    assert measurements_path.read_bytes() == measurement_bytes
 
 
 def test_stale_run_recovery_requires_matching_acquired_lock(tmp_path):
@@ -1247,4 +1841,358 @@ def test_archive_refuses_reparse_point_config_metadata(tmp_path, monkeypatch):
 
     assert existing.is_dir()
     assert not (tmp_path / ".8845a-backups").exists()
+
+
+def test_recorder_refuses_reserved_reparse_directory_before_writing(tmp_path, monkeypatch):
+    root = tmp_path / "experiments"
+    root.mkdir()
+    reserved = storage_module.reserve_experiment_directory(root, "junction guard")
+    real_check = storage_module._is_symlink_or_junction
+    monkeypatch.setattr(
+        storage_module,
+        "_is_symlink_or_junction",
+        lambda path: Path(path) == reserved or real_check(Path(path)),
+    )
+
+    with pytest.raises(OSError):
+        ExperimentRecorder.create(
+            root,
+            "junction guard",
+            {"simulation": True},
+            ModeSettings(Mode.DCV),
+            reserved_directory=reserved,
+        )
+
+    assert list(reserved.iterdir()) == []
+
+
+def test_recorder_refuses_a_real_reserved_directory_symlink(tmp_path):
+    root = tmp_path / "experiments"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    reserved = storage_module.reserve_experiment_directory(root, "symlink guard")
+    reserved.rmdir()
+    try:
+        reserved.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"This Windows environment cannot create symlinks: {exc}")
+
+    try:
+        with pytest.raises(OSError):
+            ExperimentRecorder.create(
+                root,
+                "symlink guard",
+                {"simulation": True},
+                ModeSettings(Mode.DCV),
+                reserved_directory=reserved,
+            )
+
+        assert list(outside.iterdir()) == []
+    finally:
+        reserved.unlink(missing_ok=True)
+
+
+def test_recorder_refuses_a_real_windows_reserved_directory_junction(tmp_path):
+    if sys.platform != "win32":
+        pytest.skip("Windows directory junction integration test")
+    root = tmp_path / "experiments"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    reserved = storage_module.reserve_experiment_directory(root, "junction integration")
+    reserved.rmdir()
+    command = (
+        "New-Item -ItemType Junction "
+        f"-Path '{str(reserved).replace(chr(39), chr(39) * 2)}' "
+        f"-Target '{str(outside).replace(chr(39), chr(39) * 2)}' | Out-Null"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create a directory junction: {result.stderr or result.stdout}")
+
+    try:
+        with pytest.raises(OSError):
+            ExperimentRecorder.create(
+                root,
+                "junction integration",
+                {"simulation": True},
+                ModeSettings(Mode.DCV),
+                reserved_directory=reserved,
+            )
+
+        assert list(outside.iterdir()) == []
+    finally:
+        reserved.rmdir()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory swap race test")
+def test_recorder_metadata_write_cannot_swap_run_directory_for_junction(
+    tmp_path, monkeypatch
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_config = outside / "config.json"
+    original_outside = b"external config sentinel; preserve exactly\r\n"
+    outside_config.write_bytes(original_outside)
+    recorder = ExperimentRecorder.create(
+        tmp_path, "directory swap race", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    directory = recorder.directory
+    moved = directory.with_name(f"{directory.name}-moved")
+    replace = os.replace
+    attack = {"rename_blocked": False, "junction_created": False}
+
+    def create_junction() -> None:
+        command = (
+            "New-Item -ItemType Junction "
+            f"-Path '{str(directory).replace(chr(39), chr(39) * 2)}' "
+            f"-Target '{str(outside).replace(chr(39), chr(39) * 2)}' | Out-Null"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise OSError(f"could not create race-test junction: {result.stderr or result.stdout}")
+        attack["junction_created"] = True
+
+    def replace_after_directory_swap(source, target):
+        try:
+            os.rename(directory, moved)
+        except PermissionError:
+            attack["rename_blocked"] = True
+        else:
+            create_junction()
+        return replace(source, target)
+
+    monkeypatch.setattr(storage_module.os, "replace", replace_after_directory_swap)
+    try:
+        # finish() closes every output stream before atomically replacing config.json.
+        # That is the narrow window where stream handles alone cannot pin the folder.
+        recorder.finish("test")
+        assert attack["rename_blocked"] is True
+        assert outside_config.read_bytes() == original_outside
+        os.rename(directory, moved)
+        os.rename(moved, directory)
+    finally:
+        monkeypatch.setattr(storage_module.os, "replace", replace)
+        if attack["junction_created"]:
+            directory.rmdir()
+        if moved.exists():
+            os.rename(moved, directory)
+        if not all(
+            stream is None or stream.closed
+            for stream in (recorder._data_stream, recorder._event_stream, recorder._log_stream)
+        ):
+            recorder.finish("test")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory lease lifecycle test")
+def test_recorder_directory_lease_is_released_when_recorder_is_collected(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "directory lease gc", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    directory = recorder.directory
+    moved = directory.with_name(f"{directory.name}-moved")
+    del recorder
+    gc.collect()
+
+    os.rename(directory, moved)
+    assert moved.is_dir()
+
+
+def test_recorder_periodic_sync_start_failure_does_not_prevent_cleanup(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "sync thread start failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+
+    class _ThreadThatCannotStart:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("simulated thread start failure")
+
+        def is_alive(self):
+            return False
+
+        def join(self):
+            raise RuntimeError("cannot join thread before it is started")
+
+    monkeypatch.setattr(storage_module, "Thread", _ThreadThatCannotStart)
+    with pytest.raises(RuntimeError, match="simulated thread start failure"):
+        recorder.start_periodic_sync(lambda exc: None)
+
+    assert recorder._csv_sync_thread is None
+    recorder.finish("start_error")
+    assert all(
+        stream is None or stream.closed
+        for stream in (recorder._data_stream, recorder._event_stream, recorder._log_stream)
+    )
+    assert recorder._directory_lease is None
+
+
+def test_recorder_periodic_sync_start_error_joins_a_thread_that_already_started(
+    tmp_path, monkeypatch
+):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "sync thread post-start failure", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    created_threads = []
+
+    class _ThreadStartsThenFails:
+        def __init__(self, *, target, name, daemon):
+            self._thread = threading.Thread(target=target, name=name, daemon=daemon)
+            self.join_calls = 0
+            created_threads.append(self)
+
+        @property
+        def ident(self):
+            return self._thread.ident
+
+        def start(self):
+            self._thread.start()
+            raise RuntimeError("simulated post-start failure")
+
+        def join(self):
+            self.join_calls += 1
+            self._thread.join()
+
+        def is_alive(self):
+            return self._thread.is_alive()
+
+    monkeypatch.setattr(storage_module, "Thread", _ThreadStartsThenFails)
+    with pytest.raises(RuntimeError, match="simulated post-start failure"):
+        recorder.start_periodic_sync(lambda exc: None)
+
+    sync_thread = created_threads[0]
+    assert sync_thread.join_calls == 1
+    assert not sync_thread.is_alive()
+    assert recorder._csv_sync_thread is None
+    recorder.finish("start_error")
+    assert all(
+        stream is None or stream.closed
+        for stream in (recorder._data_stream, recorder._event_stream, recorder._log_stream)
+    )
+    assert recorder._directory_lease is None
+
+
+@pytest.mark.parametrize(
+    "filename", ["measurements.csv", "events.csv", "run.log", "config.json"]
+)
+def test_recorder_never_overwrites_existing_output_file(tmp_path, filename):
+    directory = tmp_path / "existing output"
+    directory.mkdir()
+    output = directory / filename
+    original = b"external sentinel; do not overwrite\r\n"
+    output.write_bytes(original)
+
+    with pytest.raises(OSError):
+        ExperimentRecorder(directory, {"simulation": True}, ModeSettings(Mode.DCV))
+
+    assert output.read_bytes() == original
+    assert list(directory.iterdir()) == [output]
+
+
+@pytest.mark.parametrize(
+    "filename", ["measurements.csv", "events.csv", "run.log", "config.json"]
+)
+def test_recorder_refuses_output_file_symlink_without_touching_target(
+    tmp_path, filename,
+):
+    directory = tmp_path / "symlinked output"
+    directory.mkdir()
+    output = directory / filename
+    outside = tmp_path / f"outside-{filename}"
+    original = b"external symlink sentinel\r\n"
+    outside.write_bytes(original)
+    try:
+        output.symlink_to(outside)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"This Windows environment cannot create symlinks: {exc}")
+
+    with pytest.raises(OSError):
+        ExperimentRecorder(directory, {"simulation": True}, ModeSettings(Mode.DCV))
+
+    assert output.is_symlink()
+    assert outside.read_bytes() == original
+    assert list(directory.iterdir()) == [output]
+
+
+def test_recorder_metadata_does_not_touch_legacy_fixed_temp_path(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "metadata temp", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    fixed_temp = recorder.directory / "config.json.tmp"
+    original = b"external metadata sentinel\r\n"
+    fixed_temp.write_bytes(original)
+    try:
+        recorder._write_metadata()
+        assert fixed_temp.read_bytes() == original
+        assert json.loads(
+            (recorder.directory / "config.json").read_text(encoding="utf-8")
+        )["completion_status"] == "running"
+    finally:
+        recorder.finish("test")
+
+
+def test_recorder_metadata_does_not_follow_legacy_fixed_temp_symlink(tmp_path):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "metadata temp symlink", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    fixed_temp = recorder.directory / "config.json.tmp"
+    outside = tmp_path / "outside-config-temp.json"
+    original = b"external metadata temp sentinel\r\n"
+    outside.write_bytes(original)
+    try:
+        fixed_temp.symlink_to(outside)
+    except (NotImplementedError, OSError) as exc:
+        recorder.finish("test")
+        pytest.skip(f"This Windows environment cannot create symlinks: {exc}")
+
+    try:
+        recorder._write_metadata()
+        assert fixed_temp.is_symlink()
+        assert outside.read_bytes() == original
+        assert json.loads(
+            (recorder.directory / "config.json").read_text(encoding="utf-8")
+        )["completion_status"] == "running"
+    finally:
+        fixed_temp.unlink(missing_ok=True)
+        recorder.finish("test")
+
+
+def test_recorder_metadata_refuses_reparse_config_target(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(
+        tmp_path, "metadata target", {"simulation": True}, ModeSettings(Mode.DCV)
+    )
+    config_path = recorder.directory / "config.json"
+    original_config = config_path.read_bytes()
+    outside = tmp_path / "outside-config.json"
+    original_outside = b"outside metadata sentinel\r\n"
+    outside.write_bytes(original_outside)
+    real_check = storage_module._is_symlink_or_junction
+    monkeypatch.setattr(
+        storage_module,
+        "_is_symlink_or_junction",
+        lambda path: Path(path) == config_path or real_check(Path(path)),
+    )
+
+    with pytest.raises(OSError):
+        recorder._write_metadata()
+
+    assert outside.read_bytes() == original_outside
+    assert config_path.read_bytes() == original_config
+    monkeypatch.setattr(storage_module, "_is_symlink_or_junction", real_check)
+    recorder.finish("test")
 

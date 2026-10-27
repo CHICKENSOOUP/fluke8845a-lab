@@ -8,11 +8,12 @@ const ui = {
 };
 const app = {
   meta: null, state: null, points: [], latestInvalidPoint: null, imported: null, generation: null, lastSample: 0, lastLog: 0,
+  chartCleared: false,
   modes: new Map(), selectedMode: "DCV", baseline: null, baselineByMode: new Map(), dcvInputImpedanceAuto: false, toastTimer: 0, pollTimer: 0, pollInFlight: false,
   portDescriptions: new Map(),
   importedEvents: null, importedExperimentId: null, importedFileName: "", chartEventHits: [], hoveredEventIndex: null, selectedEventIndex: null,
   chartFramePending: false, pointerFramePending: false, pointIndexCache: null,
-  logRows: [], logFilter: "all",
+  logRows: [], logFilter: "all", fileExportResults: [],
   activePointers: new Map(), pinchState: null,
   activeDeviceSerial: "",
   chartOverview: [], chartOverviewJobId: null, chartOverviewStatus: "idle", chartOverviewRevision: -1,
@@ -27,7 +28,7 @@ const app = {
   historyEventsWorker: null, cancelEventImport: null,
   historyImportWorker: null, historyImportJob: null, cancelHistoryImport: null, importedStats: null,
 };
-const COLORS = { ink: "#526064", muted: "#87918b", grid: "#e5e4da", axis: "#aeb6ad", line: "#138b92", lineFill: "#138b9218", event: "#d39130" };
+const COLORS = { ink: "#526064", muted: "#87918b", grid: "#e5e4da", axis: "#aeb6ad", line: "#138b92", lineFill: "#138b9218", event: "#8a5d13" };
 const COMMAND_RECOVERY_STORAGE_KEY = "8845a-unresolved-command";
 
 function commandRecoveryKey(action) {
@@ -121,6 +122,22 @@ function setActiveBaseline(value) {
 }
 
 function activeMode() { return app.modes.get(app.selectedMode) || null; }
+
+function fixedRangeTooltip(state = app.state) {
+  const reasons = [];
+  if (state?.connected && !state.simulation && state.control_mode !== "computer") {
+    reasons.push("仪表处于 Local 模式；切换到 Computer 后可操作。");
+  }
+  const status = String(state?.status || "");
+  if (/(采集中|测量中)/.test(status) || status.includes("暂停")) {
+    reasons.push("采集中不能更改仪器参数。");
+  }
+  if (el("autorange")?.checked) {
+    reasons.push("自动量程已启用；关闭自动量程后可选择固定量程。");
+  }
+  return reasons.join(" ") || "选择当前测量模式的固定量程。";
+}
+
 function settingsPayload() {
   const mode = app.selectedMode;
   const settings = { mode, autorange: el("autorange").checked, autozero: el("autozero").checked };
@@ -129,7 +146,7 @@ function settingsPayload() {
   if (spec.nplc.length) settings.nplc = Number(el("nplc").value);
   if (spec.bandwidths.length) settings.ac_bandwidth_hz = Number(el("bandwidth").value);
   if (spec.analog_filter) settings.analog_filter = el("analogFilter").checked;
-  if (spec.digital_filter) settings.digital_filter = false;
+  if (spec.digital_filter) settings.digital_filter = !!el("digitalFilter")?.checked;
   if (spec.input_impedance_auto) settings.input_impedance_auto = el("inputImpedanceAuto").checked;
   return settings;
 }
@@ -169,22 +186,29 @@ function populateModeOptions(spec) {
   html += `<p id="modeParameterHint" class="mode-parameter-hint" aria-live="polite">${timingHint}</p>`;
   if (spec.analog_filter) html += `<label class="option-check"><input id="analogFilter" type="checkbox"> 启用直流模拟滤波</label>`;
   if (spec.input_impedance_auto) html += `<label class="option-check" title="默认关闭为10 MΩ。启用后仅在100 mV、1 V、10 V DCV量程使用大于10 GΩ的输入阻抗，其他量程仍为10 MΩ。"><input id="inputImpedanceAuto" type="checkbox" ${app.dcvInputImpedanceAuto ? "checked" : ""}> 自动高输入阻抗（仅DCV）</label><p class="field-hint">仅100 mV、1 V、10 V量程可用，启用时输入阻抗大于10 GΩ。</p>`;
-  if (spec.digital_filter) html += `<label class="option-check" title="${htmlText(app.meta?.digital_filter_disabled_reason || "数字滤波当前保持关闭")}"><input id="digitalFilter" type="checkbox" disabled> 直流数字滤波（暂时关闭）</label>`;
+  if (spec.digital_filter) html += `<label class="option-check" title="${htmlText(app.meta?.digital_filter_info || "数字滤波仅适用于慢速直流测量；平均数量随功能和量程变化，仪表固件版本需核实")}"><input id="digitalFilter" type="checkbox"> 启用直流数字滤波</label>`;
   html += `<label class="option-check" title="仪表自动测量内部零点并补偿偏移，可提升稳定性但会增加测量时间；不会把被测读数强制改成0。"><input id="autozero" type="checkbox" checked> 自动零点校正</label>`;
   html += `<p id="autozeroSpeedHint" class="mode-parameter-hint">启用自动零点会增加测量时间；不会把被测读数强制改成 0。</p>`;
   ui.options.innerHTML = html;
+  el("range").title = fixedRangeTooltip();
   el("autorange").addEventListener("change", () => {
     el("range").disabled = el("autorange").checked;
+    el("range").title = fixedRangeTooltip();
     clearSafetyConfirmation();
     clearPreflightSummary();
     renderSettingsComparison(app.state);
     updateCurrentRangeGuidance(app.state);
   });
   el("range").addEventListener("change", () => { clearSafetyConfirmation(); clearPreflightSummary(); renderSettingsComparison(app.state); updateCurrentRangeGuidance(app.state); });
-  for (const id of ["nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "autozero"]) {
+  for (const id of ["nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "digitalFilter", "autozero"]) {
     const control = el(id);
-    if (control) control.addEventListener("change", () => { clearPreflightSummary(); renderSettingsComparison(app.state); });
+    if (control) control.addEventListener("change", () => {
+      if (id === "nplc") updateDigitalFilterAvailability(app.state);
+      clearPreflightSummary();
+      renderSettingsComparison(app.state);
+    });
   }
+  updateDigitalFilterAvailability(app.state);
   ui.safety.textContent = spec.safety;
   const safetyLimits = el("modeSafetyLimits");
   safetyLimits.textContent = spec.safety_limits || "";
@@ -206,6 +230,38 @@ function populateModeOptions(spec) {
   el("chartTitle").textContent = `${spec.label} · 随时间变化`;
   el("legendName").textContent = `${spec.label} 原始读数`;
   drawChart();
+}
+
+function updateDigitalFilterAvailability(state = app.state) {
+  const control = el("digitalFilter");
+  if (!control) return false;
+  const spec = app.modes.get(app.selectedMode);
+  if (!spec?.digital_filter) return false;
+
+  const nplc = Number(el("nplc")?.value);
+  const slowNplc = nplc === 10 || nplc === 100;
+  const device = state?.device || {};
+  const firmware = String(device.range_firmware || "").trim();
+  const knownOldFirmware = !!(
+    state?.connected && !state.simulation && firmware
+    && compareRangeFirmware(firmware, [2, 0]) === false
+  );
+  let reason = "";
+  if (!slowNplc) {
+    reason = "直流数字滤波仅在10或100 NPLC（慢于1 PLC）时有效；请选择10或100 NPLC。";
+  } else if (knownOldFirmware) {
+    reason = `当前面板核对的 OutG SW ${firmware} 早于 2.0，不支持该功能。`;
+  }
+  if (reason) control.checked = false;
+  control.disabled = !!reason || !!(
+    state?.connected && !state.simulation && state.control_mode === "local"
+  );
+  const info = String(app.meta?.digital_filter_info || "数字滤波适用于DCV、DCI、2W和4W；平均数量随功能和量程变化，手册未给出固定最大响应时间。以实际采样间隔为准；通信超时将作为失败记录，不会生成读数。");
+  const firmwareHint = !firmware || compareRangeFirmware(firmware, [2, 0]) === null
+    ? "当前 OutG SW 版本未知；数字滤波要求 OutG SW 2.0 或更高，启用时软件会尝试设置并回读确认，不能仅凭 IDN 推断固件版本。"
+    : "OutG SW 版本来自面板核对记录。";
+  control.title = reason || `${info} ${firmwareHint}`;
+  return !reason && !control.disabled;
 }
 
 function clearSafetyConfirmation() { ui.confirm.checked = false; }
@@ -265,7 +321,7 @@ function updateCurrentRangeGuidance(state = app.state, selectedSpec = null) {
     return;
   }
 
-  const minimum = mode === "DCI" ? [2, 0] : [1, 0, 700, 18];
+  const minimum = mode === "DCI" ? [2, 0] : null;
   const minimumText = mode === "DCI" ? "2.0" : "1.0.700.18";
   const isAuto = !!el("autorange")?.checked;
   const selectedRange = isAuto ? null : Number(el("range")?.value);
@@ -275,12 +331,15 @@ function updateCurrentRangeGuidance(state = app.state, selectedSpec = null) {
   const device = state?.device || {};
   const firmware = String(device.range_firmware || "").trim();
   const firmwareSource = String(device.range_firmware_source || "未知").trim() || "未知";
-  const firmwareGate = firmware ? compareRangeFirmware(firmware, minimum) : null;
+  const firmwareGate = minimum && firmware ? compareRangeFirmware(firmware, minimum) : null;
   const hasTerminalReadback = !!(state?.connected && !state.simulation && state.control_mode !== "local");
   const terminal = hasTerminalReadback ? String(state?.configuration?.input_terminals || "").trim() : "";
   const terminalKnown = !!terminal;
   const frontTerminal = terminalKnown && terminal.toUpperCase().startsWith("FRON");
-  const pieces = [`量程限制：当前选择 ${mode} ${selectedText}`, `策略门槛：${mode} 400 mA 档要求 OutG SW ≥ ${minimumText}；1 A、3 A、10 A 档只允许前面板电流端子`];
+  const firmwarePolicy = mode === "DCI"
+    ? `DCI 400 mA 档要求 OutG SW ≥ ${minimumText}`
+    : `ACI 400 mA 档要求软件版本 ≥ ${minimumText}；官方资料未明确对应 OutG SW 还是 InG SW，本软件不根据 OutG SW 或 InG SW 自动拒绝 400 mA 档，使用前请在仪表面板核对软件版本`;
+  const pieces = [`量程限制：当前选择 ${mode} ${selectedText}`, `策略门槛：${firmwarePolicy}；1 A、3 A、10 A 档只允许前面板电流端子`];
   const active = state?.active_settings;
   if (state?.connected && !state.simulation && state.control_mode !== "local") {
     if (active?.mode && active.mode !== mode) pieces.push(`设备当前回读 ${active.mode}，与界面选择不同`);
@@ -304,7 +363,9 @@ function updateCurrentRangeGuidance(state = app.state, selectedSpec = null) {
   const needs400mAGate = isAuto || selectedRange === 0.4;
   const needsFrontTerminal = isAuto || [1, 3, 10].includes(selectedRange);
   if (needs400mAGate) {
-    if (firmwareGate === false) {
+    if (mode === "ACI") {
+      pieces.push(`ACI 400 mA 档的软件版本门槛 ${minimumText} 未由 OutG/InG 字段自动判断；使用 400 mA 固定档或自动量程前，请在仪表面板核对软件版本`);
+    } else if (firmwareGate === false) {
       pieces.push(`400 mA 档使用版本 ${firmware}（来源 ${firmwareSource}），低于门槛 ${minimumText}，该档按软件策略受限；下一步：人工核对仪表面板 VERSIONS + SN 中的 OutG SW，并确认缓存来源版本`);
     } else if (firmwareGate === true) {
       pieces.push(`400 mA 档版本门槛 ${minimumText} 已满足；这只说明固件门槛，不验证实际接线和保险丝`);
@@ -330,16 +391,17 @@ function updateCurrentRangeGuidance(state = app.state, selectedSpec = null) {
 function renderIdnFirmwareInfo(state, device = state?.device || {}) {
   const info = el("idnFirmwareInfo");
   if (!info) return;
+  const gateEvidence = "DCI 400 mA 门槛明确依据人工核对的 OutG SW；ACI 官方资料未明确 1.0.700.18 门槛对应 OutG SW 还是 InG SW，本软件不根据这两个字段自动拒绝 400 mA 档，使用前需在仪表面板核对软件版本。";
   if (!state?.connected) {
     info.textContent = "未连接，尚未读取 *IDN?。";
   } else if (state.simulation) {
-    info.textContent = "MOCK 身份字段是模拟数据，不代表仪器固件；真实仪器的 400 mA 门槛只依据人工核对的面板 OutG SW。";
+    info.textContent = `MOCK 身份字段是模拟数据，不代表仪器固件；${gateEvidence}`;
   } else if (device.idn_version_candidate) {
     const revision = String(device.idn_revision || "未返回");
-    info.textContent = `*IDN? 修订字段中有数字候选 ${device.idn_version_candidate}，但未验证为 OutG SW，不作为 400 mA 固件门槛依据；原始修订字段：${revision}。`;
+    info.textContent = `*IDN? 修订字段中有数字候选 ${device.idn_version_candidate}，但未验证为 OutG SW，不作为 400 mA 固件门槛依据；原始修订字段：${revision}。${gateEvidence}`;
   } else {
     const revision = String(device.idn_revision || "未返回");
-    info.textContent = `*IDN? 修订字段：${revision}。不将该字段作为仪器固件版本；400 mA 门槛只依据人工核对的面板 OutG SW。`;
+    info.textContent = `*IDN? 修订字段：${revision}。不将该字段作为仪器固件版本；${gateEvidence}`;
   }
 }
 
@@ -809,6 +871,7 @@ const COMMAND_LABELS = {
   event: "记录事件", open_experiment_directory: "打开实验目录", shutdown: "退出服务",
 };
 const COMMAND_PROGRESS_DETAILS = {
+  diagnose: "诊断进行中：正在读取仪器身份、测量功能、输入端子和错误队列；完成后显示诊断结果。",
   zero: "正在发出 ZERO:AUTO ONCE；随后检查错误队列并回读仪器配置，不会把读数设为零。",
   configure: "正在写入所选测量设置并回读核对；完成后报告模式与参数应用结果。",
   stop: "正在停止采集，等待采集线程完成写入并关闭 CSV；完成后报告样本数和保存目录。",
@@ -866,8 +929,34 @@ function intervalMetricText(value) {
   return `${numberText(seconds * 1e6, 4)} µs`;
 }
 
+function updateDisabledTooltip(control, reason, enabledTitle = "") {
+  if (!control) return;
+  if (reason) {
+    if (control.dataset.disabledReason === undefined) {
+      control.dataset.enabledTitle = control.title || enabledTitle || "";
+    }
+    control.dataset.disabledReason = reason;
+    control.title = reason;
+    return;
+  }
+  if (control.dataset.disabledReason !== undefined) {
+    control.title = control.dataset.enabledTitle || enabledTitle || "";
+    delete control.dataset.disabledReason;
+    delete control.dataset.enabledTitle;
+  } else if (!control.title && enabledTitle) {
+    control.title = enabledTitle;
+  }
+}
+
 function serialFormDisabled(disabled) {
-  for (const id of ["port", "portList", "baudrate", "bytesize", "parity", "stopbits", "eol", "flow", "serialTimeout", "scanPorts", "connectReal", "connectMock"]) el(id).disabled = disabled;
+  const reason = disabled
+    ? "串口参数已锁定；先断开当前仪器或模拟器，再修改设置并重新连接。"
+    : "串口参数将在下次连接时使用。";
+  for (const id of ["port", "portList", "baudrate", "bytesize", "parity", "stopbits", "eol", "flow", "serialTimeout", "scanPorts", "connectReal", "connectMock"]) {
+    const control = el(id);
+    control.disabled = disabled;
+    updateDisabledTooltip(control, disabled ? reason : "", "串口参数将在下次连接时使用。");
+  }
 }
 
 function manualSoftwareProfiles() {
@@ -914,7 +1003,36 @@ function renderManualSoftwareInfo(profile) {
     const time = updated && Number.isFinite(updated.getTime()) ? updated.toLocaleString() : "时间未记录";
     info.textContent = `来源：仪表面板人工核对 · 更新时间：${time}`;
   }
-  el("clearManualSoftware").disabled = !hasVersion || !app.state?.connected || !!app.state?.simulation;
+  updateManualFirmwareAvailability(app.state, hasVersion);
+}
+
+function updateManualFirmwareAvailability(state, hasVersion) {
+  const running = /采集中|测量中/.test(state?.status || "");
+  const paused = String(state?.status || "").includes("暂停");
+  const acquiring = running || paused;
+  const lockReason = !state?.connected
+    ? "连接真实仪器后才能记录面板软件版本。"
+    : state.simulation
+      ? "MOCK 模拟模式不使用真实仪器面板版本。"
+      : acquiring
+        ? "采集中不能更改面板版本记录；请先停止并保存当前实验。"
+        : "";
+  for (const [id, help] of [
+    ["outguardSoftware", "人工记录仪表前面板 VERSIONS + SN 页的 OutG SW；不是 SCPI 读取。"],
+    ["inguardSoftware", "可选人工记录仪表前面板 VERSIONS + SN 页的 InG SW；不是 SCPI 读取。"],
+  ]) {
+    const control = el(id);
+    control.disabled = !!lockReason;
+    updateDisabledTooltip(control, lockReason, help);
+  }
+  const clearReason = lockReason || (!hasVersion ? "当前仪器没有可清除的面板版本记录。" : "");
+  const clearButton = el("clearManualSoftware");
+  clearButton.disabled = !!clearReason;
+  updateDisabledTooltip(
+    clearButton,
+    clearReason,
+    "清除本机为当前仪器序列号保存的人工版本记录；不会修改仪器固件。",
+  );
 }
 
 async function clearManualSoftware() {
@@ -1009,6 +1127,8 @@ function updateExperimentNameValidation() {
   else {
     el("start").disabled = !!error;
     el("single").disabled = !!error;
+    el("startFromSettings").disabled = el("start").disabled;
+    el("singleFromSettings").disabled = el("single").disabled;
   }
   return error;
 }
@@ -1020,6 +1140,11 @@ async function startSingle() {
   await submitAcquisition("single");
 }
 
+async function startFromSettings(action) {
+  const accepted = await submitAcquisition(action);
+  if (accepted) el("settingsDialog").close();
+}
+
 function clearPreflightSummary() {
   const summary = el("preflightSummary");
   summary.textContent = "";
@@ -1027,11 +1152,13 @@ function clearPreflightSummary() {
 }
 
 async function submitAcquisition(action) {
-  if (updateExperimentNameValidation() || app.startPending) return;
+  if (updateExperimentNameValidation() || app.startPending) return false;
   app.startPending = true;
   const summary = el("preflightSummary");
   summary.classList.remove("error");
-  summary.textContent = "正在核对仪器连接、配置回读、接线确认和保存目录…";
+  summary.textContent = app.state?.connected && app.state?.simulation
+    ? "正在检查模拟器连接、测量设置和保存目录…"
+    : "正在核对仪器连接、配置回读、接线确认和保存目录…";
   if (app.state) updateStateDisplay(app.state);
   const payload = startPayload();
   try {
@@ -1039,7 +1166,7 @@ async function submitAcquisition(action) {
     if (!preflight.success) {
       summary.textContent = `采集预检未通过：${preflight.message || "请检查配置和保存目录"}`;
       summary.classList.add("error");
-      return;
+      return false;
     }
     const checks = Array.isArray(preflight.checks) ? preflight.checks.map(String) : [];
     summary.textContent = `采集预检通过：${checks.join(" · ")}`;
@@ -1049,7 +1176,7 @@ async function submitAcquisition(action) {
         summary.textContent = "请修改实验名称后重新开始；旧实验数据未修改。";
         el("experimentName").focus();
         el("experimentName").select();
-        return;
+        return false;
       }
       if (choice === "overwrite") {
         payload.expected_duplicate_path = String(preflight.duplicate_path || "");
@@ -1060,10 +1187,16 @@ async function submitAcquisition(action) {
         summary.textContent = "将创建新的独立目录；旧实验数据不会覆盖。";
       } else {
         summary.textContent = "已取消启动；旧实验数据未修改。";
-        return;
+        return false;
       }
     }
-    await command(action, payload);
+    const result = await command(action, payload);
+    if (result?.success) return true;
+    summary.textContent = result?.uncertain
+      ? "启动结果尚未确认；请查看采集状态和日志，确认后再决定是否重试。"
+      : `采集未启动：${result?.message || "启动请求未被服务接受；当前曲线保持不变。"}`;
+    summary.classList.add("error");
+    return false;
   } finally {
     app.startPending = false;
     if (app.state) updateStateDisplay(app.state);
@@ -1071,6 +1204,8 @@ async function submitAcquisition(action) {
       const nameError = !!experimentNameError(el("experimentName").value);
       el("start").disabled = nameError;
       el("single").disabled = nameError;
+      el("startFromSettings").disabled = el("start").disabled;
+      el("singleFromSettings").disabled = el("single").disabled;
     }
   }
 }
@@ -1220,6 +1355,48 @@ function clearChartOverview() {
   app.chartRangeView = null;
 }
 
+function clearDisplayedPlot() {
+  const status = String(app.state?.status || "");
+  const acquiring = /(采集中|测量中)/.test(status) || status.includes("暂停");
+  if (app.startPending || acquiring) {
+    toast("请先停止并保存当前实验，再清空图表。", true);
+    return false;
+  }
+  if (!app.points.length && !app.imported?.length && !app.chartOverview.length) {
+    toast("当前没有可清空的曲线。", false);
+    return false;
+  }
+
+  app.chartCleared = true;
+  app.points = [];
+  app.latestInvalidPoint = null;
+  app.imported = null;
+  app.importedStats = null;
+  app.importedEvents = null;
+  app.importedExperimentId = null;
+  app.importedFileName = "";
+  app.selectedEventIndex = null;
+  app.selectedPointIndex = null;
+  app.cursor = null;
+  app.pointIndexCache = null;
+  app.xView = null;
+  app.yView = null;
+  app.yOrigin = null;
+  app.bufferTruncated = false;
+  clearChartOverview();
+  el("restoreLive").classList.add("hidden");
+  el("autoFollow").checked = true;
+  const mode = activeMode();
+  el("chartTitle").textContent = mode ? `${mode.label} · 随时间变化` : "测量曲线";
+  el("legendName").textContent = mode ? `${mode.label} 原始读数` : "原始读数";
+  renderEvents([]);
+  updateAccessiblePointTable();
+  updateStats();
+  drawChart();
+  toast("图表已清空；measurements.csv 和 events.csv 保留。要重新测量，请点“新建测量”。", false);
+  return true;
+}
+
 function mergeChartRows(overview, recent) {
   const byId = new Map();
   for (const point of overview || []) byId.set(Number(point.id), point);
@@ -1239,6 +1416,7 @@ function mergeChartRows(overview, recent) {
 }
 
 function chartPointsForPlot() {
+  if (app.chartCleared) return [];
   const recent = validPoints();
   if (app.imported) return recent;
   if (app.xView) {
@@ -1254,7 +1432,7 @@ function chartPointsForPlot() {
 }
 
 async function refreshChartOverview() {
-  if (app.chartOverviewInFlight) return false;
+  if (app.chartCleared || app.chartOverviewInFlight) return false;
   const requestGeneration = app.generation;
   const requestDirectory = app.state?.experiment_dir || app.state?.last_experiment_dir;
   if (!requestDirectory) return false;
@@ -1298,6 +1476,7 @@ async function refreshChartOverview() {
 }
 
 function scheduleChartOverviewRefresh() {
+  if (app.chartCleared) return;
   const now = Date.now();
   if (now < app.chartOverviewNextAt || app.chartOverviewInFlight) return;
   app.chartOverviewNextAt = now + 1500;
@@ -1414,6 +1593,7 @@ async function pollState() {
     app.mockConnectPending = false;
     const wasConnected = !!app.state?.connected;
     if (app.generation !== null && state.generation !== app.generation) {
+      app.chartCleared = false;
       app.points = [];
       app.latestInvalidPoint = null;
       app.lastSample = 0;
@@ -1436,7 +1616,7 @@ async function pollState() {
     if (!app.imported) scheduleChartOverviewRefresh();
     if (wasConnected && !state.connected) clearSafetyConfirmation();
     updateStateDisplay(state);
-    if (state.events && !app.imported) renderEvents(state.events);
+    if (state.events && !app.imported) renderEvents(app.chartCleared ? [] : state.events);
     if (state.logs?.some((line) => String(line.text).startsWith("! "))) {
       // The actual error remains in the status panel; avoid repeated popups during polling.
     }
@@ -1585,9 +1765,21 @@ function updateStateDisplay(state) {
   el("copyExperimentPath").disabled = !directory;
   el("downloadCsv").disabled = !state.last_experiment_dir;
   el("downloadCsv").textContent = state.experiment_dir ? "下载进行中快照 CSV" : state.last_experiment_dir ? "下载最近已保存 CSV" : "暂无可下载 CSV";
-  el("downloadEventsSafe").disabled = !state.last_experiment_dir || !!state.experiment_dir;
-  el("downloadMeasurementsSafe").disabled = !state.last_experiment_dir || !!state.experiment_dir;
-  el("downloadSharePackage").disabled = !state.last_experiment_dir || !!state.experiment_dir;
+  const exportLockReason = state.experiment_dir
+    ? "请先停止并保存当前采集，再导出安全副本或分享包。"
+    : !state.last_experiment_dir
+      ? "完成并保存一次实验后即可导出安全副本或分享包。"
+      : "";
+  const safeExportHelp = {
+    downloadEventsSafe: "仅对事件文本做表格软件安全处理；原始 events.csv 不会更改。",
+    downloadMeasurementsSafe: "仅对原始响应和错误文本做表格软件安全处理；原始 measurements.csv 不会更改。",
+    downloadSharePackage: "导出脱敏 ZIP；隐藏仪器身份和本机路径，原始实验文件不变。",
+  };
+  for (const [id, help] of Object.entries(safeExportHelp)) {
+    const button = el(id);
+    button.disabled = !!exportLockReason;
+    updateDisabledTooltip(button, exportLockReason, help);
+  }
   el("downloadCsv").title = state.experiment_dir
     ? "下载时生成进行中快照，只包含最后一条完整 CSV 记录；响应会标明服务器快照时间。"
     : state.last_experiment_dir ? "下载最近一次已完成并保存的原始 CSV。" : "开始并保存一次实验后即可下载原始 CSV。";
@@ -1618,13 +1810,24 @@ function updateStateDisplay(state) {
   const running = /采集中|测量中/.test(state.status || "");
   const paused = String(state.status || "").includes("暂停");
   const acquiring = running || paused;
+  el("newMeasurement").disabled = acquiring || app.startPending;
+  el("newMeasurement").title = acquiring
+    ? "请先停止并保存当前实验，再新建测量。"
+    : "打开实验设置并填写名称，再选单次测量或连续采集。新测量开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键 Ctrl+Alt+N。";
+  el("clearPlot").disabled = acquiring || app.startPending;
+  el("clearPlot").title = acquiring
+    ? "请先停止并保存当前实验，再清空图表。"
+    : "确认后清除当前图表、统计和事件列表；磁盘上的 measurements.csv / events.csv 不会删除。";
+  el("newMeasurementHint").textContent = acquiring || app.startPending
+    ? "采集中；重测前先点“停止并保存”，再点“新建测量”。"
+    : "新建测量：点“新建测量”→ 填名称 → 点“单次测量”或“开始连续采集”。新测量开始后自动换图，旧 CSV 保留；“清空图表”只清除显示。";
   const nameError = experimentNameError(el("experimentName").value);
   el("experimentNameError").textContent = nameError;
   el("experimentNameError").classList.toggle("hidden", !nameError);
-  el("outguardSoftware").disabled = !state.connected || state.simulation || acquiring;
-  el("inguardSoftware").disabled = !state.connected || state.simulation || acquiring;
-  el("clearManualSoftware").disabled = !state.connected || state.simulation || acquiring ||
-    !(el("outguardSoftware").value.trim() || el("inguardSoftware").value.trim());
+  updateManualFirmwareAvailability(
+    state,
+    !!(el("outguardSoftware").value.trim() || el("inguardSoftware").value.trim()),
+  );
   const computerControl = !state.connected || state.simulation || state.control_mode === "computer";
   const zeroConfigurationReady = !!state.active_settings?.mode &&
     String(state.active_settings.mode) === String(app.selectedMode || "");
@@ -1632,6 +1835,8 @@ function updateStateDisplay(state) {
   el("applyControlMode").disabled = !state.connected || state.simulation || acquiring;
   el("start").disabled = !state.connected || !computerControl || acquiring || !!nameError || app.startPending;
   el("single").disabled = !state.connected || !computerControl || acquiring || !!nameError || app.startPending;
+  el("startFromSettings").disabled = el("start").disabled;
+  el("singleFromSettings").disabled = el("single").disabled;
   const singleMeasurement = String(state.status || "").includes("单次测量中");
   const continuousRunning = running && !singleMeasurement;
   el("pause").disabled = !continuousRunning;
@@ -1657,10 +1862,7 @@ function updateStateDisplay(state) {
   el("range").disabled = settingsDisabled || el("autorange").checked;
   if (el("analogFilter")) el("analogFilter").disabled = settingsDisabled;
   if (el("inputImpedanceAuto")) el("inputImpedanceAuto").disabled = settingsDisabled;
-  if (el("digitalFilter")) {
-    el("digitalFilter").checked = false;
-    el("digitalFilter").disabled = true;
-  }
+  if (el("digitalFilter")) updateDigitalFilterAvailability(state);
   el("autozero").disabled = settingsDisabled;
   if (el("nplc")) el("nplc").disabled = !computerControl;
   if (el("bandwidth")) el("bandwidth").disabled = !computerControl;
@@ -1674,8 +1876,8 @@ function updateStateDisplay(state) {
       : acquiring
         ? "采集中：当前模式没有适用的速度调整项。"
         : state.connected
-          ? "采集前：选择参数后点“应用仪器参数”。"
-          : "可先选择模式与参数；连接仪器或模拟器后应用。";
+          ? "采集前：填写实验名后可在此直接开始；更改仪器参数需先应用。"
+          : "可先选择模式与参数；连接后填写实验名，即可从此处开始。";
   el("settingsApplyHint").textContent = applyHint;
   el("zero").disabled = !state.connected || !computerControl || acquiring || !zeroConfigurationReady;
   const localPhysicalControl = !!state.connected && !state.simulation && !computerControl;
@@ -1684,12 +1886,23 @@ function updateStateDisplay(state) {
     ? "Local 模式下不运行通信诊断，也不发送 SCPI 查询；切换到 Computer 后再诊断。"
     : "读取仪器身份和当前通信/配置状态，不启动采集。";
   el("controlModeHelp").textContent = "Computer：软件可发送 SCPI 命令、配置和采集，仪表 RS-232 协议须设为 COMPUTER。Local：软件发送 SYST:LOC 请求；仪表没有 Local 状态的 SCPI 回读，请核对仪表面板。软件采集、配置、ZERO 和诊断均禁用，串口连接保留。只能在停止采集后切换。";
-  const lockReason = !state.connected ? "请先连接仪器或模拟器。"
-    : !computerControl ? "仪表处于 Local 模式；切换到 Computer 后可操作。"
-      : acquiring ? "采集中不能更改仪器参数。" : "";
+  const lockReasons = [];
+  if (!state.connected) lockReasons.push("请先连接仪器或模拟器。");
+  if (state.connected && !computerControl) lockReasons.push("仪表处于 Local 模式；切换到 Computer 后可操作。");
+  if (acquiring) lockReasons.push("采集中不能更改仪器参数。");
+  const lockReason = lockReasons.join(" ");
   for (const id of ["mode", "autorange", "range", "nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "autozero", "applySettings"]) {
     const control = el(id);
-    if (control?.disabled) control.title = lockReason;
+    if (!control) continue;
+    if (control.disabled) {
+      control.title = id === "range" ? fixedRangeTooltip(state) : lockReason;
+      if (id !== "range") control.dataset.disabledReason = control.title;
+    } else if (id === "range") {
+      control.title = fixedRangeTooltip(state);
+    } else if (control.dataset.disabledReason !== undefined) {
+      if (control.title === control.dataset.disabledReason) control.title = "";
+      delete control.dataset.disabledReason;
+    }
   }
   el("disconnect").title = acquiring
     ? "采集中不能断开连接；请先停止并保存当前实验。"
@@ -1732,7 +1945,7 @@ function syncSettingsReadback(state) {
     if (spec.nplc.length && active.nplc !== null && active.nplc !== undefined) el("nplc").value = String(active.nplc);
     if (spec.bandwidths.length && active.ac_bandwidth_hz !== null && active.ac_bandwidth_hz !== undefined) el("bandwidth").value = String(active.ac_bandwidth_hz);
     if (spec.analog_filter) el("analogFilter").checked = !!active.analog_filter;
-    if (spec.digital_filter) el("digitalFilter").checked = false;
+    if (spec.digital_filter) el("digitalFilter").checked = active.digital_filter === true;
     el("autozero").checked = !!active.autozero;
     if (spec.input_impedance_auto && el("inputImpedanceAuto")) {
       el("inputImpedanceAuto").checked = !!active.input_impedance_auto;
@@ -1743,7 +1956,9 @@ function syncSettingsReadback(state) {
   } else if (app.awaitSpeedReadback && app.selectedMode === active.mode) {
     if (spec.nplc.length && active.nplc !== null && active.nplc !== undefined) el("nplc").value = String(active.nplc);
     if (spec.bandwidths.length && active.ac_bandwidth_hz !== null && active.ac_bandwidth_hz !== undefined) el("bandwidth").value = String(active.ac_bandwidth_hz);
+    if (spec.digital_filter) el("digitalFilter").checked = active.digital_filter === true;
   }
+  updateDigitalFilterAvailability(state);
   app.awaitSpeedReadback = false;
 }
 
@@ -1752,7 +1967,7 @@ function renderSettingsComparison(state) {
   if (!container) return;
   const pendingMode = el("mode").value || app.selectedMode;
   const pendingSpec = app.modes.get(pendingMode);
-  if (!pendingSpec) { container.textContent = "설정 선택 후 적용 상태가 표시됩니다."; return; }
+  if (!pendingSpec) { container.textContent = "请先选择测量模式，以查看当前生效与待应用设置。"; return; }
   const pending = settingsPayload();
   const actual = state?.active_settings || {};
   const modeLabel = (value) => app.modes.get(value)?.label || value || "未回读";
@@ -1995,11 +2210,12 @@ function renderEvents(events) {
     const elapsed = Number(event.elapsed_s);
     const value = event.value_si !== null && event.value_si !== undefined ? scaledValue(event.value_si, event.unit_si) : null;
     const sample = event.sample_index ? `#${event.sample_index}` : "";
-    return `<li><button class="event-jump" type="button" data-event-index="${eventIndex}" title="定位图表到该事件"><time>t=${Number.isFinite(elapsed) ? durationText(elapsed) : "—"}</time></button><span>${htmlText(event.text)}</span><span class="event-value">${sample}${value ? ` · ${value.value} ${value.unit}` : ""}</span></li>`;
+    return `<li><button class="event-jump" type="button" data-event-index="${eventIndex}" title="定位图表到该事件"><time>t=${Number.isFinite(elapsed) ? durationText(elapsed) : "—"}</time></button><span>${htmlText(event.text)}</span><span class="event-value">${sample}${value ? ` · ${value.value} ${htmlText(value.unit)}` : ""}</span></li>`;
   }).join("");
 }
 
 function displayedEvents() {
+  if (app.chartCleared) return [];
   return app.imported ? (app.importedEvents || []) : (app.state?.events || []);
 }
 
@@ -2129,6 +2345,17 @@ function updateEmptyPlotState(hasPoints = validPoints().length > 0) {
   el("plotEmpty").classList.toggle("hidden", hasPoints);
   el("measurementArea").classList.toggle("chart-empty", !hasPoints);
   if (hasPoints) return;
+  if (app.chartCleared) {
+    el("emptyTitle").textContent = "曲线已清空";
+    el("emptyDetail").textContent = "重新测量：点“新建测量”填写名称并选择单次或连续采集。新测量开始后自动换图，旧实验 CSV 保留；无需先清空。";
+    el("emptyNewMeasurement").classList.remove("hidden");
+    el("emptyOpenSettings").classList.add("hidden");
+    el("emptyConnectMock").classList.add("hidden");
+    el("emptyStart").classList.add("hidden");
+    return;
+  }
+  el("emptyNewMeasurement").classList.add("hidden");
+  el("emptyOpenSettings").classList.remove("hidden");
   if (!connected) {
     el("emptyTitle").textContent = "图表还没有数据";
     el("emptyDetail").textContent = "连接 8845A，或先连接模拟器查看采集流程。";
@@ -2275,7 +2502,7 @@ function drawChart() {
   ctx.save();
   ctx.translate(14, top + plotHeight / 2);
   ctx.rotate(-Math.PI / 2);
-  ctx.fillStyle = "#697a80";
+  ctx.fillStyle = COLORS.ink;
   ctx.textAlign = "center";
   const plottedMode = app.modes.get(rows[0]?.mode || app.selectedMode);
   const quantityLabel = plottedMode?.quantity === "voltage" ? "电压" : plottedMode?.quantity === "current" ? "电流" : plottedMode?.quantity === "resistance" ? "电阻" : "读数";
@@ -2284,12 +2511,12 @@ function drawChart() {
   if (relativeYTickLabels) {
     const absoluteOrigin = scaledValue(yOrigin, unit);
     const originLabel = `${absoluteOrigin.value} ${absoluteOrigin.unit}`.trim();
-    ctx.fillStyle = "#697a80";
+    ctx.fillStyle = COLORS.ink;
     ctx.font = "12px Segoe UI, Microsoft YaHei UI, sans-serif";
     ctx.textAlign = "right";
     ctx.fillText(`刻度相对 ${originLabel}`, right - 5, top + 11);
   }
-  ctx.fillStyle = "#697a80";
+  ctx.fillStyle = COLORS.ink;
   ctx.textAlign = "center";
   ctx.fillText("实验经过时间", left + plotWidth / 2, height - 7);
 
@@ -2313,13 +2540,13 @@ function drawChart() {
   const baselineOffset = baseline - yOrigin;
   if (Number.isFinite(baseline) && baselineOffset >= yMin && baselineOffset <= yMax) {
     const y = yOffsetToPixel(baselineOffset);
-    ctx.strokeStyle = "#c7842f";
+    ctx.strokeStyle = "#8a5d13";
     ctx.lineWidth = 1.4;
     ctx.setLineDash([6, 4]);
     ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
     ctx.setLineDash([]);
     const baselineLabel = scaledValue(baseline, unit);
-    ctx.fillStyle = "#a4651d";
+    ctx.fillStyle = "#8a5d13";
     ctx.textAlign = "right";
     ctx.fillText(`基准 ${baselineLabel.value} ${baselineLabel.unit}`.trim(), right - 5, y - 8);
   }
@@ -2907,6 +3134,7 @@ async function loadHistory(file) {
     });
     const { rows, modeValue, unit, experimentId, stats } = result;
     const mode = app.modes.get(modeValue);
+    app.chartCleared = false;
     app.imported = rows;
     app.importedStats = stats || null;
     app.importedExperimentId = experimentId || null;
@@ -3104,8 +3332,10 @@ async function savePlot() {
     if (!blob) throw new Error("浏览器未能生成 PNG");
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = url; link.download = `8845A_plot_${localExperimentName().replace(/^实验_/, "")}.png`;
+    const filename = `8845A_plot_${localExperimentName().replace(/^实验_/, "")}.png`;
+    link.href = url; link.download = filename;
     link.click(); URL.revokeObjectURL(url);
+    recordFileExportResult("曲线截图", filename);
   } catch (error) { toast(`截图失败：${error.message}`, true); }
 }
 
@@ -3180,6 +3410,10 @@ async function downloadLatestCsv() {
     link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
+    recordFileExportResult(
+      exportState === "in-progress-snapshot" ? "进行中 CSV 快照" : "原始测量 CSV",
+      filename,
+    );
     toast(exportState === "in-progress-snapshot"
       ? `已下载进行中快照；快照时间 ${snapshotTime}`
       : `已下载已保存 CSV；服务器时间 ${snapshotTime}`);
@@ -3203,6 +3437,7 @@ async function downloadLatestEventsSafeCsv() {
     link.download = encodedName ? decodeURIComponent(encodedName) : "events_excel_safe.csv";
     link.click();
     URL.revokeObjectURL(url);
+    recordFileExportResult("事件安全副本", link.download);
     toast("已导出事件安全副本；原始 events.csv 未修改");
   } catch (error) {
     toast(`事件 CSV 导出失败：${error.message}`, true);
@@ -3224,6 +3459,7 @@ async function downloadLatestMeasurementsSafeCsv() {
     link.download = encodedName ? decodeURIComponent(encodedName) : "measurements_excel_safe.csv";
     link.click();
     URL.revokeObjectURL(url);
+    recordFileExportResult("测量安全副本", link.download);
     toast("已导出测量安全副本；原始 measurements.csv 未修改");
   } catch (error) {
     toast(`测量 CSV 导出失败：${error.message}`, true);
@@ -3248,6 +3484,7 @@ function downloadLatestSharePackage() {
   link.target = "_blank";
   link.rel = "noopener";
   link.click();
+  recordFileExportResult("脱敏分享包", "Fluke8845A_脱敏分享包.zip", "已发起浏览器下载");
   toast("正在生成脱敏分享包；实验原始文件保持不变。失败原因会在新标签页显示。");
 }
 
@@ -3259,6 +3496,20 @@ async function copyExperimentPath() {
     await navigator.clipboard.writeText(directory);
     toast("实验目录路径已复制");
   } catch (error) { toast(`复制路径失败：${error.message}`, true); }
+}
+
+function recordFileExportResult(label, filename, status = "已交给浏览器下载") {
+  app.fileExportResults.unshift({ label: String(label), filename: String(filename), status: String(status) });
+  app.fileExportResults.length = Math.min(app.fileExportResults.length, 10);
+  const list = el("filesExportResults");
+  if (!list) return;
+  list.replaceChildren();
+  for (const result of app.fileExportResults) {
+    const row = document.createElement("li");
+    row.textContent = `${result.label} · ${result.filename} · ${result.status}`;
+    row.title = "浏览器下载位置由浏览器设置决定；此记录不代表文件写入实验目录。";
+    list.append(row);
+  }
 }
 
 async function refreshExperimentFiles() {
@@ -3295,7 +3546,8 @@ function handleApplicationShortcut(event) {
 
   const key = String(event.key || "").toLowerCase();
   let actionId = null;
-  if (key === "r") actionId = "start";
+  if (key === "n") actionId = "newMeasurement";
+  else if (key === "r") actionId = "start";
   else if (key === "p") actionId = el("resume").classList.contains("hidden") ? "pause" : "resume";
   else if (key === "s") actionId = "stop";
   else if (key === "," || key === "comma") actionId = "openSettings";
@@ -3305,6 +3557,19 @@ function handleApplicationShortcut(event) {
   if (!button || button.disabled || typeof button.click !== "function") return;
   event.preventDefault?.();
   button.click();
+}
+
+function openNewMeasurementSettings() {
+  const status = String(app.state?.status || "");
+  if (app.startPending || /(采集中|测量中|暂停)/.test(status)) {
+    toast("请先停止并保存当前实验，再新建测量。", true);
+    return;
+  }
+  const dialog = el("settingsDialog");
+  if (!dialog.open) dialog.showModal();
+  el("sectionExperiment").scrollIntoView?.({ behavior: "smooth", block: "start" });
+  el("experimentName").focus();
+  el("experimentName").select();
 }
 
 function bindControls() {
@@ -3319,6 +3584,11 @@ function bindControls() {
     finishDuplicateNameAction("cancel");
   });
   el("openSettings").addEventListener("click", () => el("settingsDialog").showModal());
+  el("newMeasurement").addEventListener("click", openNewMeasurementSettings);
+  el("emptyNewMeasurement").addEventListener("click", openNewMeasurementSettings);
+  el("clearPlot").addEventListener("click", clearDisplayedPlot);
+  el("singleFromSettings").addEventListener("click", () => startFromSettings("single"));
+  el("startFromSettings").addEventListener("click", () => startFromSettings("start"));
   el("openFiles").addEventListener("click", () => { el("filesDialog").showModal(); refreshExperimentFiles(); });
   el("refreshFiles").addEventListener("click", refreshExperimentFiles);
   el("closeFiles").addEventListener("click", () => el("filesDialog").close());
@@ -3463,6 +3733,7 @@ function bindControls() {
   el("openExperimentDir").addEventListener("click", () => command("open_experiment_directory"));
   el("copyExperimentPath").addEventListener("click", copyExperimentPath);
   el("restoreLive").addEventListener("click", () => {
+    app.chartCleared = false;
     app.imported = null; app.importedStats = null; app.xView = null; app.yView = null; app.yOrigin = null;
     app.importedEvents = null; app.importedExperimentId = null; app.importedFileName = ""; app.selectedEventIndex = null;
     el("autoFollow").checked = true;

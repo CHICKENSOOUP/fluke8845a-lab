@@ -9,6 +9,8 @@
 3. 在“仪器”设置中选择 COM 端口并连接。连接真实仪器前，请先核对仪器处于 RS-232 / COMPUTER 模式，并确认串口参数和接线。
 4. 没有连接仪器时，可勾选“使用明确标记的 MOCK 模拟仪器”体验界面。Mock 读数是模拟数据，不是仪器测量结果。
 
+ZIP 中的 `examples/mock_experiments/` 包含 DCV、ACV、DCI、ACI、两线电阻和四线电阻六种模式的示例实验目录。目录中的测量值均为 Mock 模拟数据，不是真实 8845A 读数；每个目录包含原始测量 CSV、配置、事件和运行日志。
+
 请勿只复制或移动 `Fluke8845A.exe`；它需要与 ZIP 中的运行库文件放在一起运行。实验数据会写入界面所选的保存目录。
 
 ## 启动 localhost 网页界面
@@ -23,6 +25,8 @@ This ZIP contains the packaged Windows x64 application, not the source project. 
 2. Double-click `Fluke8845A.exe` in the extracted folder.
 3. Select the COM port in the instrument settings. Before connecting real hardware, verify RS-232 / COMPUTER mode, serial settings, and wiring on the instrument.
 4. Without an instrument, select the explicitly labelled Mock instrument to explore the interface. Mock readings are simulated and are not measurements from a Fluke meter.
+
+The ZIP includes `examples/mock_experiments/` with sample runs for DCV, ACV, DCI, ACI, 2-wire resistance, and 4-wire resistance. Those readings are simulated Mock data, not measurements from a real 8845A. Each run includes the raw measurement CSV, configuration, events, and run log.
 
 Do not move or copy only the desktop EXE; it relies on the bundled runtime files. Experiment data is written to the directory selected in the app.
 
