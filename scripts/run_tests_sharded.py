@@ -48,6 +48,7 @@ SHARDS = {
         "tests/test_path_security.py",
         "tests/test_plot_history.py",
         "tests/test_state.py",
+        "tests/test_iv_backend.py",
         "tests/test_storage.py",
         "tests/test_test_shards.py",
     ),

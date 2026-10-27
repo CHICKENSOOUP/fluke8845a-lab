@@ -120,6 +120,7 @@ class MeasurementWorker(QObject):
         self._valid_response_ends_ns: deque[int] = deque(maxlen=ACTUAL_RATE_WINDOW_POINTS)
         self._consecutive_timeouts = 0
         self._one_shot = False
+        self._iv_mode = False
         self._pending_rows: list[dict] = []
         self._last_gui_emit_ns = 0
         self._running_stats = RunningStats()
@@ -1202,6 +1203,10 @@ class MeasurementWorker(QObject):
                 return
             if code == "communication_error" and isinstance(exc, InstrumentError):
                 self._finish_experiment("instrument_error")
+                return
+            if self._iv_mode:
+                self._finish_experiment("instrument_error")
+                self.status_changed.emit("电流读取失败，IV 采集已停止；请检查连接后手动重新开始")
                 return
             if self._one_shot:
                 self.stop()
