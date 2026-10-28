@@ -2,6 +2,11 @@ name: Publish source packages
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing version tag to publish"
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -19,6 +24,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -34,11 +41,22 @@ jobs:
         shell: pwsh
 
       - name: Run Python 3.11 tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py311"
+          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py311" --timeout-seconds 480
           if ($LASTEXITCODE -ne 0) { throw "Python 3.11 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
+
+      - name: Upload Python 3.11 test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-shards-py311
+          path: build/pytest-shards-py311/**/stdout.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   publish:
     needs: test-python311
@@ -47,6 +65,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Node.js for Web frontend tests
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -61,7 +81,20 @@ jobs:
           cache-dependency-path: requirements-lock.txt
 
       - name: Validate versioned release identity
-        run: python scripts/release_metadata.py --ref-type $env:GITHUB_REF_TYPE --ref-name $env:GITHUB_REF_NAME --sha $env:GITHUB_SHA
+        env:
+          RECOVERY_TAG: ${{ inputs.release_tag }}
+        run: |
+          $refType = $env:GITHUB_REF_TYPE
+          $refName = $env:GITHUB_REF_NAME
+          $sha = (git rev-parse HEAD).Trim()
+          if ($env:RECOVERY_TAG) {
+            $refType = "tag"
+            $refName = $env:RECOVERY_TAG
+            $tagSha = (git rev-parse "refs/tags/$refName^{commit}").Trim()
+            if ($LASTEXITCODE -ne 0 -or $tagSha -ne $sha) { throw "Checked out commit does not match the requested tag." }
+          }
+          python scripts/release_metadata.py --ref-type $refType --ref-name $refName --sha $sha
+          if ($LASTEXITCODE -ne 0) { throw "Invalid release identity." }
         shell: pwsh
 
       - name: Install locked test environment
@@ -77,11 +110,22 @@ jobs:
         shell: pwsh
 
       - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py312"
+          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py312" --timeout-seconds 480
           if ($LASTEXITCODE -ne 0) { throw "Python 3.12 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
+
+      - name: Upload Python 3.12 test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-shards-py312
+          path: build/pytest-shards-py312/**/stdout.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build and verify source package
         run: |
@@ -122,14 +166,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RECOVERY_TAG: ${{ inputs.release_tag }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
           $archive = Join-Path $env:GITHUB_WORKSPACE "dist\Fluke8845A_Source_Project.zip"
           $checksums = Join-Path $env:GITHUB_WORKSPACE "dist\SHA256SUMS.txt"
           $manifestPath = Join-Path $env:RUNNER_TEMP ("ghcr-manifest-" + [guid]::NewGuid().ToString("N") + ".json")
           $releasePath = Join-Path $env:RUNNER_TEMP ("github-release-" + [guid]::NewGuid().ToString("N") + ".json")
-          $sha = $env:GITHUB_SHA
-          $metadata = (python scripts/release_metadata.py --ref-type $env:GITHUB_REF_TYPE --ref-name $env:GITHUB_REF_NAME --sha $sha | ConvertFrom-Json)
+          $sha = (git rev-parse HEAD).Trim()
+          $refType = $env:GITHUB_REF_TYPE
+          $refName = $env:GITHUB_REF_NAME
+          if ($env:RECOVERY_TAG) {
+            $refType = "tag"
+            $refName = $env:RECOVERY_TAG
+            $tagSha = (git rev-parse "refs/tags/$refName^{commit}").Trim()
+            if ($LASTEXITCODE -ne 0 -or $tagSha -ne $sha) { throw "Checked out commit does not match the requested tag." }
+          }
+          $metadata = (python scripts/release_metadata.py --ref-type $refType --ref-name $refName --sha $sha | ConvertFrom-Json)
           $tag = $metadata.tag
           $title = $metadata.title
           $prerelease = [bool]$metadata.prerelease

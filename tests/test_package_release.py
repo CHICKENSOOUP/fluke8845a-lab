@@ -1744,7 +1744,8 @@ def test_release_workflow_allows_software_tests_to_run_under_job_timeout():
     for marker in ("- name: Run Python 3.11 tests\n", "- name: Run tests\n"):
         step = workflow.split(marker, 1)[1].split("      - name:", 1)[0]
         assert "run_tests_sharded.py" in step
-        assert "--timeout-seconds" not in step
+        assert "--timeout-seconds 480" in step
+        assert "QT_QPA_PLATFORM: offscreen" in step
         assert "\n        timeout-minutes:" not in step
 
     assert "timeout-minutes: 10" in workflow
