@@ -354,6 +354,11 @@ def test_mode_button_waits_for_configuration_readback(qt_app, monkeypatch, tmp_p
 
 def test_simple_workspace_mock_connect_start_stop_saves_csv(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "simple-e2e-config"))
+    warnings = []
+    def capture_warning(_parent, title, message, *_args, **_kwargs):
+        warnings.append(f"{title}: {message}")
+        return QMessageBox.StandardButton.Ok
+    monkeypatch.setattr(QMessageBox, "warning", capture_warning)
     window = MainWindow()
     try:
         window.output_root.setText(str(tmp_path / "runs"))
@@ -366,7 +371,7 @@ def test_simple_workspace_mock_connect_start_stop_saves_csv(qt_app, monkeypatch,
         deadline = time.monotonic() + 5
         while (not window._connected or not window._active_settings_by_mode) and time.monotonic() < deadline:
             QTest.qWait(10)
-        assert window._connected and window._simulation
+        assert window._connected and window._simulation, f"Mock 连接失败：{warnings}"
         assert not window.configuration_dialog.isVisible()
         assert not window.output_root.isVisible()
         window.interval_spin.setValue(0.02)
@@ -375,18 +380,18 @@ def test_simple_workspace_mock_connect_start_stop_saves_csv(qt_app, monkeypatch,
         deadline = time.monotonic() + 5
         while window._experiment_csv_path is None and time.monotonic() < deadline:
             QTest.qWait(10)
-        assert window._experiment_csv_path is not None, "模拟实验启动未完成"
+        assert window._experiment_csv_path is not None, f"模拟实验启动未完成：{warnings}"
         deadline = time.monotonic() + 5
         while window._global_stats.get("count", 0) < 3 and time.monotonic() < deadline:
             QTest.qWait(10)
-        assert window._global_stats.get("count", 0) >= 3
+        assert window._global_stats.get("count", 0) >= 3, f"Mock 连续采集未收到足够读数：{warnings}"
         assert not window.interval_spin.isEnabled()
         assert all(not button.isEnabled() for button in window.mode_buttons.values())
         window.stop_button.click()
         deadline = time.monotonic() + 5
         while (window._acquiring or window._experiment_active or window._finalization_pending) and time.monotonic() < deadline:
             QTest.qWait(10)
-        assert not window._acquiring and not window._experiment_active and not window._finalization_pending
+        assert not window._acquiring and not window._experiment_active and not window._finalization_pending, f"Mock 停止未完成：{warnings}"
         assert window.interval_spin.isEnabled()
         assert window._experiment_csv_path is not None
         with window._experiment_csv_path.open(newline="", encoding="utf-8-sig") as stream:
@@ -398,6 +403,7 @@ def test_simple_workspace_mock_connect_start_stop_saves_csv(qt_app, monkeypatch,
         assert config["target_interval_s"] == pytest.approx(0.02)
         assert config["initial_target_interval_s"] == pytest.approx(0.02)
         assert config["target_interval_changes"] == []
+        assert not warnings, f"Mock 采集产生警告：{warnings}"
     finally:
         if window._acquiring:
             window._stop()

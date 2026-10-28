@@ -1707,15 +1707,25 @@ class ExperimentRecorder:
                 stream.flush()
                 os.fsync(stream.fileno())
 
-            self._assert_output_path(
-                temp, must_not_exist=False, expected_identity=created_identity
-            )
-            self._assert_output_path(
-                target,
-                must_not_exist=expected_identity is None,
-                expected_identity=expected_identity,
-            )
-            os.replace(temp, target)
+            # Windows can briefly deny a rename while another process holds a
+            # handle without delete sharing. Recheck both identities on every
+            # attempt and preserve the atomic replace and eventual error.
+            for attempt in range(4):
+                self._assert_output_path(
+                    temp, must_not_exist=False, expected_identity=created_identity
+                )
+                self._assert_output_path(
+                    target,
+                    must_not_exist=expected_identity is None,
+                    expected_identity=expected_identity,
+                )
+                try:
+                    os.replace(temp, target)
+                    break
+                except PermissionError as exc:
+                    if getattr(exc, "winerror", None) != 32 or attempt == 3:
+                        raise
+                    Event().wait(0.05 * (2 ** attempt))
             self._assert_output_path(
                 target, must_not_exist=False, expected_identity=created_identity
             )

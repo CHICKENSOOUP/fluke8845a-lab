@@ -2196,3 +2196,61 @@ def test_recorder_metadata_refuses_reparse_config_target(tmp_path, monkeypatch):
     monkeypatch.setattr(storage_module, "_is_symlink_or_junction", real_check)
     recorder.finish("test")
 
+
+@pytest.mark.parametrize("failures, should_succeed", [(2, True), (10, False)])
+def test_metadata_replace_retries_only_transient_windows_sharing_conflicts(tmp_path, monkeypatch, failures, should_succeed):
+    recorder = ExperimentRecorder.create(tmp_path, "sharing", {"simulation": True}, ModeSettings(Mode.DCV))
+    original_replace = storage_module.os.replace
+    original_assert = recorder._assert_output_path
+    calls = []
+    checks = []
+
+    def checked(path, **kwargs):
+        checks.append(path)
+        return original_assert(path, **kwargs)
+
+    def replace(source, target):
+        calls.append((source, target))
+        if len(calls) <= failures:
+            error = PermissionError("sharing violation")
+            error.winerror = 32
+            raise error
+        return original_replace(source, target)
+
+    try:
+        monkeypatch.setattr(recorder, "_assert_output_path", checked)
+        monkeypatch.setattr(storage_module.os, "replace", replace)
+        if should_succeed:
+            recorder._write_metadata()
+            assert len(calls) == 3
+            assert sum(path == recorder.directory / "config.json" for path in checks) >= 4
+        else:
+            with pytest.raises(PermissionError) as failure:
+                recorder._write_metadata()
+            assert failure.value.winerror == 32
+            assert 1 < len(calls) < failures
+    finally:
+        monkeypatch.setattr(storage_module.os, "replace", original_replace)
+        recorder.finish("test")
+
+
+def test_metadata_replace_does_not_retry_nonsharing_permission_error(tmp_path, monkeypatch):
+    recorder = ExperimentRecorder.create(tmp_path, "access", {"simulation": True}, ModeSettings(Mode.DCV))
+    original_replace = storage_module.os.replace
+    calls = []
+
+    def denied(source, target):
+        calls.append((source, target))
+        error = PermissionError("access denied")
+        error.winerror = 5
+        raise error
+
+    try:
+        monkeypatch.setattr(storage_module.os, "replace", denied)
+        with pytest.raises(PermissionError) as failure:
+            recorder._write_metadata()
+        assert failure.value.winerror == 5
+        assert len(calls) == 1
+    finally:
+        monkeypatch.setattr(storage_module.os, "replace", original_replace)
+        recorder.finish("test")
