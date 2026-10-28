@@ -1425,8 +1425,9 @@ class WebCommandRouter(QObject):
             QThread.currentThread().quit()
             return {"success": True, "message": "测量服务已安全退出"}
 
-        if action == "configure":
-            self._require_safety_confirmation(payload, worker)
+        if action in ("configure", "switch_mode"):
+            if action == "configure":
+                self._require_safety_confirmation(payload, worker)
             if worker.state != AcquisitionState.STOPPED:
                 raise ValueError("请停止采集后再应用仪器参数")
             try:
@@ -1438,7 +1439,10 @@ class WebCommandRouter(QObject):
             conflicts, readback_basis = self._known_configuration_conflicts(settings, worker)
             if conflicts:
                 return self._configuration_conflict_response(conflicts, readback_basis)
-            worker.configure_mode(settings, settings)
+            if action == "switch_mode":
+                worker.configure_mode_without_wiring_confirmation(settings)
+            else:
+                worker.configure_mode(settings, settings)
             error = check_worker_error("配置仪器参数失败")
             return error or {"success": True, "message": f"已应用并核对 {descriptor(settings.mode).label} 参数"}
 

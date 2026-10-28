@@ -96,9 +96,9 @@ def test_launcher_selects_desktop_or_web_and_forwards_arguments(monkeypatch, tmp
 
     monkeypatch.setattr(launch_windows.subprocess, "run", fake_run)
 
-    assert launch_windows.main(["desktop", "--mock", "--smoke"]) == 7
+    assert launch_windows.main(["desktop", "--smoke"]) == 7
     assert launch_windows.main(["web", "--port", "0", "--no-browser"]) == 7
-    assert calls[0][0] == [str(python), "-m", "fluke8845a", "--mock", "--smoke"]
+    assert calls[0][0] == [str(python), "-m", "fluke8845a", "--smoke"]
     assert calls[1][0] == [
         str(python), "-m", "fluke8845a.webapp", "--port", "0", "--no-browser"
     ]

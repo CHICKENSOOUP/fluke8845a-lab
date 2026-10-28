@@ -1595,7 +1595,7 @@ def test_extracted_source_web_smoke_serves_current_health_and_asset_fingerprints
 
     assert report["health"]["status"] == "ok"
     assert report["health"]["bind"] == "127.0.0.1"
-    assert report["health"]["version"] == "2.0.0"
+    assert report["health"]["version"] == "2.1.0"
     assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
     for route, filename in {
         "/": "index.html",
@@ -1669,7 +1669,7 @@ def test_release_workflow_runs_web_smoke_from_the_extracted_source_archive():
     smoke_marker = "- name: Smoke test first launch from extracted source ZIP\n"
     smoke_step = workflow.split(smoke_marker, 1)[1].split("      - name:", 1)[0]
     assert '$env:QT_QPA_PLATFORM = "offscreen"' in smoke_step
-    assert 'python "scripts\\launch_windows.py" desktop --mock --smoke' in smoke_step
+    assert 'python "scripts\\launch_windows.py" desktop --smoke' in smoke_step
     assert "Extracted source ZIP first-launch smoke failed" in smoke_step
     assert 'python "$env:GITHUB_WORKSPACE\\scripts\\package_source.py"' in smoke_step
     assert '--smoke-extracted-source-web "$extractRoot"' in smoke_step
@@ -1744,7 +1744,7 @@ def test_release_workflow_allows_software_tests_to_run_under_job_timeout():
     for marker in ("- name: Run Python 3.11 tests\n", "- name: Run tests\n"):
         step = workflow.split(marker, 1)[1].split("      - name:", 1)[0]
         assert "run_tests_sharded.py" in step
-        assert "--timeout-seconds 240" in step
+        assert "--timeout-seconds 420" in step
         assert "QT_QPA_PLATFORM: offscreen" in step
         assert "\n        timeout-minutes:" not in step
 

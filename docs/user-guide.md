@@ -4,16 +4,15 @@
 
 ## 简体中文
 
-版本 2.0.0 · 中文 Windows 桌面应用
+版本 2.1.0 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v2.0.0 更新桌面测量工作区、曲线显示和 CSV 导出。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
+v2.1.0 统一桌面与网页测量界面。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时先发送 `SYST:REM`，再查询 `*IDN?`；只接受设备型号字段为 `8845A` 的 Fluke 仪器，不会重置仪器。若身份识别失败，程序会尽力发送 `SYST:LOC` 后关闭串口。先 REMOTE 再进行 RS-232 收发遵循编程手册 PDF 第76页（印刷第66页）的说明。
-- **MOCK**：在连接窗口勾选模拟模式，选择场景后连接。状态和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
 
-程序启动时扫描串口，也可在端口框直接输入 COM 号。默认值为 9600 baud、8 data bits、无校验、1 stop bit、无流控、CRLF 结束符、2秒普通命令响应超时。`READ?`会根据当前积分时间或交流滤波设置自动使用更长的主机等待上限；这只是避免过早超时的通信保护，不代表仪器的采样时间保证。手册中 RS-232 出厂参数包含 9600、8位、无校验、1停止位和无流控；EOL需按仪器面板设置。可配置选项包括手册列出的全部波特率、7/8数据位、无/奇/偶校验、1/2停止位、无/XON-XOFF/RTS-CTS流控以及CR/LF/CRLF结束符。真实仪器的读取超时（包括普通串口 `TimeoutError`）或读取过程中的通信异常会立即停止本次实验、保存当前空值失败行并关闭串口；软件不自动重试或续接旧实验。操作者需检查仪器/线缆，手动重新连接，并以新实验目录开始下一段采集，避免迟到响应被误当作后续样本。真实仪器连接在 COMPUTER 模式且停止或暂停采集时，软件每 10 秒查询一次 `*IDN?` 确认连接；连续采集期间不会插入探测查询，LOCAL 和 MOCK 模式也不会探测。探测发现断线、响应超时或仪器身份变化时会关闭连接并更新状态；若实验处于暂停状态，软件会结束并保存为通信异常。
+程序启动时扫描串口，也可在端口框直接输入 COM 号。默认值为 9600 baud、8 data bits、无校验、1 stop bit、无流控、CRLF 结束符、2秒普通命令响应超时。`READ?`会根据当前积分时间或交流滤波设置自动使用更长的主机等待上限；这只是避免过早超时的通信保护，不代表仪器的采样时间保证。手册中 RS-232 出厂参数包含 9600、8位、无校验、1停止位和无流控；EOL需按仪器面板设置。可配置选项包括手册列出的全部波特率、7/8数据位、无/奇/偶校验、1/2停止位、无/XON-XOFF/RTS-CTS流控以及CR/LF/CRLF结束符。真实仪器的读取超时（包括普通串口 `TimeoutError`）或读取过程中的通信异常会立即停止本次实验、保存当前空值失败行并关闭串口；软件不自动重试或续接旧实验。操作者需检查仪器/线缆，手动重新连接，并以新实验目录开始下一段采集，避免迟到响应被误当作后续样本。真实仪器连接在 COMPUTER 模式且停止或暂停采集时，软件每 10 秒查询一次 `*IDN?` 确认连接；连续采集期间不会插入探测查询，LOCAL 模式也不会探测。探测发现断线、响应超时或仪器身份变化时会关闭连接并更新状态；若实验处于暂停状态，软件会结束并保存为通信异常。
 
 首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。仪表菜单中的 RS-232 `COMPUTER` 协议模式与软件里的 `COMPUTER/LOCAL` 控制权是两项设置：协议模式须在仪表菜单选择；控制权可在连接窗口切换。`COMPUTER` 使用 `SYST:REM`，除仪表的 `LOCAL` 键外，其他面板按键会被禁用。选择 `LOCAL` 会发送 `SYST:LOC`，将控制权交给面板；软件停用测量、设置、诊断和ZERO，串口保持连接。面板操作完成后，在软件选择 `COMPUTER` 即可切回远程控制；软件会重新读取当前测量模式和参数。采集中不能切换控制权。若直接按仪表 `LOCAL` 导致 `+550,"Command not allowed in local"`，软件会保存异常行且不伪造读数，停止采集并关闭串口；重新连接可恢复远程控制。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
 
@@ -51,7 +50,7 @@ DCV 的自动输入阻抗默认关闭，表示 10 MΩ。启用后，8845A 只在
 
 可打开自动量程，或取消勾选后选择固定量程。后端子下1 A、3 A和10 A固定量程仍不可用，可能进入这些档位的电流自动量程也会被阻止。DCI 自动量程在已核实 OutG SW 明确低于2.0时会被拒绝。ACI 的软件版本要求字段无法从 OutG/InG 记录自动判定；使用 ACI 400 mA 固定档或自动量程前，请核对仪表面板版本。按“应用仪器参数”后，软件写入SCPI命令并读取量程、功能、带宽、端子等可用状态；仪器错误队列非零或功能回读不匹配时不会启动实验。模拟滤波器只出现在DCV/DCI/电阻模式；NPLC只出现在这些直流积分模式。AC滤波档的3/20/200 Hz分别是慢/中/快三档截止频率选择，不是采样频率。
 
-自动量程仍保持“自动量程”设置；界面另外显示最近一次仪器 `RANG?` 回读的档位快照，并提示它可能随输入改变。这个快照不是锁定的固定量程。Mock只显示带“模拟”字样的合成档位，不代表真实仪表读数。
+自动量程仍保持“自动量程”设置；界面另外显示最近一次仪器 `RANG?` 回读的档位快照，并提示它可能随输入改变。这个快照不是锁定的固定量程。
 
 8845A 数字滤波仅适用于 DCV、DCI、两线电阻和四线电阻；软件只允许在 NPLC 10 或 100 启用（慢于 1 PLC）。`CONF` 会将数字滤波预设为 ON，因此配置时软件在 `CONF` 后先发送 `SENS:<function>:FILT:DIG OFF`，检查错误队列并回读 `...:FILT:DIG?`；确认 OFF 后才写量程和 NPLC。请求开启时，写 NPLC 后再发送 `SENS:<function>:FILT:DIG ON`，并再次检查错误队列和回读确认。已核实 OutG SW <2.0 时拒绝开启；版本未知时尝试命令并以错误队列和回读确认，未确认则配置失败。已核实版本低于 2.0 且请求关闭时，跳过滤波命令并继续配置 NPLC。平均读数数量随 DC 功能和量程变化，手册未给最大 `READ?` 响应时间；软件只有有限的主机端超时保护，不保证仪器时限。超时会保存空值失败记录、停止采集并关闭串口，不伪造读数。依据《Programmers Manual Rev. 3》Table 13（PDF pp. 42–43 / printed pp. 32–33）、数字滤波命令（PDF pp. 58–60 / printed pp. 48–50）、CONF 预设 Table 18（PDF p. 51 / printed p. 41）、READ?（PDF p. 52 / printed p. 42）；《Users Manual Rev. 3》OutG SW <2.0 限制（PDF p. 47 / printed p. 3-3），滤波适用速率及平均数量（PDF p. 75 / printed p. 4-5）。
 
@@ -75,7 +74,7 @@ ZERO 完成后的桌面和 Web 状态显示命令反馈及配置回读；回读�
 
 ## 4. 单次测量与连续采集
 
-1. 启动软件，在连接窗口选择串口参数并连接仪器，或选择 MOCK 模拟模式并连接。
+1. 启动软件，在连接窗口选择串口参数并连接仪器。
 2. 在主界面选择直流电压、交流电压、直流电流、交流电流、两线电阻或四线电阻。切换模式前请自行检查接线；软件不会检测表笔和被测电路。
 3. 在主界面选择量程。需要修改其他参数时，打开“测量参数”，应用参数并等待回读确认。实验自动保存在已有的保存目录；未设置过时默认为 Windows 文档目录下的 Fluke8845A_Experiments。
 4. 点击“单次测量”或“开始连续采集”。连续采集可暂停、继续和停止；停止后等待保存结束，再调整参数或切换模式。
@@ -113,32 +112,32 @@ CSV保留原有`timestamp_local`、`timestamp_utc`和`elapsed_s`字段，它们�
 
 CSV以UTF-8 BOM编码，含样本序号、主机本地和UTC ISO时间、单调经过时间、读数通信耗时、实际间隔、模式、SI单位、原始响应、仪器量程、NPLC、交流带宽、滤波/零点状态和异常信息。Python `repr(float)`不做小数位截断；`raw_reading`保留SCPI返回的十进制文本。
 
-## 7. MOCK测试
+## 7. 自动化测试
 
-MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定样本断线场景；六种模式都有噪声和漂移读数。超时/断线测试均为模拟故障。看右上角MOCK标识及配置文件`simulation: true`识别模拟数据。
+自动化测试使用内部模拟仪器，不在软件界面提供模拟连接。
 
 ## 8. 依据、限制和状态
 
 此前记录的冻结程序构建流程曾逐模式执行六种测量的 Mock GUI 采集和文件保存检查；这些记录不是当前源码快照的硬件验收结果。
 
-可追溯 SCPI 与规格请看 [SCPI 参考](scpi-reference.md)。硬件检查范围与当前版本的验证限制见[硬件验证说明](hardware-validation.md)。当前源码包含 Mock 工作流；模拟结果不是真机验证。
+可追溯 SCPI 与规格请看 [SCPI 参考](scpi-reference.md)。硬件检查范围与当前版本的验证限制见[硬件验证说明](hardware-validation.md)。
 
 
 本源码发布未附带预编译 Windows 二进制。测试与硬件验证的当前范围见[硬件验证说明](hardware-validation.md)。
 
 ## 9. localhost 浏览器界面
 
-运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat` 可启动本机网页界面。服务只监听 `127.0.0.1:8765`，不加载远程页面或 CDN；网页与桌面版共用仪器驱动、采集线程和逐点写盘器。主页面只显示当前读数、采集状态、控制按钮和一张大曲线；顶部“实验文件”打开独立文件窗口，列出当前或最近实验的测量 CSV、事件 CSV、配置、日志和导出结果；“设置与分析”打开单独的设置对话框。网页版普通滚轮缩放读数轴，Shift+滚轮缩放时间轴，Ctrl+滚轮同时缩放两轴，Alt+滚轮以零点为锚缩放读数轴；另提供自动缩放、自动跟随、历史 CSV 和 PNG 导出。
+运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`，打开本机网页界面。主界面提供六种测量模式、仪器连接、测量参数、量程、采集控制和曲线。普通滚轮缩放两轴，Shift + 滚轮缩放时间轴，Ctrl + 滚轮缩放纵轴。可选完整显示、滚动显示和纵轴自动；滑动平均点数可在采集中修改。点击“保存曲线”下载 ZIP，内含简洁 CSV 和详细 CSV。
 
-启动服务不会自动打开串口。连接前先断开桌面版占用的 COM 端口，因为同一端口不能同时由两个程序打开。电流和电阻测量仍须由操作者确认接线、输入端子、保险丝和被测电路状态。页面的“退出服务”会停止采集、完成待写数据并安全关闭串口。Mock 读数始终是模拟数据。
+启动服务不会自动打开串口。连接前先断开桌面版占用的 COM 端口，因为同一端口不能同时由两个程序打开。电流和电阻测量仍须由操作者确认接线、输入端子、保险丝和被测电路状态。页面的“退出服务”会停止采集、完成待写数据并安全关闭串口。
 
 ## English
 
-Version 2.0.0 updates the desktop measurement workspace, chart controls, and CSV export. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
+Version 2.1.0 brings the desktop and browser measurement interfaces together. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
 
 ### 1. Connection and modes
 
-For a real meter, set the rear interface to RS-232 and select the COMPUTER protocol with the 8845A/8846A command set. The application connects using COMPUTER/REMOTE control by default; its instrument settings panel can switch between this state and LOCAL front-panel control. On connection, it sends `SYST:REM` before querying `*IDN?`, accepts only a Fluke model identified as `8845A`, and does not reset the instrument. If identification fails, it makes a best-effort `SYST:LOC` before closing the serial port. Sending REMOTE before RS-232 traffic follows the *Programmers Manual*, PDF p. 76 (printed p. 66). Mock mode exercises simulated workflows; its readings are not instrument measurements and must not be used as calibration or experimental evidence.
+For a real meter, set the rear interface to RS-232 and select the COMPUTER protocol with the 8845A/8846A command set. The application connects using COMPUTER/REMOTE control by default; its instrument settings panel can switch between this state and LOCAL front-panel control. On connection, it sends `SYST:REM` before querying `*IDN?`, accepts only a Fluke model identified as `8845A`, and does not reset the instrument. If identification fails, it makes a best-effort `SYST:LOC` before closing the serial port. Sending REMOTE before RS-232 traffic follows the *Programmers Manual*, PDF p. 76 (printed p. 66).
 
 The application scans serial ports at startup and also accepts a manually entered COM port. Defaults are 9600 baud, 8 data bits, no parity, one stop bit, no flow control, CRLF termination, and a two-second response timeout. Confirm the instrument's settings. The instrument menu's RS-232 COMPUTER protocol and the application's COMPUTER/LOCAL control state are separate settings. COMPUTER control disables front-panel keys except LOCAL. The application can send `SYST:LOC` to hand control to the panel; measurement and settings commands are paused while LOCAL. Switching back to COMPUTER sends `SYST:REM` and refreshes the active function and settings. A normal disconnect attempts `SYST:LOC`.
 
@@ -162,7 +161,7 @@ Instrument conversion speed and the application's target interval are independen
 
 ### 4. Acquisition and data files
 
-Connect the instrument or Mock, select one of the six modes, then configure the instrument and target interval in the measurement settings dialog. Start a single reading or continuous acquisition; continuous acquisition can be paused, resumed, or stopped. Each run receives an automatic time-and-mode name and a separate timestamped directory. Wait for saving to finish before changing mode or settings.
+Connect the instrument, select one of the six modes, then configure the instrument and target interval in the measurement settings dialog. Start a single reading or continuous acquisition; continuous acquisition can be paused, resumed, or stopped. Each run receives an automatic time-and-mode name and a separate timestamped directory. Wait for saving to finish before changing mode or settings.
 
 The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Existing `timestamp_local`, `timestamp_utc`, and `elapsed_s` retain their host `READ?` request-start meaning. New `host_read_request_start_*` and `host_read_response_end_*` columns record the host wall-clock and monotonic request/response boundaries; they are not instrument sampling timestamps. `read_duration_s` covers only this `READ?` request/response window and excludes the later range query. `actual_interval_s`, desktop telemetry, and Web telemetry use the difference between consecutive valid response-end monotonic timestamps; failed attempts have no interval value. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
 
@@ -176,15 +175,10 @@ Historical CSV loading is read-only. Matching event markers are restored where a
 
 ### 6. Mock and verification limits
 
-Mock mode supports six-mode simulated readings, step response/recovery, long-term drift, selected timeouts, and simulated disconnects. Check the visible MOCK indicator and `simulation: true` in `config.json`. Mock workflows are not hardware tests. See the [SCPI reference](scpi-reference.md), [hardware verification notes](hardware-validation.md), and [known limitations](known-limitations.md).
+Automated tests use an internal simulator; the application interfaces connect to real instruments. See the [SCPI reference](scpi-reference.md), [hardware verification notes](hardware-validation.md), and [known limitations](known-limitations.md).
 
 ### 7. Local browser interface
 
-Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It listens only on `127.0.0.1:8765`, uses no remote pages or CDN, and shares the instrument driver, acquisition worker, and per-reading recorder with the desktop application. The main page keeps the reading, acquisition state, controls, and one large plot; **Settings & Analysis** opens a separate dialog. It supports all six modes, wheel/modifier zoom, auto scale, statistics, reference changes, event logging, CSV history, and PNG export.
+Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. The local interface provides six measurement modes, connection and measurement settings, range controls, acquisition, and a live chart. The wheel zooms both axes; Shift and Ctrl restrict zoom to the time or vertical axis. Curve export downloads a ZIP containing the simple and detailed CSV files.
 
-Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection. Mock readings remain simulated.
-### 事件导出
-
-可在 localhost 页面导出“脱敏分享包” ZIP。分享包只含 config.json、measurements.csv 和可选 events.csv；会隐藏已知设备序列号、COM 口和文本中的本机路径，不收录 run.log 或目录中的其他文件。有效数值保持原样，数值列中的非数值文本会替换为脱敏标记；分享副本会对公式样式的文本添加文本前缀，且不会修改原始实验文件。用表格软件查看分享包内 CSV 时可以使用该副本；若要打开原始 CSV，请单独导出事件/测量 Excel 安全副本。
-
-`measurements.csv` 与 `events.csv` 始终是原始记录，软件不会为表格软件打开而改写它们。事件文本以及测量 CSV 的 `raw_reading`、`error` 文本可能以 `=`, `+`, `-` 或 `@` 开头，被 Excel 等表格软件解释为公式。若需用表格软件查看数据，请在 localhost 图表工具栏分别导出 `*_measurements_excel_safe.csv` 和 `*_events_excel_safe.csv` 副本。安全副本会检查允许导出的各列，为公式样式文本添加文本前缀；数值字段中的普通带正负号数值保持不变。安全副本不会修改原始文件，仅支持停止采集后导出。科研分析请优先使用未修改的原始 CSV；用表格软件打开时请使用安全副本。
+Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection.

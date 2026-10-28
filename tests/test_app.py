@@ -1217,3 +1217,9 @@ def test_capture_runtime_source_identity_rejects_frozen_binary_mismatch(tmp_path
 
     with pytest.raises(ValueError, match="EXE与BUILD-PROVENANCE"):
         probe_provenance_module.capture_runtime_source_identity(executable_path=executable)
+
+
+def test_desktop_cli_rejects_removed_mock_mode():
+    with pytest.raises(SystemExit) as result:
+        app_module.main(["--mock"])
+    assert result.value.code == 2

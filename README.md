@@ -13,7 +13,6 @@
 - 直流电压、交流电压、直流电流、交流电流、二线电阻和四线电阻
 - 串口配置及项目自有驱动实现的 SCPI 通信
 - 连续 CSV 记录、时间戳、事件标记、统计和实时曲线
-- Mock 模式：无需连接仪器即可体验六种测量流程
 - 可选 localhost 浏览器界面，复用桌面版的仪器驱动和采集线程
 
 界面由 Qt/PySide6 提供；串口通信由 pyserial 和项目自有 SCPI 驱动负责。本项目不使用 Qt SerialPort。
@@ -57,7 +56,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 ### 仪器与验证状态
 
-连接前，请将仪器设为 RS-232 / COMPUTER 模式，并在仪器上核对串口参数。当前验证范围见[硬件验证说明](docs/hardware-validation.md)。Mock 数据为模拟数据，不是仪器测量结果。接线与操作要求见[使用指南](docs/user-guide.md)。
+连接前，请将仪器设为 RS-232 / COMPUTER 模式，并在仪器上核对串口参数。当前验证范围见[硬件验证说明](docs/hardware-validation.md)。接线与操作要求见[使用指南](docs/user-guide.md)。
 
 ### 许可证
 
@@ -69,6 +68,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 - [使用指南](docs/user-guide.md)
 - [短时真机 GUI 探测](docs/hardware-probes.md)
 - [已知限制](docs/known-limitations.md)
+- [v2.1.0 发布说明](docs/release-notes-v2.1.0.md)
 - [v2.0.0 发布说明](docs/release-notes-v2.0.0.md)
 - [v1.1.0 发布说明](docs/release-notes-v1.1.0.md)
 - [v1.0.7 发布说明](docs/release-notes-v1.0.7.md)
@@ -93,7 +93,6 @@ Windows desktop application for controlling a Fluke 8845A over RS-232, recording
 - DC voltage, AC voltage, DC current, AC current, 2-wire resistance, and 4-wire resistance
 - Serial-port configuration and SCPI communication through the project's own driver
 - Continuous CSV logging, timestamps, event markers, statistics, and live plots
-- Mock mode for exercising all six measurement workflows without connecting an instrument
 - Optional localhost browser interface sharing the desktop app's instrument driver and acquisition worker
 
 Qt/PySide6 supplies the graphical interface; pyserial and the project's SCPI driver handle serial communication. The application does not use Qt SerialPort.
@@ -147,7 +146,7 @@ Pushing a `v*` tag matching the project version runs the Windows Python and Web 
 
 ## Hardware and verification status
 
-Use the instrument's RS-232 / COMPUTER mode and verify the serial settings on the instrument before connecting. Current test and hardware verification limits are summarized in [docs/hardware-validation.md](docs/hardware-validation.md). Mock results are simulated and are not instrument measurements. Follow the safety and wiring instructions in [docs/user-guide.md](docs/user-guide.md).
+Use the instrument's RS-232 / COMPUTER mode and verify the serial settings on the instrument before connecting. Current test and hardware verification limits are summarized in [docs/hardware-validation.md](docs/hardware-validation.md). Follow the safety and wiring instructions in [docs/user-guide.md](docs/user-guide.md).
 
 ## Licensing
 
@@ -161,6 +160,7 @@ This source release does not bundle Qt libraries. Do not treat the project MIT l
 - [Usage guide](docs/user-guide.md)
 - [Short hardware GUI probes](docs/hardware-probes.md)
 - [Known limitations](docs/known-limitations.md)
+- [v2.1.0 release notes](docs/release-notes-v2.1.0.md)
 - [v2.0.0 release notes](docs/release-notes-v2.0.0.md)
 - [v1.1.0 release notes](docs/release-notes-v1.1.0.md)
 - [v1.0.7 release notes](docs/release-notes-v1.0.7.md)

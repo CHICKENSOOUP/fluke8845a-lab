@@ -30,7 +30,7 @@
       <span id="connectionBadge" class="connection-badge"><i></i><span>未连接</span></span>
       <span id="scenarioBadge" class="scenario-badge hidden" role="status" aria-live="polite"></span>
       <button id="reconnectReal" class="button button-header hidden" type="button">重新连接</button>
-      <button id="openFiles" class="button button-header" type="button" aria-label="实验文件">实验文件</button>
+      <button id="openConnection" class="button button-primary" type="button">连接仪器</button><button id="openParameters" class="button button-header" type="button">测量参数</button><button id="openFiles" class="button button-header" type="button" aria-label="实验文件">实验文件</button>
       <button id="openSettings" class="button button-header" type="button" aria-keyshortcuts="Control+Alt+Comma" title="打开设置与分析；快捷键 Ctrl+Alt+,">设置与分析</button>
       <button id="shutdownService" class="service-exit" type="button" title="关闭浏览器标签页只会关闭页面；localhost 服务和当前采集仍会继续。使用此按钮才会停止采集并退出服务。">退出服务</button>
     </div>
@@ -38,6 +38,7 @@
 
   <main class="workspace">
     <section id="measurementArea" class="measurement-area" aria-label="实时测量状态与波形图">
+      <nav id="modeButtons" class="mode-buttons" aria-label="测量模式"><button type="button" data-mode="DCV">直流电压</button><button type="button" data-mode="ACV">交流电压</button><button type="button" data-mode="DCI">直流电流</button><button type="button" data-mode="ACI">交流电流</button><button type="button" data-mode="RES2">两线电阻</button><button type="button" data-mode="RES4">四线电阻</button></nav>
       <section class="readout-panel">
         <div class="readout-state">
           <div id="connectionSummary" class="connection-summary">未连接</div>
@@ -60,12 +61,13 @@
       </section>
 
       <section class="action-bar" aria-label="采集控制">
-        <button id="newMeasurement" class="button button-primary" type="button" aria-keyshortcuts="Control+Alt+N" aria-describedby="newMeasurementHint" title="打开实验设置并填写名称，再选单次测量或连续采集。新测量开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键 Ctrl+Alt+N。">新建测量</button>
+        <button id="newMeasurement" class="button button-primary" type="button" aria-keyshortcuts="Control+Alt+N" aria-describedby="newMeasurementHint" title="打开实验设置并填写名称，再选单次测量或连续采集。新测量开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键 Ctrl+Alt+N。">重新测量</button>
         <button id="clearPlot" class="button button-outline" type="button" aria-describedby="newMeasurementHint" title="确认后清除当前图表、统计和事件显示；磁盘上的 CSV 不会删除。">清空图表</button>
         <button id="start" class="button button-primary" type="button" disabled aria-keyshortcuts="Control+Alt+R" title="开始采集；快捷键 Ctrl+Alt+R">开始采集</button>
         <button id="single" class="button button-outline" type="button" disabled>单次测量</button>
         <span class="pause-slot"><button id="pause" class="button button-quiet" type="button" disabled aria-keyshortcuts="Control+Alt+P" title="暂停采集；快捷键 Ctrl+Alt+P">暂停</button><button id="resume" class="button button-quiet hidden" type="button" aria-keyshortcuts="Control+Alt+P" title="继续采集；快捷键 Ctrl+Alt+P">继续</button></span>
         <button id="stop" class="button button-danger" type="button" disabled aria-keyshortcuts="Control+Alt+S" title="停止并保存；快捷键 Ctrl+Alt+S">停止并保存</button>
+                <span id="mainRange" class="main-range"></span><label class="average-control">平均点数 <input id="averageWindow" type="number" min="1" max="100000" value="20"></label><button id="saveCurveCsv" class="button button-primary" type="button">保存曲线</button>
         <span id="newMeasurementHint" class="new-measurement-hint">新建测量：点“新建测量”→ 填名称 → 点“单次测量”或“开始连续采集”。新测量开始后自动换图，旧 CSV 保留；“清空图表”只清除显示。</span>
         <span id="acquisitionFeedback" class="acquisition-feedback" role="status" aria-live="polite">尚未开始实验</span>
         <span id="commandStatus" class="command-status hidden" role="status" aria-live="polite"></span>
@@ -80,17 +82,17 @@
         <div class="chart-toolbar">
           <div class="chart-title"><span class="section-kicker">实时趋势</span><h1 id="chartTitle">测量曲线</h1><span id="dataSourceStatus" class="data-source-status" aria-live="polite">实时数据</span></div>
           <div class="chart-actions">
-            <label class="toggle-label"><input id="autoFollow" type="checkbox" checked><span>自动跟随</span></label><span id="viewModeStatus" class="view-mode-status">自动跟随最新数据</span>
+            <label class="toggle-label"><input id="autoY" type="checkbox" checked><span>纵轴自动</span></label><button id="fullView" class="button button-mini" type="button">完整显示</button><label class="toggle-label"><input id="autoFollow" type="checkbox"><span>滚动显示</span></label><span id="viewModeStatus" class="view-mode-status">自动跟随最新数据</span>
             <button id="autoScale" class="button button-mini" type="button" title="重设时间轴与读数轴，适配当前数据">自动缩放</button>
             <button id="restoreLive" class="button button-mini hidden" type="button">返回实时</button>
             <button id="resetRealtimeView" class="button button-primary" type="button" title="清除手动缩放并恢复最新 120 秒自动跟随">回到实时窗口</button>
           </div>
         </div>
         <div id="chartContext" class="chart-context">
-          <span><i class="legend-line"></i><span id="legendName">原始读数</span></span>
-          <span class="chart-context-actions"><span id="pointCursor">悬停读点</span><span id="chartGestureHint">滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴</span><details id="plotHelp" class="chart-help"><summary>图表操作 · 触屏</summary><p>悬停读取最近数据点；普通滚轮缩放两轴，Shift+滚轮缩放时间轴，Ctrl+滚轮缩放纵轴。手动缩放或平移任一坐标轴后，自动跟随关闭。鼠标拖动可平移；触屏单指平移、双指缩放。方向键选点、Home/End 跳到首末点、Enter 锁定基准；Alt+方向键平移，+/- 缩放。自动缩放显示全数据；点击“回到实时窗口”恢复最新数据跟随。单独加载测量 CSV 后，可再选择配套 events.csv，软件会核对实验标识；也可用“加载实验文件夹”自动配对同目录文件。</p></details></span>
+          <span><i class="legend-line"></i><span id="legendName">原始读数</span><i class="legend-mean"></i>滑动平均</span>
+          <span class="chart-context-actions"><span id="pointCursor">悬停读点</span><span id="chartGestureHint">滚轮：双轴 · Shift：时间轴 · Ctrl：纵轴</span><details id="plotHelp" class="chart-help"><summary>图表操作 · 触屏</summary><p>悬停读取最近数据点；普通滚轮缩放两轴，Shift+滚轮缩放时间轴，Ctrl+滚轮缩放纵轴。手动缩放或平移任一坐标轴后，自动跟随关闭。鼠标拖动可平移；触屏单指平移、双指缩放。方向键选点、Home/End 跳到首末点、Enter 锁定基准；Alt+方向键平移，+/- 缩放。自动缩放显示全数据；点击“回到实时窗口”恢复最新数据跟随。单独加载测量 CSV 后，可再选择配套 events.csv，软件会核对实验标识；也可用“加载实验文件夹”自动配对同目录文件。</p></details></span>
         </div>
-        <div class="plot-wrap"><canvas id="plot" role="img" tabindex="0" aria-keyshortcuts="ArrowLeft ArrowRight Home End Enter Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown + -" aria-label="测量曲线图；左右方向键选点，Home 和 End 跳到首末点，Enter 锁定基准，Alt 加方向键平移，正负号缩放" aria-describedby="plotAccessibilitySummary"></canvas><canvas id="plotOverlay" class="plot-overlay" aria-hidden="true"></canvas><div id="plotEmpty" class="plot-empty" aria-live="polite"><span class="empty-icon" aria-hidden="true">⌁</span><strong id="emptyTitle">等待连接</strong><span id="emptyDetail">连接 8845A 或先试用模拟器，曲线会显示在这里。</span><div class="empty-actions"><button id="emptyNewMeasurement" class="button button-mini button-primary hidden" type="button" title="填写实验名称并选择单次测量或连续采集；开始后自动显示新曲线，旧 CSV 保留。">新建测量</button><button id="emptyOpenSettings" class="button button-mini" type="button">打开设置</button><button id="emptyConnectMock" class="button button-mini" type="button">连接模拟器</button><button id="emptyStart" class="button button-mini button-primary hidden" type="button">开始采集</button></div></div></div>
+        <div class="plot-wrap"><canvas id="plot" role="img" tabindex="0" aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown + -" aria-label="测量曲线图；Alt 加方向键平移，正负号缩放" aria-describedby="plotAccessibilitySummary"></canvas><canvas id="plotOverlay" class="plot-overlay" aria-hidden="true"></canvas><div id="plotEmpty" class="plot-empty" aria-live="polite"><span class="empty-icon" aria-hidden="true">⌁</span><strong id="emptyTitle">等待连接</strong><span id="emptyDetail">连接仪器后开始测量。</span><div class="empty-actions"><button id="emptyNewMeasurement" class="button button-mini button-primary hidden" type="button" title="填写实验名称并选择单次测量或连续采集；开始后自动显示新曲线，旧 CSV 保留。">新建测量</button><button id="emptyOpenSettings" class="button button-mini" type="button">连接仪器</button><button id="emptyStart" class="button button-mini button-primary hidden" type="button">开始采集</button></div></div></div>
         <div class="plot-footer"><span id="plotRange">等待数据</span><div class="plot-footer-tools"><span id="bufferNote">完整原始数据逐点保存到 CSV</span><div class="axis-range-control"><label for="yAxisSpan" title="范围按右侧单位输入；最小跨度受计算机浮点精度限制">纵轴跨度</label><input id="yAxisSpan" type="number" min="0" step="any" inputmode="decimal" aria-label="纵轴显示跨度" title="按右侧单位输入。例：单位为 MΩ 时，1e-12 MΩ = 1 µΩ；单位为 Ω 时，1e-6 Ω = 1 µΩ。最小跨度受计算机浮点精度限制，放大不会提升仪表分辨率；只改变图表显示，不修改原始读数。"><span id="yAxisSpanUnit">V</span><button id="applyYAxisSpan" class="button button-mini" type="button" title="按输入跨度缩放纵轴，并保持当前纵轴中心">应用</button></div></div></div>
         <div id="plotAccessibilitySummary" class="sr-only" aria-live="off">测量曲线图。摘要会在聚焦图表时提供当前读数、统计和范围；展开数据表可查看最近测量尝试。</div>
         <details class="accessible-data-table"><summary>曲线数据表（最近 50 条测量尝试）</summary><button id="copyPointTable" class="button button-mini" type="button">复制表格文本</button><div class="table-scroll"><table><thead><tr><th scope="col">样本</th><th scope="col">本地时间</th><th scope="col">原始响应 / 实际量程</th><th scope="col">换算值</th><th scope="col">状态</th></tr></thead><tbody id="pointTableBody"><tr><td colspan="5">等待测量数据</td></tr></tbody></table></div></details>
@@ -128,8 +130,7 @@
                 </div>
                 <button id="resetSerialDefaults" class="button button-mini" type="button">恢复推荐串口设置</button>
               </details>
-              <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="connectMock" class="button button-quiet" type="button">连接模拟器</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button><button id="diagnose" class="button button-quiet" type="button">运行诊断</button></div>
-              <div id="mockScenarioRow" class="scenario-row"><label for="mockScenario">模拟场景（连接前选择）</label><select id="mockScenario"><option>阶跃响应与恢复</option><option>长期漂移</option><option>通信超时测试</option><option>断线恢复测试</option></select></div>
+              <div class="button-row connect-actions"><button id="connectReal" class="button button-primary" type="button">连接 8845A</button><button id="disconnect" class="button button-quiet hidden" type="button">断开</button><button id="diagnose" class="button button-quiet" type="button">运行诊断</button></div>
               <div class="connection-detail"><span class="connection-led"></span><span id="connectionText">串口尚未打开</span></div>
               <div id="connectionProgress" class="connection-progress hidden" role="status" aria-live="polite"></div>
               <ol id="connectionStages" class="connection-stages" aria-label="连接步骤"></ol>
@@ -182,7 +183,6 @@
                 <p id="rangeLimitHint" class="field-hint hidden"></p>
                 <label class="confirm-row"><input id="safetyConfirm" type="checkbox"><span>我已按提示核对接线、极性、保险丝和输入限值</span></label>
               </div>
-              <div id="mockSafetyNote" class="safety-note mock-note hidden"><span class="safety-symbol" aria-hidden="true">✓</span><div><strong>模拟测量</strong><p>当前使用合成数据，不涉及仪器插孔、保险丝或外部回路。</p></div></div>
               <button id="zero" class="button button-quiet button-wide" type="button" title="执行一次内部零点测量并更新补偿，不是校准调整或去皮，也不会强制显示0。停止采集后执行；启用模拟滤波时，量程、NPLC和触发条件应符合ZERO要求。">执行 ZERO 校正…</button>
               <p id="zeroResult" class="field-hint hidden" role="status" aria-live="polite"></p>
             </section>

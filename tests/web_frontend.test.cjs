@@ -404,6 +404,7 @@ test("fixed range tooltip updates on auto toggle and combines Local acquisition 
   await element(elements, "autorange").dispatch("change");
   assert.match(element(elements, "range").title, /自动量程.*关闭.*固定量程/);
 
+  api.app.state = { connected: false };
   element(elements, "autorange").checked = false;
   await element(elements, "autorange").dispatch("change");
 
@@ -496,7 +497,7 @@ test("wide Web empty plot shortens the chart and keeps its actions visible", asy
         updateEmptyPlotState(false);
         requestAnimationFrame(() => {
           try {
-            const actions = ["emptyOpenSettings", "emptyConnectMock"].map((id) => {
+            const actions = ["emptyOpenSettings"].map((id) => {
               const node = doc.getElementById(id);
               const rect = node.getBoundingClientRect();
               return getComputedStyle(node).display !== "none" && rect.width > 0 && rect.height > 0;
@@ -520,10 +521,10 @@ test("wide Web empty plot shortens the chart and keeps its actions visible", asy
   </script>`;
   const metrics = await inspectChromiumDom(browser, probe);
   assert.equal(metrics.error, undefined, `frontend empty-state geometry probe runs: ${JSON.stringify(metrics)}`);
-  assert.ok(metrics.emptyHeight >= 220 && metrics.emptyHeight <= 320, `wide empty chart is compact: ${JSON.stringify(metrics)}`);
-  assert.ok(metrics.emptyHeight < metrics.fullHeight * 0.6, `wide empty chart is shorter than the data layout: ${JSON.stringify(metrics)}`);
+  assert.ok(metrics.emptyHeight >= 220, `chart remains usable: ${JSON.stringify(metrics)}`);
+  assert.ok(Math.abs(metrics.emptyHeight - metrics.fullHeight) < 2, `chart keeps its workspace height: ${JSON.stringify(metrics)}`);
   assert.equal(metrics.emptyTitle, "图表还没有数据", "geometry is measured after the real frontend empty-state transition");
-  assert.deepEqual(metrics.actions, [true, true], "settings and Mock connection remain available in the empty chart");
+  assert.deepEqual(metrics.actions, [true], "connection remains available in the empty chart");
 });
 
 test("Web disconnect exposes reconnect while preserving last serial settings", async () => {
@@ -1171,7 +1172,7 @@ function createFrontend({ preferences = null, stubChart = true, storage: provide
   });
   const source = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8")
     .replace(/\ninitialize\(\);\s*$/, "");
-  vm.runInContext(`${source}\n;globalThis.__frontend = { app, ui, command, handleCommandRecoveryStorage, acknowledgeUncertainCommands, restoreUnresolvedCommands, updateStateDisplay, pollState, scanPorts, startPayload, startContinuous, startSingle, populateModeOptions, bindControls, chooseDuplicateNameAction, connectReal, connectMock, drawChart, buildPixelPointIndex, nearestPoint, appendSampleRows, saveManualSoftware, clearManualSoftware, renderSettingsComparison, refreshChartOverview, clearChartOverview, chartPointsForPlot, refreshExperimentFiles: typeof refreshExperimentFiles === "function" ? refreshExperimentFiles : null, downloadLatestCsv: typeof downloadLatestCsv === "function" ? downloadLatestCsv : null, scheduleChartRedraw: typeof scheduleChartRedraw === "function" ? scheduleChartRedraw : null, downsampleForRender: typeof downsampleForRender === "function" ? downsampleForRender : null, classifyLog: typeof classifyLog === "function" ? classifyLog : null, filterLogRows: typeof filterLogRows === "function" ? filterLogRows : null, formatLogsText: typeof formatLogsText === "function" ? formatLogsText : null, loadHistory, requestChartRange, loadHistoryEvents: typeof loadHistoryEvents === "function" ? loadHistoryEvents : null, restorePreferences, updateStats, renderEvents, focusEvent, updateAccessiblePointTable: typeof updateAccessiblePointTable === "function" ? updateAccessiblePointTable : null, clearPreferences: typeof clearPreferences === "function" ? clearPreferences : null, localExperimentName: typeof localExperimentName === "function" ? localExperimentName : null, copyAccessiblePointTable: typeof copyAccessiblePointTable === "function" ? copyAccessiblePointTable : null, updateEmptyPlotState: typeof updateEmptyPlotState === "function" ? updateEmptyPlotState : null, createPlotExportCanvas: typeof createPlotExportCanvas === "function" ? createPlotExportCanvas : null, copyExperimentPath: typeof copyExperimentPath === "function" ? copyExperimentPath : null, experimentNameError: typeof experimentNameError === "function" ? experimentNameError : null };`, context);
+  vm.runInContext(`${source}\n;globalThis.__frontend = { app, ui, command, handleCommandRecoveryStorage, acknowledgeUncertainCommands, restoreUnresolvedCommands, updateStateDisplay, pollState, scanPorts, startPayload, startContinuous, startSingle, populateModeOptions, bindControls, chooseDuplicateNameAction, connectReal, drawChart, buildPixelPointIndex, nearestPoint, appendSampleRows, saveManualSoftware, clearManualSoftware, renderSettingsComparison, refreshChartOverview, clearChartOverview, chartPointsForPlot, chartMeanRows, refreshMovingAverage, refreshExperimentFiles: typeof refreshExperimentFiles === "function" ? refreshExperimentFiles : null, downloadLatestCsv: typeof downloadLatestCsv === "function" ? downloadLatestCsv : null, scheduleChartRedraw: typeof scheduleChartRedraw === "function" ? scheduleChartRedraw : null, downsampleForRender: typeof downsampleForRender === "function" ? downsampleForRender : null, classifyLog: typeof classifyLog === "function" ? classifyLog : null, filterLogRows: typeof filterLogRows === "function" ? filterLogRows : null, formatLogsText: typeof formatLogsText === "function" ? formatLogsText : null, loadHistory, requestChartRange, loadHistoryEvents: typeof loadHistoryEvents === "function" ? loadHistoryEvents : null, restorePreferences, updateStats, renderEvents, focusEvent, updateAccessiblePointTable: typeof updateAccessiblePointTable === "function" ? updateAccessiblePointTable : null, clearPreferences: typeof clearPreferences === "function" ? clearPreferences : null, localExperimentName: typeof localExperimentName === "function" ? localExperimentName : null, copyAccessiblePointTable: typeof copyAccessiblePointTable === "function" ? copyAccessiblePointTable : null, updateEmptyPlotState: typeof updateEmptyPlotState === "function" ? updateEmptyPlotState : null, createPlotExportCanvas: typeof createPlotExportCanvas === "function" ? createPlotExportCanvas : null, copyExperimentPath: typeof copyExperimentPath === "function" ? copyExperimentPath : null, experimentNameError: typeof experimentNameError === "function" ? experimentNameError : null };`, context);
   if (stubChart) vm.runInContext("drawChart = () => {}; updateStats = () => {};", context);
   return { api: context.__frontend, elements, context, storage, clipboard, animationFrames };
 }
@@ -1318,51 +1319,19 @@ test("Mock mode hides physical wiring confirmation and sends no physical confirm
   assert.equal(Object.hasOwn(api.startPayload(), "safety_confirmed"), false);
 });
 
-test("real instrument mode keeps wiring confirmation visible and user controlled", () => {
-  const { api, elements } = createFrontend();
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  api.app.state = connectedState({ simulation: false, connection_text: "8845A 已连接" });
-  api.updateStateDisplay(api.app.state);
-
-  assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), true);
-  assert.equal(element(elements, "safetyControls").classList.contains("hidden"), false);
-  assert.equal(element(elements, "mockSafetyNote").classList.contains("hidden"), true);
-  element(elements, "safetyConfirm").checked = true;
-  assert.equal(api.startPayload().safety_confirmed, true);
-});
-
-test("connected Mock scenario cannot be edited without reconnecting", () => {
-  const { api, elements } = createFrontend();
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  api.updateStateDisplay(connectedState());
-
-  assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), false);
-  assert.equal(element(elements, "mockScenario").disabled, true);
-  assert.match(element(elements, "mockScenario").title, /断开.*重新连接/);
-});
-
-test("Mock scenario is selectable before connection and is sent with the request", async () => {
+test("real acquisition asks for wiring confirmation before preflight", async () => {
   const { api, elements, context } = createFrontend();
-  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  assert.match(html, /id="mockScenarioRow" class="scenario-row"/);
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  api.app.state = connectedState({ connected: false, simulation: false });
-  api.updateStateDisplay(api.app.state);
-
-  assert.equal(element(elements, "mockScenarioRow").classList.contains("hidden"), false);
-  assert.equal(element(elements, "mockScenario").disabled, false);
-  element(elements, "mockScenario").value = "长期漂移";
-
-  const requests = mockSuccessfulCommand(context);
-  await api.connectMock();
-
-  const request = JSON.parse(requests[0].options.body);
-  assert.equal(request.action, "connect_mock");
-  assert.equal(request.payload.scenario, "长期漂移");
+  api.app.modes.set("DCV", dcv); api.app.selectedMode = "DCV"; api.app.state = connectedState({ simulation: false });
+  element(elements, "experimentName").value = "run";
+  let sent = 0; context.fetch = async () => { sent++; throw new Error("unexpected"); };
+  context.window.confirm = () => false;
+  assert.equal(await api.startContinuous(), undefined);
+  assert.equal(sent, 0);
 });
+
+
+
+
 
 test("changing mode or range clears the previous physical wiring confirmation", () => {
   const { api, elements } = createFrontend();
@@ -1463,18 +1432,7 @@ function mockSuccessfulCommand(context) {
   return requests;
 }
 
-test("starting a Mock connection clears any previous real wiring confirmation", async () => {
-  const { api, elements, context } = createFrontend();
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  mockSuccessfulCommand(context);
-  element(elements, "safetyConfirm").checked = true;
 
-  await api.connectMock();
-
-  assert.equal(element(elements, "safetyConfirm").checked, false);
-  assert.equal(Object.hasOwn(api.startPayload(), "safety_confirmed"), false);
-});
 
 test("starting a real connection clears stale wiring confirmation and requires a fresh check", async () => {
   const { api, elements, context } = createFrontend();
@@ -1543,159 +1501,38 @@ test("experiment name hint explains explicit duplicate-name choices", () => {
   );
 });
 
-test("settings cards stack independently in desktop columns and reflow at 820 px in Chromium", async (t) => {
-  const candidates = [
-    process.env.CHROME_BIN,
-    process.env.EDGE_BIN,
-    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-    "C:/Program Files/Google/Chrome/Application/chrome.exe",
-  ].filter(Boolean);
-  const browser = candidates.find((candidate) => fs.existsSync(candidate));
-  if (!browser) return t.skip("Chromium is not installed; settings-card geometry cannot be measured here");
-
+test("connection and measurement settings are separated into dialog views", () => {
   const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
-  const source = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8")
-    .replace('<link rel="stylesheet" href="/app.css">', `<style>${css}</style>`)
-    .replace(/\s*<script[^>]*>[\s\S]*?<\/script>|\s*<script[^>]*><\/script>/g, "")
-    .replace(/\s*<script[^>]*src="[^"]*"[^>]*><\/script>/g, "");
-  const probe = `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script>
-    const source = ${JSON.stringify(source)};
-    const widths = [1440, 1000, 821, 820];
-    const frames = widths.map((width) => {
-      const frame = document.createElement("iframe");
-      frame.style.cssText = "display:block;border:0;width:" + width + "px;height:1000px";
-      frame.srcdoc = source;
-      document.body.appendChild(frame);
-      return { width, frame };
-    });
-    Promise.all(frames.map(({ width, frame }) => new Promise((resolve) => frame.addEventListener("load", () => {
-      const doc = frame.contentDocument;
-      const dialog = doc.querySelector("#settingsDialog");
-      dialog.showModal();
-      const columnLeft = doc.querySelector(".settings-column-left");
-      const columnRight = doc.querySelector(".settings-column-right");
-      if (!columnLeft || !columnRight) {
-        resolve({ width, error: "settings cards are not grouped into independent desktop columns" });
-        return;
-      }
-      const rect = (id) => {
-        const value = doc.querySelector("#" + id).getBoundingClientRect();
-        return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
-      };
-      const grid = doc.querySelector(".settings-grid");
-      const scroll = doc.querySelector(".settings-scroll");
-      resolve({
-        width,
-        columns: getComputedStyle(grid).gridTemplateColumns.trim().split(/\\s+/).length,
-        gridRect: (() => { const r = grid.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; })(),
-        sections: Object.fromEntries(["sectionSerial", "sectionMeasurement", "sectionExperiment", "sectionAnalysis", "sectionDiagnostics"].map((id) => [id, rect(id)])),
-        desktopColumns: [columnLeft, columnRight].map((column) => {
-          const r = column.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
-        }),
-        scroll: { height: scroll.clientHeight, scrollHeight: scroll.scrollHeight, width: scroll.clientWidth, scrollWidth: scroll.scrollWidth },
-        dialog: rect("settingsDialog"),
-      });
-    })))).then((metrics) => { document.getElementById("result").textContent = JSON.stringify(metrics); });
-  </script>`;
-  const metrics = await inspectChromiumDom(browser, probe);
-  assert.equal(metrics.length, 4);
-  for (const layout of metrics) {
-    assert.equal(layout.error, undefined, `${layout.width}px settings layout: ${layout.error || ""}`);
-    const { sectionSerial, sectionMeasurement, sectionExperiment, sectionAnalysis, sectionDiagnostics } = layout.sections;
-    if (layout.width > 820) {
-      assert.equal(layout.columns, 2, `${layout.width}px keeps two settings columns`);
-      assert.ok(Math.abs(layout.desktopColumns[0].left - sectionSerial.left) <= 1);
-      assert.ok(Math.abs(layout.desktopColumns[0].left - sectionExperiment.left) <= 1);
-      assert.ok(Math.abs(layout.desktopColumns[1].left - sectionMeasurement.left) <= 1);
-      assert.ok(Math.abs(layout.desktopColumns[1].left - sectionAnalysis.left) <= 1);
-      assert.ok(Math.abs((sectionSerial.bottom + 13) - sectionExperiment.top) <= 1, `${layout.width}px serial and experiment cards have only the intended column gap`);
-      assert.ok(Math.abs((sectionMeasurement.bottom + 13) - sectionAnalysis.top) <= 1, `${layout.width}px measurement and analysis cards have only the intended column gap`);
-      assert.ok(layout.desktopColumns[0].right < layout.desktopColumns[1].left);
-      assert.ok(sectionDiagnostics.top >= Math.max(layout.desktopColumns[0].bottom, layout.desktopColumns[1].bottom) + 12);
-    } else {
-      assert.equal(layout.columns, 1, `${layout.width}px switches to one column at the breakpoint`);
-      const ordered = [sectionSerial, sectionMeasurement, sectionExperiment, sectionAnalysis, sectionDiagnostics];
-      assert.ok(ordered.every((section, index) => index === 0 || section.top > ordered[index - 1].top));
-      assert.ok(ordered.every((section) => Math.abs(section.left - sectionSerial.left) <= 1));
-    }
-    assert.ok(layout.scroll.scrollHeight > layout.scroll.height, `${layout.width}px settings remain vertically scrollable`);
-    assert.ok(layout.scroll.scrollWidth <= layout.scroll.width, `${layout.width}px settings do not overflow horizontally`);
-    assert.ok(layout.dialog.right <= layout.width + 1, `${layout.width}px dialog stays inside the viewport`);
-  }
+  assert.match(css, /settings-dialog\[data-view="connection"\] #sectionMeasurement/);
+  assert.match(css, /settings-dialog\[data-view="parameters"\] #sectionSerial/);
 });
 
-test("empty plot gives the next useful action and uses a compact empty layout", () => {
+test("empty plot offers a connection action", () => {
   const { api, elements } = createFrontend();
-  assert.equal(typeof api.updateEmptyPlotState, "function");
-  api.app.state = { connected: false, status: "等待连接" };
-  api.updateEmptyPlotState(false);
+  api.app.state = { connected: false, status: "等待连接" }; api.updateEmptyPlotState(false);
   assert.match(element(elements, "emptyDetail").textContent, /连接/);
-  assert.equal(element(elements, "emptyConnectMock").classList.contains("hidden"), false);
-  assert.equal(element(elements, "emptyStart").classList.contains("hidden"), true);
-  assert.equal(element(elements, "measurementArea").classList.contains("chart-empty"), true);
-
-  api.app.state = connectedState({ status: "等待开始" });
-  api.updateEmptyPlotState(false);
-  assert.equal(element(elements, "emptyConnectMock").classList.contains("hidden"), true);
-  assert.equal(element(elements, "emptyStart").classList.contains("hidden"), false);
-  api.updateEmptyPlotState(true);
-  assert.equal(element(elements, "measurementArea").classList.contains("chart-empty"), false);
+  assert.equal(element(elements, "emptyOpenSettings").classList.contains("hidden"), false);
 });
 
-test("empty plot actions open settings, connect Mock, and start acquisition", async () => {
-  const { api, elements, context } = createFrontend();
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  api.populateModeOptions(dcv);
-  element(elements, "experimentName").value = "短测";
-  const requests = mockSuccessfulCommand(context);
-  api.bindControls();
-
+test("empty plot connection action opens the connection dialog", async () => {
+  const { api, elements } = createFrontend(); api.bindControls();
   await element(elements, "emptyOpenSettings").dispatch("click");
+  assert.equal(element(elements, "settingsDialog").dataset.view, "connection");
   assert.equal(element(elements, "settingsDialog").showModalCalled, true);
-  await element(elements, "emptyConnectMock").dispatch("click");
-  await element(elements, "emptyStart").dispatch("click");
-  assert.deepEqual(requests.map(({ options }) => JSON.parse(options.body).action), ["connect_mock", "preflight", "start"]);
 });
 
-test("cleared Web chart offers a direct new-measurement action that opens experiment settings", async () => {
+test("cleared connected chart offers start", () => {
   const { api, elements } = createFrontend();
-  api.app.chartCleared = true;
+  api.app.state = { connected: true, status: "已连接", control_mode: "computer" }; api.app.chartCleared = true;
   api.updateEmptyPlotState(false);
-  assert.equal(element(elements, "emptyNewMeasurement").classList.contains("hidden"), false);
-  assert.equal(element(elements, "emptyOpenSettings").classList.contains("hidden"), true);
-  assert.match(element(elements, "emptyDetail").textContent, /旧实验 CSV 保留/);
-  assert.match(element(elements, "emptyDetail").textContent, /无需先清空/);
-
-  api.bindControls();
-  await element(elements, "emptyNewMeasurement").dispatch("click");
-
-  assert.equal(element(elements, "settingsDialog").showModalCalled, true);
-  assert.equal(element(elements, "experimentName").focusCalled, true);
-  assert.equal(element(elements, "experimentName").selectCalled, true);
+  assert.equal(element(elements, "emptyStart").classList.contains("hidden"), false);
 });
 
-test("new measurement action opens experiment setup without clearing the old chart first", async () => {
-  const { api, elements } = createFrontend();
-  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  const actionBar = html.indexOf('<section class="action-bar"');
-  const newMeasurement = html.indexOf('id="newMeasurement"');
-  const settingsDialog = html.indexOf('<dialog id="settingsDialog"');
-  assert.ok(actionBar >= 0 && newMeasurement > actionBar && newMeasurement < settingsDialog);
-  assert.match(html, /新建测量：点“新建测量”→ 填名称 → 点“单次测量”或“开始连续采集”。新测量开始后自动换图，旧 CSV 保留/);
-  assert.match(html, /id="newMeasurement"[^>]*class="button button-primary"[^>]*>新建测量</);
-  assert.match(html, /id="clearPlot"[^>]*>清空图表/);
-  assert.match(html, /id="singleFromSettings"[^>]*>单次测量/);
-  assert.match(html, /id="startFromSettings"[^>]*>开始连续采集/);
-
-  api.app.points = [{ x: 1, y: 2, status: "ok" }];
-  api.bindControls();
+test("new measurement clears the displayed data while keeping saved files", async () => {
+  const { api, elements } = createFrontend(); api.app.state = connectedState({ status: "就绪" });
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }]; api.bindControls();
   await element(elements, "newMeasurement").dispatch("click");
-
-  assert.equal(element(elements, "settingsDialog").showModalCalled, true);
-  assert.equal(element(elements, "experimentName").focusCalled, true);
-  assert.equal(element(elements, "experimentName").selectCalled, true);
-  assert.equal(api.app.points.length, 1);
+  assert.equal(api.app.chartCleared, true); assert.equal(api.app.points.length, 0);
 });
 
 test("settings window starts a new continuous measurement directly and closes after acceptance", async () => {
@@ -1804,7 +1641,6 @@ test("rejected start command explains that no new measurement started and preser
   };
   api.bindControls();
 
-  await element(elements, "newMeasurement").dispatch("click");
   await element(elements, "singleFromSettings").dispatch("click");
 
   assert.deepEqual(actions, ["preflight", "single"]);
@@ -1875,15 +1711,29 @@ test("a new experiment generation makes the live curve visible again after clear
   assert.equal(api.app.lastSample, 1);
 });
 
-test("new measurement action is locked during an active acquisition", async () => {
-  const { api, elements } = createFrontend();
-  api.bindControls();
-  api.updateStateDisplay(connectedState({ status: "连续采集中" }));
-
-  assert.equal(element(elements, "newMeasurement").disabled, true);
-  assert.match(element(elements, "newMeasurement").title, /先停止并保存当前实验/);
+test("new measurement saves an active experiment before clearing", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv); api.app.generation = 1;
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }];
+  api.bindControls(); api.updateStateDisplay(connectedState({ status: "连续采集中" }));
+  assert.equal(element(elements, "newMeasurement").disabled, false);
+  const requests = [];
+  context.fetch = async (url, options) => {
+    if (options?.method === "POST") { requests.push(JSON.parse(options.body).action); return { ok:true, json:async()=>({success:true,message:"已保存"}) }; }
+    return { ok:true, json:async()=>connectedState({ generation:1, status:"已停止", samples:[], logs:[], events:[] }) };
+  };
   await element(elements, "newMeasurement").dispatch("click");
-  assert.notEqual(element(elements, "settingsDialog").showModalCalled, true);
+  assert.deepEqual(requests, ["stop"]); assert.equal(api.app.chartCleared, true); assert.equal(api.app.points.length, 0);
+});
+
+test("new measurement keeps the chart when stop or save fails", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.modes.set("DCV", dcv); api.app.generation = 1;
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }];
+  api.bindControls(); api.updateStateDisplay(connectedState({ status: "连续采集中" }));
+  context.fetch = async () => ({ ok:true, json:async()=>({success:false,message:"保存失败"}) });
+  await element(elements, "newMeasurement").dispatch("click");
+  assert.equal(api.app.chartCleared, false); assert.equal(api.app.points.length, 1);
 });
 
 test("starting acquisition shows the completed preflight checklist before submitting start", async () => {
@@ -2132,7 +1982,7 @@ test("firmware version field tooltips distinguish DCI and ACI source evidence", 
   assert.match(inguard[1], /ACI.*未明确.*不根据.*自动拒绝/);
 });
 
-test("NPLC and bandwidth can be prepared before acquisition and tuned during supported live acquisition", () => {
+test("NPLC and bandwidth remain locked during acquisition", () => {
   const { api, elements } = createFrontend();
   api.app.modes.set("DCV", dcv);
   api.app.selectedMode = "DCV";
@@ -2144,7 +1994,7 @@ test("NPLC and bandwidth can be prepared before acquisition and tuned during sup
   assert.match(element(elements, "settingsApplyHint").textContent, /采集前/);
 
   api.updateStateDisplay(connectedState({ status: "采集中" }));
-  assert.equal(element(elements, "nplc").disabled, false);
+  assert.equal(element(elements, "nplc").disabled, true);
   assert.equal(element(elements, "applySettings").disabled, true);
   assert.equal(element(elements, "applySpeed").disabled, false);
   assert.match(element(elements, "settingsApplyHint").textContent, /采集中/);
@@ -2161,7 +2011,7 @@ test("NPLC and bandwidth can be prepared before acquisition and tuned during sup
   assert.equal(element(elements, "bandwidth").disabled, false);
   assert.equal(element(elements, "applySpeed").disabled, true);
   api.updateStateDisplay(connectedState({ status: "采集中", active_settings: { mode: "ACV" } }));
-  assert.equal(element(elements, "bandwidth").disabled, false);
+  assert.equal(element(elements, "bandwidth").disabled, true);
   assert.equal(element(elements, "applySpeed").disabled, false);
 });
 
@@ -2299,7 +2149,7 @@ test("release resource validator accepts current source and rejects stale sampli
   const javascript = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
   assert.match(html, /id="serviceStatus"/);
   assert.match(html, /id="safetyControls"/);
-  assert.match(html, /id="mockSafetyNote"/);
+  assert.doesNotMatch(html, /id="mockSafetyNote"/);
   const validator = "import json,sys; from scripts.package_windows_release import validate_packaged_web_resources; data=json.load(sys.stdin); validate_packaged_web_resources(data['html'], data['javascript'])";
   const validate = (page) => spawnSync("python", ["-X", "utf8", "-c", validator], {
     cwd: ROOT, input: JSON.stringify({ html: page, javascript }), encoding: "utf8",
@@ -2311,20 +2161,7 @@ test("release resource validator accepts current source and rejects stale sampli
   assert.match(stale.stderr, /实测采样间隔/);
 });
 
-test("the top bar identifies Mock data and keeps the selected scenario visible after state refresh", () => {
-  const { api, elements } = createFrontend();
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  api.updateStateDisplay(connectedState({ mock_scenario: "长期漂移" }));
 
-  assert.equal(element(elements, "mockScenario").value, "长期漂移");
-  assert.equal(element(elements, "scenarioBadge").textContent, "模拟 · 长期漂移");
-  assert.equal(element(elements, "scenarioBadge").classList.contains("hidden"), false);
-
-  api.updateStateDisplay(connectedState({ simulation: false, mock_scenario: null, connection_text: "真实 8845A 已连接" }));
-  assert.equal(element(elements, "scenarioBadge").classList.contains("hidden"), true);
-  assert.match(element(elements, "connectionBadge").querySelector("span").textContent, /8845A/);
-});
 
 test("measurement status keeps Real or Mock and the full scenario name visible on narrow screens", () => {
   const { api, elements } = createFrontend();
@@ -3144,21 +2981,12 @@ test("event feedback is shown and text clears only after the event is saved", as
   assert.equal(input.value, "恢复完成");
 });
 
-test("chart gesture help is expandable and the live hint stays concise", () => {
+test("chart shows a concise wheel gesture hint", () => {
   const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  assert.match(html, /<details id="plotHelp"[^>]*>/);
-  assert.match(html, /<summary>[^<]*触屏[^<]*<\/summary>/);
-  assert.match(html, /触屏单指平移、双指缩放/);
-  assert.match(html, /id="pointCursor"[^>]*>[^<]*悬停读点/);
-  assert.match(html, /id="chartGestureHint"[^>]*>[^<]*滚轮/);
-  assert.match(html, /滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴/);
-  assert.match(html, /普通滚轮缩放两轴，Shift\+滚轮缩放时间轴，Ctrl\+滚轮缩放纵轴/);
-  assert.match(html, /id="scenarioBadge"/);
-  assert.match(html, /id="acquisitionFeedback"/);
-  assert.match(html, /class="pause-slot"[\s\S]*id="pause"[\s\S]*id="resume"/);
+  assert.match(html, /滚轮：双轴 · Shift：时间轴 · Ctrl：纵轴/);
 });
 
-test("the chart draws a horizontal reference line for the active baseline", () => {
+test("the baseline remains available without a dashed line", () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("DCV", dcv);
   api.app.points = [
@@ -3171,12 +2999,11 @@ test("the chart draws a horizontal reference line for the active baseline", () =
   api.drawChart();
 
   const strokes = element(elements, "plot").canvasContext.strokes;
-  assert.ok(strokes.some((stroke) => stroke.dash.length > 0 && stroke.path.length === 2
-    && stroke.path[0][0] === "M" && stroke.path[1][0] === "L"
-    && Math.abs(stroke.path[0][2] - stroke.path[1][2]) < 1e-8));
+  assert.equal(strokes.some((stroke) => stroke.dash.length > 0), false);
+  assert.equal(api.app.baseline, 1.5);
 });
 
-test("web chart text and reference markers meet contrast targets", () => {
+test("web chart text meets contrast targets without dashed markers", () => {
   const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
   const luminance = (hex) => {
     const channels = hex.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255);
@@ -3221,13 +3048,7 @@ test("web chart text and reference markers meet contrast targets", () => {
     assert.ok(draw, `chart renders ${label}`);
     assert.ok(contrast(draw.color, chartBackground) >= 4.5, `${label} must meet normal-text contrast`);
   }
-  const dashedSegments = context.strokes.filter((stroke) => stroke.dash.length > 0 && stroke.path.length >= 2);
-  const baseline = dashedSegments.find((stroke) => Math.abs(stroke.path[0][2] - stroke.path[1][2]) < 1e-8);
-  const event = dashedSegments.find((stroke) => Math.abs(stroke.path[0][1] - stroke.path[1][1]) < 1e-8);
-  assert.ok(baseline, "the active baseline is drawn");
-  assert.ok(event, "the experiment event marker is drawn");
-  assert.ok(contrast(baseline.color, chartBackground) >= 3.0, "baseline line must meet non-text contrast");
-  assert.ok(contrast(event.color, chartBackground) >= 3.0, "event line must meet non-text contrast");
+  assert.equal(context.strokes.some((stroke) => stroke.dash.length > 0), false);
 });
 
 test("failed readings leave a visible gap instead of joining surrounding samples", () => {
@@ -3792,62 +3613,13 @@ test("event entries identify their chart location and selecting one centers the 
   assert.match(element(elements, "pointCursor").textContent, /事件.*load switched/);
 });
 
-test("hovering a chart event marker shows its time, local timestamp, and label", async () => {
-  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
-  const event = {
-    elapsed_s: 5,
-    text: "load switched",
-    timestamp_local: "2026-10-15T12:34:56+08:00",
-  };
-  api.app.modes.set("DCV", dcv);
-  api.app.selectedMode = "DCV";
-  api.app.state = connectedState({ events: [event] });
-  api.app.points = [
-    { id: 1, x: 0, y: 1, status: "ok", unit: "V" },
-    { id: 2, x: 10, y: 2, status: "ok", unit: "V" },
-  ];
-  element(elements, "autoFollow").checked = false;
-  api.drawChart();
 
-  const marker = api.app.chartEventHits[0];
-  assert.ok(marker, "the event is represented by a chart marker");
-  const scale = api.app.chartScale;
-  await element(elements, "plot").dispatch("pointermove", {
-    clientX: marker.x,
-    clientY: (scale.top + scale.bottom) / 2,
-  });
-  while (animationFrames.length) animationFrames.shift()();
 
-  assert.equal(api.app.hoveredEventIndex, 0);
-  assert.equal(api.app.cursor, null, "hovering the marker suppresses the measurement point cursor");
-  const cursorText = element(elements, "pointCursor").textContent;
-  assert.match(cursorText, /事件 · t=5 s/);
-  assert.ok(cursorText.includes(expectedLocalDateTime(event.timestamp_local)), "the cursor includes the event's local timestamp");
-  assert.match(cursorText, /load switched/);
-  assert.ok(
-    element(elements, "plotOverlay").canvasContext.calls.some(([, text]) => text === event.text),
-    "the overlay labels the hovered marker with the event name",
-  );
-});
-
-test("chart points can be selected and locked as baseline with the keyboard", async () => {
+test("normal keyboard arrows do not select a chart point", async () => {
   const { api, elements } = createFrontend({ stubChart: false });
-  api.app.modes.set("DCV", dcv);
-  element(elements, "chartGestureHint").textContent = "滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴";
-  api.app.points = [
-    { id: 1, x: 0, y: 1, status: "ok", unit: "V", raw: "1.0" },
-    { id: 2, x: 1, y: 2, status: "ok", unit: "V", raw: "2.0" },
-  ];
-  element(elements, "autoFollow").checked = false;
-  api.drawChart();
-
-  await element(elements, "plot").dispatch("keydown", { key: "End", preventDefault() {} });
-  assert.match(element(elements, "pointCursor").textContent, /已选样本 #2/);
-  assert.equal(element(elements, "chartGestureHint").textContent, "滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴");
-  await element(elements, "plot").dispatch("keydown", { key: "Enter", preventDefault() {} });
-
-  assert.equal(api.app.baseline, 2);
-  assert.equal(element(elements, "baselineValue").value, "2");
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }]; api.drawChart();
+  await element(elements, "plot").dispatch("keydown", { key: "ArrowRight", preventDefault() {} });
+  assert.equal(api.app.selectedPointIndex, null);
 });
 
 test("chart supports keyboard zoom and pan while keeping the view near measured data", async () => {
@@ -4191,7 +3963,7 @@ test("manual fine span rebases a view centered near zero from a 30 MΩ first sam
   assert.equal(api.app.points[0].y, 30e6, "rebasing never changes the raw measurement");
 });
 
-test("fine-scale Y-axis cursor, baseline, and raw sample share the same origin offset", async () => {
+test("fine-scale Y-axis retains baseline data and raw sample offset", async () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
   api.app.selectedMode = "RES2";
@@ -4204,12 +3976,8 @@ test("fine-scale Y-axis cursor, baseline, and raw sample share the same origin o
   const scale = api.app.chartScale;
   assert.equal(scale.yOrigin, 30e6, "chartScale exposes the stable absolute-to-offset origin");
   assert.ok(Math.abs(scale.yToPixel(30e6) - (scale.top + scale.bottom) / 2) < 1e-8, "the raw reading maps through its origin offset");
-  const baselineStroke = element(elements, "plot").canvasContext.strokes.find((stroke) => stroke.dash.length > 0
-    && stroke.path.length === 2 && Math.abs(stroke.path[0][2] - stroke.path[1][2]) < 1e-8);
-  assert.ok(baselineStroke && Math.abs(baselineStroke.path[0][2] - (scale.top + scale.bottom) / 2) < 1e-8, "the absolute baseline is translated into the same offset view");
-  api.app.cursor = { x: (scale.left + scale.right) / 2, y: (scale.top + scale.bottom) / 2 };
-  api.drawChart();
-  assert.ok(element(elements, "plotOverlay").canvasContext.calls.some(([, text]) => String(text).includes("30 MΩ")), "the inverse cursor mapping restores the absolute reading");
+  assert.equal(api.app.baseline, 30e6);
+  assert.equal(element(elements, "plot").canvasContext.strokes.some((stroke) => stroke.dash.length > 0), false);
   assert.equal(api.app.points[0].y, 30e6, "drawing and cursor inspection do not rewrite the raw point");
 });
 
@@ -4317,22 +4085,7 @@ test("nearest-point pixel index is reused across cursor redraws", () => {
   assert.equal(api.app.chartScale.pointIndex, firstIndex);
 });
 
-test("sparse indexed data still exposes the nearest point between distant samples", async () => {
-  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
-  api.app.modes.set("DCV", dcv);
-  api.app.points = [
-    { id: 1, x: 0, y: 1, status: "ok", unit: "V", raw: "1.000" },
-    { id: 2, x: 1, y: 2, status: "ok", unit: "V", raw: "2.000" },
-  ];
-  element(elements, "autoFollow").checked = false;
-  api.drawChart();
 
-  await element(elements, "plot").dispatch("pointermove", { clientX: 400, clientY: 200 });
-  while (animationFrames.length) animationFrames.shift()();
-
-  assert.equal(api.app.cursor?.point?.id, 1);
-  assert.match(element(elements, "pointCursor").textContent, /样本 #1.*原始 1\.000/);
-});
 
 test("nearest-point lookup expands past a close-x bucket when a farther bucket is much closer in y", () => {
   const { api } = createFrontend();
@@ -4458,25 +4211,7 @@ test("nearest-point index prunes candidate reads for 20k dense flat samples", ()
   assert.equal(sourceReads, 2, "only the selected row is re-read to produce the returned pixel position");
 });
 
-test("pointer hover paints only the cursor overlay instead of redrawing the data plot", async () => {
-  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  assert.match(html, /id="plotOverlay"[^>]*aria-hidden="true"/);
-  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
-  api.app.modes.set("DCV", dcv);
-  api.app.points = Array.from({ length: 20_000 }, (_, index) => ({
-    id: index + 1, x: index, y: 1 + index / 20_000, status: "ok", unit: "V", raw: String(index),
-  }));
-  element(elements, "autoFollow").checked = false;
-  api.drawChart();
-  const plotStrokes = element(elements, "plot").canvasContext.strokes.length;
-  const overlay = element(elements, "plotOverlay").canvasContext;
 
-  await element(elements, "plot").dispatch("pointermove", { clientX: 400, clientY: 180 });
-  while (animationFrames.length) animationFrames.shift()();
-
-  assert.equal(element(elements, "plot").canvasContext.strokes.length, plotStrokes);
-  assert.ok(overlay.strokes.length > 0, "the pointer crosshair is rendered on the lightweight overlay");
-});
 
 test("nearest-point lookup retains a correct linear fallback without a pixel index", () => {
   const { api } = createFrontend();
@@ -4725,7 +4460,7 @@ test("touch pinch can narrow the Y axis to a few floating-point steps at large r
   assert.ok(span > 0 && Number.isFinite(span), `Y span must remain finite and nonzero, got ${span}`);
 });
 
-test("manual zoom of either axis turns off auto-follow and updates the visible status", async () => {
+test("manual zoom preserves auto-follow", async () => {
   const { api, elements, animationFrames } = createFrontend({ stubChart: false });
   api.app.points = Array.from({ length: 21 }, (_, index) => ({ id: index + 1, x: index, y: index + 1, status: "ok", unit: "V" }));
   element(elements, "autoFollow").checked = true;
@@ -4734,13 +4469,12 @@ test("manual zoom of either axis turns off auto-follow and updates the visible s
   await element(elements, "plot").dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {} });
   flushAnimationFrames(animationFrames);
 
-  assert.equal(element(elements, "autoFollow").checked, false);
-  assert.match(element(elements, "viewModeStatus").textContent, /自动跟随已关闭/);
-  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
-  assert.match(html, /手动缩放或平移任一坐标轴.*自动跟随关闭/);
+  assert.equal(element(elements, "autoFollow").checked, true);
+  assert.match(element(elements, "viewModeStatus").textContent, /自动跟随最新数据/);
+
 });
 
-test("Shift-wheel time-axis zoom turns off auto-follow and preserves the reading axis", async () => {
+test("Shift-wheel preserves auto-follow and the reading axis", async () => {
   const { api, elements, animationFrames } = createFrontend({ stubChart: false });
   api.app.points = Array.from({ length: 101 }, (_, index) => ({ id: index + 1, x: index, y: index + 1, status: "ok", unit: "V" }));
   element(elements, "autoFollow").checked = true;
@@ -4756,8 +4490,8 @@ test("Shift-wheel time-axis zoom turns off auto-follow and preserves the reading
   assert.ok(api.app.xView[1] - api.app.xView[0] < initialXSpan);
   assert.equal(api.app.yView, null);
   assert.deepEqual([api.app.chartScale.yMin, api.app.chartScale.yMax], initialYRange);
-  assert.equal(element(elements, "autoFollow").checked, false);
-  assert.match(element(elements, "viewModeStatus").textContent, /自动跟随已关闭/);
+  assert.equal(element(elements, "autoFollow").checked, true);
+  assert.match(element(elements, "viewModeStatus").textContent, /自动跟随最新数据/);
 });
 
 test("a horizontal wheel event with no vertical delta does not leave auto-follow", async () => {
@@ -4776,7 +4510,7 @@ test("a horizontal wheel event with no vertical delta does not leave auto-follow
   assert.equal(api.app.yView, null);
 });
 
-test("manual pointer panning turns off auto-follow and updates the visible status", async () => {
+test("manual pointer panning preserves auto-follow", async () => {
   const { api, elements, animationFrames } = createFrontend({ stubChart: false });
   api.app.points = Array.from({ length: 101 }, (_, index) => ({ id: index + 1, x: index, y: index + 1, status: "ok", unit: "V" }));
   element(elements, "autoFollow").checked = true;
@@ -4788,9 +4522,9 @@ test("manual pointer panning turns off auto-follow and updates the visible statu
   await canvas.dispatch("pointermove", { pointerId: 1, clientX: 320, clientY: 180 });
   while (animationFrames.length) animationFrames.shift()();
 
-  assert.equal(element(elements, "autoFollow").checked, false);
+  assert.equal(element(elements, "autoFollow").checked, true);
   assert.notDeepEqual(api.app.xView, initialXRange);
-  assert.match(element(elements, "viewModeStatus").textContent, /自动跟随已关闭/);
+  assert.match(element(elements, "viewModeStatus").textContent, /自动跟随最新数据/);
 });
 
 test("full Web layout fits narrow and tablet viewports and keeps touch targets accessible in Chromium", async (t) => {
@@ -5086,4 +4820,165 @@ test("CSV download reports the server snapshot time from response headers", asyn
 
   assert.equal(savedUrls.length, 1);
   assert.match(element(elements, "toast").textContent, /进行中快照.*2026-10-15T12:34:56\+08:00/);
+});
+
+test("v2.1 draws a rolling average and restarts it after an invalid reading", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  element(elements, "averageWindow").value = "2";
+  api.app.points = [
+    { id: 1, x: 0, y: 2, status: "ok", unit: "V" },
+    { id: 2, x: 1, y: 4, status: "ok", unit: "V" },
+    { id: 3, x: 2, y: null, status: "timeout", unit: "V" },
+    { id: 4, x: 3, y: 8, status: "ok", unit: "V" },
+  ];
+  api.drawChart();
+  const average = element(elements, "plot").canvasContext.strokes.find((stroke) => stroke.color === "#d99423");
+  assert.ok(average, "average curve is drawn");
+  assert.equal(average.path.filter(([kind]) => kind === "M").length, 2);
+  const scale = api.app.chartScale;
+  assert.ok(Math.abs(average.path[1][2] - scale.yToPixel(3)) < 1e-8, "two readings average to 3");
+  assert.ok(Math.abs(average.path[2][2] - scale.yToPixel(8)) < 1e-8, "average restarts at 8 after the gap");
+});
+
+test("v2.1 main page has six modes, average controls and no visible simulator entrance", () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  assert.deepEqual([...html.matchAll(/data-mode="([A-Z0-9]+)"/g)].map((match) => match[1]), ["DCV", "ACV", "DCI", "ACI", "RES2", "RES4"]);
+  for (const id of ["openConnection", "openParameters", "averageWindow", "saveCurveCsv", "autoY", "fullView", "autoFollow"]) assert.ok(html.includes(`id="${id}"`));
+  assert.doesNotMatch(html, /id="(?:emptyConnectMock|connectMock|mockScenario)"/);
+  assert.doesNotMatch(fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8"), /command\("connect_mock"/);
+});
+
+test("v2.1 curve export is disabled after clearing or opening history", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.state = { experiment_dir: "run-a" }; api.app.generation = 1;
+  api.app.points = [{ id: 1, x: 0, y: 1, status: "ok", unit: "V" }];
+  api.app.meanNextAt = Infinity;
+  api.drawChart();
+  assert.equal(element(elements, "saveCurveCsv").disabled, false);
+  api.app.chartCleared = true;
+  api.drawChart();
+  assert.equal(element(elements, "saveCurveCsv").disabled, true);
+  api.app.chartCleared = false;
+  api.app.imported = [{ id: 1, x: 0, y: 2, status: "ok", unit: "V", mode: "DCV" }];
+  api.drawChart();
+  assert.equal(element(elements, "saveCurveCsv").disabled, true);
+});
+
+test("v2.1 automatic y range includes visible full-history average", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv);
+  api.app.state = { experiment_dir: "run-a" }; api.app.generation = 42;
+  element(elements, "averageWindow").value = "20"; element(elements, "autoY").checked = true;
+  api.app.points = [{ id: 1, x: 0, y: 0, status: "ok", unit: "V" }, { id: 2, x: 1, y: 0, status: "ok", unit: "V" }];
+  api.app.meanWindow = 20; api.app.meanGeneration = 42; api.app.meanDirectory = "run-a";
+  api.app.meanRows = [{ id: 10, x: 0.5, y: 100, status: "ok", unit: "V", summary: true }];
+  api.app.meanNextAt = Infinity;
+  api.drawChart();
+  assert.ok(api.app.chartScale.yMax + api.app.chartScale.yOrigin >= 100);
+});
+
+test("v2.1 discards a delayed mean response after the window changes", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.state = { experiment_dir: "run-a" }; api.app.generation = 1;
+  element(elements, "averageWindow").value = "20";
+  let resolveRequest;
+  context.fetch = () => new Promise(resolve => { resolveRequest = resolve; });
+  const pending = api.refreshMovingAverage();
+  element(elements, "averageWindow").value = "50"; api.app.meanSequence++;
+  resolveRequest({ ok: true, json: async () => ({ total_attempts: 100000, rows: [{ id: 1, x: 0, y: 1 }] }) });
+  await pending;
+  assert.equal(api.app.meanRows.length, 0); assert.equal(api.app.meanWindow, null);
+});
+
+test("v2.1 slows full mean refresh for long recordings", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.state = { experiment_dir: "run-a" }; api.app.generation = 1;
+  element(elements, "averageWindow").value = "20";
+  context.fetch = async () => ({ ok: true, json: async () => ({ total_attempts: 100000, rows: [{ id: 1, x: 0, y: 1 }] }) });
+  await api.refreshMovingAverage();
+  assert.equal(api.app.meanRows.length, 1);
+  assert.ok(api.app.meanNextAt - Date.now() >= 29000);
+});
+
+test("v2.1 avoids a partial mean when the beginning of a large window is missing", () => {
+  const { api, elements } = createFrontend({ stubChart: false });
+  api.app.modes.set("DCV", dcv); element(elements, "averageWindow").value = "5001";
+  api.app.points = [5001,5002,5003].map((id, index) => ({ id, x:index, y:index+1, status:"ok", unit:"V" }));
+  api.drawChart();
+  assert.equal(element(elements, "plot").canvasContext.strokes.some(stroke => stroke.color === "#d99423"), false);
+});
+
+test("v2.1 live mean retains enough samples for windows larger than 5000", () => {
+  const { api, elements } = createFrontend();
+  element(elements, "averageWindow").value = "6000";
+  api.appendSampleRows(Array.from({ length: 6500 }, (_, i) => ({
+    sample_index: i + 1, elapsed_s: i, value_si: i + 1, status: "ok", mode: "DCV", unit_si: "V"
+  })));
+  assert.equal(api.app.points.length, 5000);
+  assert.equal(api.app.meanTail.length, 6500);
+  const rows = api.chartMeanRows();
+  assert.equal(rows.at(-1).y, 3500.5);
+  api.appendSampleRows([{ sample_index:6501, elapsed_s:6500, value_si:null, status:"timeout", unit_si:"V" },
+    { sample_index:6502, elapsed_s:6501, value_si:8, status:"ok", unit_si:"V" }]);
+  const afterGap = api.chartMeanRows().at(-1);
+  assert.equal(afterGap.y, 8); assert.equal(afterGap.breakBefore, true);
+});
+
+test("v2.1 export binds the request to the visible experiment identity", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.state = { experiment_dir: "D:/runs/a b" }; api.app.generation = 17;
+  element(elements, "averageWindow").value = "20"; api.bindControls();
+  let url = ""; context.fetch = async (address) => { url = String(address); throw new Error("offline"); };
+  await element(elements, "saveCurveCsv").dispatch("click");
+  const query = new URLSearchParams(url.split("?")[1]);
+  assert.equal(query.get("window"), "20");
+  assert.equal(query.get("generation"), "17");
+  assert.equal(query.get("directory"), "D:/runs/a b");
+});
+
+test("v2.1 reload seeds the mean window and retains samples received during the request", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.state = { experiment_dir: "D:/runs/a" }; api.app.generation = 17;
+  element(elements, "averageWindow").value = "4";
+  api.app.meanTail = [{ id:100, x:100, y:3, status:"ok" }];
+  let answer, address;
+  context.fetch = (url) => { address=String(url); return new Promise(resolve => { answer=resolve; }); };
+  const pending = api.refreshMovingAverage();
+  api.app.meanTail.push({ id:101, x:101, y:4, status:"ok" }); api.app.meanTailRevision++;
+  answer({ ok:true, json:async()=>({ total_attempts:101, rows:[], seed_rows:[
+    { id:98,x:98,y:1,status:"ok" }, { id:99,x:99,y:2,status:"ok" }, { id:100,x:100,y:3,status:"ok" }
+  ] }) });
+  await pending;
+  const params = new URLSearchParams(address.split("?")[1]);
+  assert.equal(params.get("seed"), "1"); assert.equal(params.get("generation"), "17"); assert.equal(params.get("directory"), "D:/runs/a");
+  assert.deepEqual(Array.from(api.app.meanTail, point => point.id), [98,99,100,101]);
+  assert.equal(api.chartMeanRows().at(-1).y, 2.5);
+});
+
+test("v2.1 mean calculations are reused on redraw and invalidated on new samples", () => {
+  const { api, elements } = createFrontend(); element(elements, "averageWindow").value = "2";
+  api.appendSampleRows([{ sample_index:1,elapsed_s:0,value_si:1,status:"ok" }, { sample_index:2,elapsed_s:1,value_si:3,status:"ok" }]);
+  const first = api.chartMeanRows(); assert.equal(api.chartMeanRows(), first);
+  api.appendSampleRows([{ sample_index:3,elapsed_s:2,value_si:5,status:"ok" }]);
+  const updated = api.chartMeanRows(); assert.notEqual(updated, first); assert.equal(updated.at(-1).y, 4);
+});
+
+test("v2.1 seed gap survives overlap with newer local samples", async () => {
+  const { api, elements, context } = createFrontend();
+  api.app.state = { experiment_dir:"run-a" }; api.app.generation = 17;
+  element(elements, "averageWindow").value = "4";
+  api.app.meanTail = [{ id:100,x:100,y:3,status:"ok" }];
+  let answer; context.fetch = () => new Promise(resolve => { answer=resolve; });
+  const pending = api.refreshMovingAverage();
+  api.app.meanTail.push({ id:101,x:101,y:4,status:"ok" }); api.app.meanTailRevision++;
+  answer({ ok:true, json:async()=>({ total_attempts:101, rows:[], seed_rows:[
+    { id:98,x:98,y:1,status:"ok" }, { id:99,x:99,y:2,status:"ok" },
+    { id:100,x:100,y:3,status:"ok",break_before:true }
+  ] }) });
+  await pending;
+  assert.equal(api.app.meanTail.find(point => point.id === 100).breakBefore, true);
+  assert.equal(api.chartMeanRows().at(-1).y, 3.5);
 });

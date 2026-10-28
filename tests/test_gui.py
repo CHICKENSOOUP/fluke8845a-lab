@@ -316,7 +316,10 @@ def test_mode_indicator_animates_to_selected_button(qt_app, monkeypatch, tmp_pat
         window._simulation = True
         window.mode_buttons[Mode.ACV].click()
         assert window.mode_animation.state() == gui_module.QPropertyAnimation.State.Running
-        QTest.qWait(window.mode_animation.duration() + 50)
+        deadline = time.monotonic() + 2.0
+        while window.mode_animation.state() == gui_module.QPropertyAnimation.State.Running and time.monotonic() < deadline:
+            QTest.qWait(10)
+        assert window.mode_animation.state() == gui_module.QPropertyAnimation.State.Stopped
         button = window.mode_buttons[Mode.ACV]
         assert window.mode_indicator.geometry() == QRect(
             button.x() + 8, window.mode_bar.height() - 6, max(0, button.width() - 16), 3
@@ -367,7 +370,7 @@ def test_simple_workspace_mock_connect_start_stop_saves_csv(qt_app, monkeypatch,
         assert window.configuration_dialog.isVisible()
         assert window.setup_section_stack.currentIndex() == 0
         window.mock_mode_check.setChecked(True)
-        window.connect_button.click()
+        window._connect_mock()
         deadline = time.monotonic() + 5
         while (not window._connected or not window._active_settings_by_mode) and time.monotonic() < deadline:
             QTest.qWait(10)
@@ -2442,36 +2445,23 @@ def test_port_dropdown_shows_description_and_connected_badge_keeps_selected_port
         qt_app.processEvents()
 
 
-def test_connection_button_distinguishes_real_instrument_and_mock_before_connecting(
-    qt_app, monkeypatch, tmp_path
-):
+def test_connection_ui_offers_only_real_instrument(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "connection-target-config"))
     window = MainWindow()
+    calls = []
     try:
-        assert window.connect_button.text() == "连接真实仪器"
-        assert window.connect_button.property("connectionTarget") == "instrument"
-
-        window.mock_mode_check.setChecked(True)
-
-        assert window.connect_button.text() == "启动MOCK模拟仪器"
-        assert window.connect_button.property("connectionTarget") == "mock"
-        assert 'QPushButton#primaryButton[connectionTarget="mock"]' in window.styleSheet()
-        assert not window._connected
-
+        monkeypatch.setattr(window, "_connect_real", lambda: calls.append("real"))
+        monkeypatch.setattr(window, "_connect_mock", lambda: calls.append("mock"))
         window.show()
         qt_app.processEvents()
-        enabled_image = QImage(window.connect_button.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        window.connect_button.render(enabled_image)
-        sample_x = max(1, enabled_image.width() - 8)
-        sample_y = window.connect_button.height() // 2
-        assert enabled_image.pixelColor(sample_x, sample_y) == QColor("#8a5d13")
-
-        window.connect_button.setEnabled(False)
-        qt_app.processEvents()
-        disabled_image = QImage(window.connect_button.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        window.connect_button.render(disabled_image)
-        disabled_sample_x = max(1, disabled_image.width() - 8)
-        assert disabled_image.pixelColor(disabled_sample_x, sample_y) == QColor("#5c4a2e")
+        assert window.mock_mode_check.isHidden()
+        assert window.scenario_combo.isHidden()
+        assert window.mock_scenario_status.isHidden()
+        assert window.connect_button.text() == "连接真实仪器"
+        window.mock_mode_check.setChecked(True)
+        assert window.connect_button.text() == "连接真实仪器"
+        window._connect_action()
+        assert calls == ["real"]
     finally:
         window.close()
         qt_app.processEvents()

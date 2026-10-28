@@ -7,7 +7,7 @@ const ui = {
   canvas: el("plot"), overlay: el("plotOverlay"), empty: el("plotEmpty"), toast: el("toast"), logs: el("logList"), events: el("eventList"),
 };
 const app = {
-  meta: null, state: null, points: [], latestInvalidPoint: null, imported: null, generation: null, lastSample: 0, lastLog: 0,
+  meta: null, state: null, points: [], meanTail: [], latestInvalidPoint: null, imported: null, generation: null, lastSample: 0, lastLog: 0,
   chartCleared: false,
   modes: new Map(), selectedMode: "DCV", baseline: null, baselineByMode: new Map(), dcvInputImpedanceAuto: false, toastTimer: 0, pollTimer: 0, pollInFlight: false,
   portDescriptions: new Map(),
@@ -20,6 +20,8 @@ const app = {
   chartOverviewInFlight: false, chartOverviewSequence: 0, chartOverviewNextAt: 0,
   chartRangeRows: null, chartRangeView: null,
   chartRangeRequest: null, chartRangeSequence: 0,
+  meanRecentCache: null, meanCombinedCache: null, meanTailRevision: 0,
+  meanRows: [], meanWindow: null, meanGeneration: null, meanDirectory: "", meanInFlight: false, meanSequence: 0, meanNextAt: 0,
   safetyReadback: null,
   xView: null, yView: null, yOrigin: null, dragging: null, cursor: null, selectedPointIndex: null, bufferTruncated: false,
   awaitInitialSettings: false, awaitSettingsReadback: false, awaitSpeedReadback: false,
@@ -190,6 +192,9 @@ function populateModeOptions(spec) {
   html += `<label class="option-check" title="仪表自动测量内部零点并补偿偏移，可提升稳定性但会增加测量时间；不会把被测读数强制改成0。"><input id="autozero" type="checkbox" checked> 自动零点校正</label>`;
   html += `<p id="autozeroSpeedHint" class="mode-parameter-hint">启用自动零点会增加测量时间；不会把被测读数强制改成 0。</p>`;
   ui.options.innerHTML = html;
+  const rangeRow = ui.options.querySelector?.(".option-row");
+  if (rangeRow && el("mainRange")) el("mainRange").replaceChildren(rangeRow);
+  document.querySelectorAll?.("[data-mode]").forEach(button => { button.classList.toggle("active", button.dataset.mode === spec.value); });
   el("range").title = fixedRangeTooltip();
   el("autorange").addEventListener("change", () => {
     el("range").disabled = el("autorange").checked;
@@ -200,6 +205,10 @@ function populateModeOptions(spec) {
     updateCurrentRangeGuidance(app.state);
   });
   el("range").addEventListener("change", () => { clearSafetyConfirmation(); clearPreflightSummary(); renderSettingsComparison(app.state); updateCurrentRangeGuidance(app.state); });
+  for (const id of ["autorange", "range"]) el(id).addEventListener("change", async () => {
+    if (!app.state?.connected) return;
+    if (!await applySettings()) { app.awaitInitialSettings = true; syncSettingsReadback(app.state); }
+  });
   for (const id of ["nplc", "bandwidth", "analogFilter", "inputImpedanceAuto", "digitalFilter", "autozero"]) {
     const control = el(id);
     if (control) control.addEventListener("change", () => {
@@ -449,6 +458,7 @@ function renderAcquisitionFeedback(state, telemetry, activeExperiment) {
   } else {
     output.textContent = "尚未开始实验；开始后会逐点保存 CSV。READ 超时或串口通信失败会立即停止采集、保存记录并关闭连接；人工确认恢复后重新连接，并开始新实验/分段。";
   }
+  output.classList.toggle("hidden", !(scpiTimeout || readTimeout || communicationFailure || explicitConnectionFailure));
 }
 
 function axisScaleForValues(values, unit, visibleSpan = 0) {
@@ -457,7 +467,8 @@ function axisScaleForValues(values, unit, visibleSpan = 0) {
     const candidate = Math.abs(Number(value));
     if (Number.isFinite(candidate) && candidate > dataMagnitude) dataMagnitude = candidate;
   }
-  const magnitude = Number.isFinite(visibleSpan) && visibleSpan > 0 ? visibleSpan : dataMagnitude;
+  const magnitude = unit === "A" && dataMagnitude > 0 ? dataMagnitude
+    : Number.isFinite(visibleSpan) && visibleSpan > 0 ? visibleSpan : dataMagnitude;
   const baseUnit = unit === "Ohm" ? "Ω" : unit;
   if (!(magnitude > 0) || !["V", "A", "Ohm"].includes(unit)) return { factor: 1, unit: baseUnit };
   const minimumExponent = -12;
@@ -864,10 +875,10 @@ function acknowledgeUncertainCommands() {
 }
 
 const COMMAND_LABELS = {
-  connect_real: "连接仪器", connect_mock: "连接模拟器", disconnect: "断开连接",
+  connect_real: "连接仪器", disconnect: "断开连接",
   diagnose: "诊断", zero: "ZERO 校正", start: "开始采集", single: "单次测量",
   pause: "暂停采集", resume: "继续采集", stop: "停止并保存",
-  configure: "应用仪器参数", speed: "应用速度", firmware_versions: "保存面板版本", control_mode: "切换控制方式",
+  configure: "应用仪器参数", switch_mode: "切换模式", speed: "应用速度", firmware_versions: "保存面板版本", control_mode: "切换控制方式",
   event: "记录事件", open_experiment_directory: "打开实验目录", shutdown: "退出服务",
 };
 const COMMAND_PROGRESS_DETAILS = {
@@ -879,7 +890,7 @@ const COMMAND_PROGRESS_DETAILS = {
   disconnect: "正在停止串口读写并安全关闭连接；完成后连接状态会更新。",
 };
 const COMMAND_BUTTONS = {
-  connect_real: ["connectReal"], connect_mock: ["connectMock"], disconnect: ["disconnect"],
+  connect_real: ["connectReal"], disconnect: ["disconnect"],
   diagnose: ["diagnose"], zero: ["zero"], start: ["start"], single: ["single"],
   pause: ["pause"], resume: ["resume"], stop: ["stop"], configure: ["applySettings"],
   speed: ["applySpeed"], control_mode: ["applyControlMode"], event: ["markEvent"],
@@ -952,7 +963,7 @@ function serialFormDisabled(disabled) {
   const reason = disabled
     ? "串口参数已锁定；先断开当前仪器或模拟器，再修改设置并重新连接。"
     : "串口参数将在下次连接时使用。";
-  for (const id of ["port", "portList", "baudrate", "bytesize", "parity", "stopbits", "eol", "flow", "serialTimeout", "scanPorts", "connectReal", "connectMock"]) {
+  for (const id of ["port", "portList", "baudrate", "bytesize", "parity", "stopbits", "eol", "flow", "serialTimeout", "scanPorts", "connectReal"]) {
     const control = el(id);
     control.disabled = disabled;
     updateDisabledTooltip(control, disabled ? reason : "", "串口参数将在下次连接时使用。");
@@ -1074,27 +1085,16 @@ async function connectReal() {
   if (result.success) {
     serialFormDisabled(true); app.awaitInitialSettings = true; app.mockConnectPending = false;
     try { localStorage.setItem("8845a-last-real-connection", "1"); } catch (_) { /* Session-only reconnect still works. */ }
-  }
-}
-
-async function connectMock() {
-  clearSafetyConfirmation();
-  const result = await command("connect_mock", {
-    settings: settingsPayload(), scenario: el("mockScenario").value,
-  });
-  if (result.success) {
-    serialFormDisabled(true);
-    app.awaitInitialSettings = true;
-    app.mockConnectPending = true;
-    el("safetyControls").classList.add("hidden");
-    el("mockSafetyNote").classList.remove("hidden");
-    el("mockScenario").disabled = true;
+    if (el("settingsDialog").open && el("settingsDialog").dataset.view === "connection") el("settingsDialog").close();
   }
 }
 
 async function applySettings() {
+  if (!window.confirm(`${activeMode()?.label || "当前模式"}\n确认接线正确？`)) return false;
+  ui.confirm.checked = true;
   const result = await command("configure", { ...safetyPayload(), settings: settingsPayload() });
   if (result.success) app.awaitSettingsReadback = true;
+  return !!result.success;
 }
 
 async function applySpeed() {
@@ -1153,6 +1153,8 @@ function clearPreflightSummary() {
 
 async function submitAcquisition(action) {
   if (updateExperimentNameValidation() || app.startPending) return false;
+  if (!window.confirm(`${activeMode()?.label || "当前模式"}\n确认接线正确？`)) return false;
+  ui.confirm.checked = true;
   app.startPending = true;
   const summary = el("preflightSummary");
   summary.classList.remove("error");
@@ -1343,6 +1345,7 @@ function cancelChartRangeRequest(request = app.chartRangeRequest) {
 }
 
 function clearChartOverview() {
+  app.meanSequence += 1; app.meanRows = []; app.meanWindow = null; app.meanNextAt = 0;
   app.chartOverviewSequence += 1;
   app.chartOverviewInFlight = false;
   cancelChartRangeRequest();
@@ -1369,6 +1372,7 @@ function clearDisplayedPlot() {
 
   app.chartCleared = true;
   app.points = [];
+  app.meanTail = [];
   app.latestInvalidPoint = null;
   app.imported = null;
   app.importedStats = null;
@@ -1385,7 +1389,7 @@ function clearDisplayedPlot() {
   app.bufferTruncated = false;
   clearChartOverview();
   el("restoreLive").classList.add("hidden");
-  el("autoFollow").checked = true;
+  el("autoFollow").checked = false;
   const mode = activeMode();
   el("chartTitle").textContent = mode ? `${mode.label} · 随时间变化` : "测量曲线";
   el("legendName").textContent = mode ? `${mode.label} 原始读数` : "原始读数";
@@ -1573,10 +1577,13 @@ function appendSampleRows(rows) {
       range: row.range_si, timestamp: row.timestamp_local, error: row.error,
     };
     app.points.push(point);
+    app.meanTail.push(point);
     if (point.status !== "ok") app.latestInvalidPoint = point;
     app.lastSample = Math.max(app.lastSample, Number.isFinite(id) ? id : app.lastSample);
   }
   if (app.points.length > 5000) app.points.splice(0, app.points.length - 5000);
+  if (app.meanTail.length > 100000) app.meanTail.splice(0, app.meanTail.length - 100000);
+  app.meanTailRevision++;
   updateAccessiblePointTable();
 }
 
@@ -1595,6 +1602,7 @@ async function pollState() {
     if (app.generation !== null && state.generation !== app.generation) {
       app.chartCleared = false;
       app.points = [];
+      app.meanTail = [];
       app.latestInvalidPoint = null;
       app.lastSample = 0;
       app.imported = null;
@@ -1656,7 +1664,7 @@ function updateStateDisplay(state) {
   el("connectionText").textContent = state.connection_text || "串口尚未打开";
   updatePortSelectionInfo(state);
   el("connectionText").parentElement.classList.toggle("is-connected", !!state.connected);
-  const connectedPending = app.pendingCommands.has("connect_real") || app.pendingCommands.has("connect_mock");
+  const connectedPending = app.pendingCommands.has("connect_real");
   const connectionProgress = String(state.connection_progress || "");
   if (!connectedPending) {
     el("connectionProgress").textContent = connectionProgress;
@@ -1678,19 +1686,12 @@ function updateStateDisplay(state) {
   try { hasSavedRealConnection = localStorage.getItem("8845a-last-real-connection") === "1"; } catch (_) { /* Optional browser preference. */ }
   el("reconnectReal").classList.toggle("hidden", !!state.connected || !!state.simulation || !hasSavedRealConnection);
   el("connectReal").classList.toggle("hidden", !!state.connected);
-  el("connectMock").classList.toggle("hidden", !!state.connected);
-  el("mockScenarioRow").classList.toggle("hidden", !!state.connected && !state.simulation);
-  el("mockScenario").disabled = !!state.connected || app.mockConnectPending;
   const scenario = state.simulation
     ? String(state.mock_scenario?.name ?? state.mock_scenario ?? "")
     : "";
   el("scenarioSummary").textContent = scenario ? `模拟场景：${scenario}` : "";
   el("scenarioSummary").classList.toggle("hidden", !scenario);
-  el("mockScenario").title = state.connected && state.simulation
-    ? "模拟器已连接；更换场景请先断开，再重新连接。"
-    : "连接模拟器前选择场景；场景会决定生成的模拟测量变化和故障行为。";
   if (scenario) {
-    el("mockScenario").value = scenario;
     el("scenarioBadge").textContent = `模拟 · ${scenario}`;
   } else {
     el("scenarioBadge").textContent = "";
@@ -1698,7 +1699,6 @@ function updateStateDisplay(state) {
   el("scenarioBadge").classList.toggle("hidden", !scenario);
   const mockConnected = !!state.connected && !!state.simulation;
   el("safetyControls").classList.toggle("hidden", mockConnected);
-  el("mockSafetyNote").classList.toggle("hidden", !mockConnected);
   serialFormDisabled(!!state.connected);
   el("controlMode").value = state.control_mode || "disconnected";
   el("controlModeStatus").textContent = !state.connected
@@ -1810,10 +1810,8 @@ function updateStateDisplay(state) {
   const running = /采集中|测量中/.test(state.status || "");
   const paused = String(state.status || "").includes("暂停");
   const acquiring = running || paused;
-  el("newMeasurement").disabled = acquiring || app.startPending;
-  el("newMeasurement").title = acquiring
-    ? "请先停止并保存当前实验，再新建测量。"
-    : "打开实验设置并填写名称，再选单次测量或连续采集。新测量开始后曲线自动换新，旧实验 CSV 保留，无需先清空。快捷键 Ctrl+Alt+N。";
+  el("newMeasurement").disabled = app.startPending || !!app.remeasurePending;
+  el("newMeasurement").title = acquiring ? "停止并保存当前实验，再重新测量" : "重新测量";
   el("clearPlot").disabled = acquiring || app.startPending;
   el("clearPlot").title = acquiring
     ? "请先停止并保存当前实验，再清空图表。"
@@ -1858,14 +1856,16 @@ function updateStateDisplay(state) {
   el("disconnect").disabled = acquiring;
   const settingsDisabled = acquiring || !computerControl;
   el("mode").disabled = settingsDisabled;
+  document.querySelectorAll?.("[data-mode]").forEach(button => { button.disabled = settingsDisabled || !state.connected || !!app.modeSwitchPending; button.classList.toggle("active", button.dataset.mode === app.selectedMode); });
   el("autorange").disabled = settingsDisabled;
   el("range").disabled = settingsDisabled || el("autorange").checked;
   if (el("analogFilter")) el("analogFilter").disabled = settingsDisabled;
   if (el("inputImpedanceAuto")) el("inputImpedanceAuto").disabled = settingsDisabled;
   if (el("digitalFilter")) updateDigitalFilterAvailability(state);
   el("autozero").disabled = settingsDisabled;
-  if (el("nplc")) el("nplc").disabled = !computerControl;
-  if (el("bandwidth")) el("bandwidth").disabled = !computerControl;
+  if (el("nplc")) el("nplc").disabled = settingsDisabled;
+  if (el("bandwidth")) el("bandwidth").disabled = settingsDisabled;
+  el("interval").disabled = settingsDisabled;
   const active = activeMode();
   const canTune = active && (active.nplc.length || active.bandwidths.length);
   el("applySpeed").disabled = !state.connected || !computerControl || !canTune || !acquiring;
@@ -2348,41 +2348,136 @@ function updateEmptyPlotState(hasPoints = validPoints().length > 0) {
   if (app.chartCleared) {
     el("emptyTitle").textContent = "曲线已清空";
     el("emptyDetail").textContent = "重新测量：点“新建测量”填写名称并选择单次或连续采集。新测量开始后自动换图，旧实验 CSV 保留；无需先清空。";
-    el("emptyNewMeasurement").classList.remove("hidden");
-    el("emptyOpenSettings").classList.add("hidden");
-    el("emptyConnectMock").classList.add("hidden");
-    el("emptyStart").classList.add("hidden");
+    el("emptyNewMeasurement").classList.add("hidden");
+    el("emptyOpenSettings").classList.toggle("hidden", connected);
+    el("emptyStart").classList.toggle("hidden", !connected);
     return;
   }
   el("emptyNewMeasurement").classList.add("hidden");
   el("emptyOpenSettings").classList.remove("hidden");
   if (!connected) {
     el("emptyTitle").textContent = "图表还没有数据";
-    el("emptyDetail").textContent = "连接 8845A，或先连接模拟器查看采集流程。";
-    el("emptyConnectMock").classList.remove("hidden");
+    el("emptyDetail").textContent = "连接仪器后开始测量。";
     el("emptyStart").classList.add("hidden");
   } else if (localControl) {
     el("emptyTitle").textContent = "仪表处于 Local 模式";
     el("emptyDetail").textContent = "切换到 Computer 后，软件才能开始采集。";
-    el("emptyConnectMock").classList.add("hidden");
     el("emptyStart").classList.add("hidden");
   } else if (acquiring) {
     el("emptyTitle").textContent = "等待首个有效读数";
     el("emptyDetail").textContent = state.last_error
       ? `最近异常：${String(state.last_error).slice(0, 100)}`
       : "采集已开始，仪表返回读数后曲线会显示在这里。";
-    el("emptyConnectMock").classList.add("hidden");
     el("emptyStart").classList.add("hidden");
   } else {
     el("emptyTitle").textContent = "设备已连接";
     el("emptyDetail").textContent = "开始采集后，读数会沿时间轴逐点显示。";
-    el("emptyConnectMock").classList.add("hidden");
     el("emptyStart").classList.remove("hidden");
   }
 }
 
+function currentMeanWindow() {
+  return Math.max(1, Math.min(100000, Math.trunc(Number(el("averageWindow")?.value) || 1)));
+}
+
+function updateSaveCurveAvailability() {
+  const button = el("saveCurveCsv");
+  if (!button) return;
+  const unavailable = app.chartCleared || !!app.imported || app.generation === null || !(app.state?.experiment_dir || app.state?.last_experiment_dir);
+  button.disabled = unavailable;
+  button.title = app.imported ? "历史曲线暂不支持导出" : app.chartCleared ? "请先开始新的测量" : unavailable ? "暂无可保存的曲线" : "保存曲线 CSV";
+}
+
+function recentMeanRows() {
+  const sourceBuffer = !app.imported && app.meanTail.length ? app.meanTail : (app.imported || app.points);
+  const windowSize = currentMeanWindow();
+  const revision = sourceBuffer === app.meanTail ? app.meanTailRevision : 0;
+  const last = sourceBuffer.at(-1);
+  const cache = app.meanRecentCache;
+  if (cache && cache.buffer === sourceBuffer && cache.length === sourceBuffer.length && cache.last === last
+      && cache.window === windowSize && cache.revision === revision) return cache.rows;
+  const source = sourceBuffer.filter(point => point.status === "ok" && Number.isFinite(point.x) && Number.isFinite(point.y));
+  let sum = 0, start = 0, previous = null, knownStart = !source.length || Number(source[0].id) <= 1;
+  const rows = source.map((point, i) => {
+    const gap = !!(point.breakBefore || point.break_before || (previous !== null && Number(point.id) > previous + 1));
+    if (gap) { sum = 0; start = i; knownStart = true; }
+    sum += point.y;
+    if (i - start >= windowSize) { sum -= source[start].y; start++; }
+    previous = Number.isFinite(Number(point.id)) ? Number(point.id) : previous;
+    return { ...point, y: sum / (i - start + 1), breakBefore: gap, summary: false, completeMean: knownStart || i - start + 1 >= windowSize };
+  });
+  app.meanRecentCache = { buffer: sourceBuffer, length: sourceBuffer.length, last, window: windowSize, revision, rows };
+  return rows;
+}
+
+function chartMeanRows() {
+  const recent = recentMeanRows();
+  const windowSize = currentMeanWindow();
+  const directory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
+  const overview = !app.imported && app.meanWindow === windowSize && app.meanGeneration === app.generation && app.meanDirectory === directory ? app.meanRows : null;
+  const memo = app.meanCombinedCache;
+  if (memo && memo.recent === recent && memo.overview === overview) return memo.rows;
+  let rows;
+  if (!overview?.length) rows = recent.filter(point => point.completeMean);
+  else {
+    // The full overview already contains older means. Only append newer real samples.
+    const lastId = overview.at(-1).id;
+    rows = overview.concat(recent.filter(point => point.id > lastId && point.completeMean));
+  }
+  app.meanCombinedCache = { recent, overview, rows };
+  return rows;
+}
+
+function seedMeanTail(seedRows) {
+  if (!Array.isArray(seedRows) || !seedRows.length) return;
+  const byId = new Map();
+  for (const row of seedRows) {
+    const id = Number(row.id), x = Number(row.x);
+    if (!Number.isFinite(id) || !Number.isFinite(x)) continue;
+    const valid = row.status === "ok" && row.y !== null && Number.isFinite(Number(row.y));
+    byId.set(id, { id, x, y: valid ? Number(row.y) : null, status: valid ? "ok" : "error", breakBefore: !!row.break_before });
+  }
+  // Existing tail can contain samples acquired after the snapshot; retain them.
+  for (const point of app.meanTail) {
+    const seed = byId.get(point.id);
+    byId.set(point.id, seed?.breakBefore ? { ...point, breakBefore: true } : point);
+  }
+  app.meanTail = [...byId.values()].sort((a, b) => a.id - b.id).slice(-100000);
+  app.meanTailRevision++;
+}
+
+async function refreshMovingAverage() {
+  const directory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
+  if (app.chartCleared || app.imported || app.generation === null || !directory || app.meanInFlight || Date.now() < app.meanNextAt) return;
+  const generation = app.generation, windowSize = currentMeanWindow(), sequence = ++app.meanSequence;
+  const width = Math.max(1, Math.min(4096, Math.floor(ui.canvas?.getBoundingClientRect?.().width || 1200)));
+  app.meanInFlight = true;
+  const startedAt = Date.now();
+  app.meanNextAt = startedAt + 5000;
+  try {
+    const needsSeed = app.meanTail.length < windowSize && (!app.meanTail.length || Number(app.meanTail[0].id) > 1);
+    const params = new URLSearchParams({ window: String(windowSize), width: String(width), generation: String(generation), directory });
+    if (needsSeed) params.set("seed", "1");
+    const response = await fetch(`/api/chart/moving-average?${params}`, { cache: "no-store" });
+    if (!response.ok) return;
+    const result = await response.json();
+    const currentDirectory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
+    if (sequence !== app.meanSequence || generation !== app.generation || directory !== currentDirectory || windowSize !== currentMeanWindow() || app.chartCleared || app.imported) return;
+    const count = Number(result.total_attempts) || 0;
+    const baseDelay = count >= 1000000 ? 120000 : count >= 100000 ? 30000 : 5000;
+    app.meanNextAt = Date.now() + Math.max(baseDelay, (Date.now() - startedAt) * 8);
+    if (needsSeed) seedMeanTail(result.seed_rows);
+    app.meanRows = (result.rows || []).map(chartPointFromApi).filter(Boolean);
+    app.meanWindow = windowSize; app.meanGeneration = generation; app.meanDirectory = directory;
+    scheduleChartRedraw();
+  } catch (_) { /* The live cache remains available while the background request is retried. */ }
+  finally { app.meanInFlight = false; }
+}
+
 function drawChart() {
   if (!ui.canvas) return;
+  updateSaveCurveAvailability();
+  void refreshMovingAverage();
   const { context: ctx, width, height, plot } = plotContext();
   if (ui.overlay) {
     const overlay = plotContext(ui.overlay);
@@ -2417,23 +2512,38 @@ function drawChart() {
   let xMin, xMax;
   if (app.xView) {
     [xMin, xMax] = app.xView;
-    if (el("autoFollow").checked) app.xView = null;
+    if (el("autoFollow").checked) { const span = xMax - xMin; xMax = Math.max(span, maxX); xMin = Math.max(0, xMax - span); app.xView = [xMin, xMax]; }
   }
   if (!app.xView) {
     if (el("autoFollow").checked) {
-      const windowSeconds = Math.max(120, maxX - minDataX);
-      xMax = Math.max(windowSeconds / 4, maxX + Math.max(1, windowSeconds * .015));
-      xMin = Math.max(minDataX, xMax - windowSeconds);
-      if (maxX < 120) { xMin = minDataX; xMax = Math.max(30, maxX * 1.08); }
+      const windowSeconds = 120;
+      xMax = Math.max(windowSeconds, maxX);
+      xMin = Math.max(0, xMax - windowSeconds);
     } else {
-      xMin = minDataX;
-      xMax = Math.max(minDataX + 1, maxX);
+      xMin = 0;
+      xMax = Math.max(1, maxX);
     }
   }
   if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) { xMin = minDataX; xMax = Math.max(minDataX + 1, maxX + 1); }
   let dataMin = Infinity, dataMax = -Infinity;
   let rawDataMin = Infinity, rawDataMax = -Infinity;
-  for (const value of values) {
+  const meanRows = chartMeanRows();
+  // Both curves are sorted by time. Examine only the visible interval without allocating large arrays.
+  let visibleValueCount = 0;
+  function includeVisible(points) {
+    let low = 0, high = points.length;
+    while (low < high) { const middle = (low + high) >>> 1; if (points[middle].x < xMin) low = middle + 1; else high = middle; }
+    for (let i = low; i < points.length && points[i].x <= xMax; i++) {
+      const value = points[i].y, offset = value - yOrigin;
+      if (offset < dataMin) dataMin = offset;
+      if (offset > dataMax) dataMax = offset;
+      if (value < rawDataMin) rawDataMin = value;
+      if (value > rawDataMax) rawDataMax = value;
+      visibleValueCount++;
+    }
+  }
+  includeVisible(rows); includeVisible(meanRows);
+  if (!visibleValueCount) for (const value of values) {
     const offset = value - yOrigin;
     if (offset < dataMin) dataMin = offset;
     if (offset > dataMax) dataMax = offset;
@@ -2445,6 +2555,7 @@ function drawChart() {
   const padding = dataSpan === 0 ? Math.max(absoluteMagnitude * .025, 1e-9) : dataSpan * .12;
   let yMin = dataMin - padding;
   let yMax = dataMax + padding;
+  if (el("autoY")?.checked) app.yView = null;
   if (app.yView) [yMin, yMax] = app.yView;
   const unit = rows[0].unit || activeMode()?.unit || "";
   const yStep = niceStep(yMax - yMin, 5);
@@ -2536,20 +2647,6 @@ function drawChart() {
 
   ctx.save();
   ctx.beginPath(); ctx.rect(left, top, plotWidth, plotHeight); ctx.clip();
-  const baseline = app.baseline;
-  const baselineOffset = baseline - yOrigin;
-  if (Number.isFinite(baseline) && baselineOffset >= yMin && baselineOffset <= yMax) {
-    const y = yOffsetToPixel(baselineOffset);
-    ctx.strokeStyle = "#8a5d13";
-    ctx.lineWidth = 1.4;
-    ctx.setLineDash([6, 4]);
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    ctx.setLineDash([]);
-    const baselineLabel = scaledValue(baseline, unit);
-    ctx.fillStyle = "#8a5d13";
-    ctx.textAlign = "right";
-    ctx.fillText(`基准 ${baselineLabel.value} ${baselineLabel.unit}`.trim(), right - 5, y - 8);
-  }
   ctx.beginPath();
   let started = false;
   for (const point of renderRows) {
@@ -2566,25 +2663,18 @@ function drawChart() {
     ctx.lineCap = "round";
     ctx.stroke();
   }
-  const events = displayedEvents();
-  app.chartEventHits = [];
-  for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
-    const event = events[eventIndex];
-    const xValue = Number(event.elapsed_s);
-    if (xValue < xMin || xValue > xMax) continue;
-    const x = xToPixel(xValue);
-    app.chartEventHits.push({ x, index: eventIndex, event });
-    ctx.strokeStyle = COLORS.event;
-    ctx.setLineDash([3, 4]);
-    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
-    ctx.setLineDash([]);
-    if (app.selectedEventIndex === eventIndex) {
-      const label = String(event.text || "实验事件").slice(0, 80);
-      ctx.fillStyle = "#72501b";
-      ctx.textAlign = x > left + plotWidth * .7 ? "right" : "left";
-      ctx.fillText(label, x > left + plotWidth * .7 ? x - 5 : x + 5, top + 11);
-    }
+  // The server overview is calculated from complete samples; the recent tail updates between snapshots.
+  const renderedMean = downsampleForRender(meanRows, xMin, xMax, plotWidth);
+  let meanStarted = false;
+  ctx.beginPath();
+  for (const point of renderedMean) {
+    if (point.x < xMin || point.x > xMax) continue;
+    const x = xToPixel(point.x), y = yToPixel(point.y);
+    if (!meanStarted || point.breakBefore) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    meanStarted = true;
   }
+  if (meanStarted) { ctx.strokeStyle = "#d99423"; ctx.lineWidth = 1.8; ctx.stroke(); }
+  app.chartEventHits = [];
   ctx.restore();
   const source = dataPoints();
   const firstId = Number(rows[0]?.id), lastId = Number(rows.at(-1)?.id);
@@ -2884,17 +2974,7 @@ ui.canvas.addEventListener("keydown", (event) => {
     drawChart();
     return;
   }
-  if (!points.length) return;
-  if (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Home" || event.key === "End") {
-    event.preventDefault?.();
-    const current = app.selectedPointIndex === null ? 0 : app.selectedPointIndex;
-    const next = event.key === "Home" ? 0 : event.key === "End" ? points.length - 1
-      : current + (event.key === "ArrowRight" ? 1 : -1);
-    selectPointByIndex(next);
-  } else if (event.key === "Enter" && app.selectedPointIndex !== null) {
-    event.preventDefault?.();
-    setBaselineFromPoint(points[app.selectedPointIndex]);
-  }
+
 });
 
 ui.canvas.addEventListener("pointermove", (event) => {
@@ -2941,28 +3021,13 @@ ui.canvas.addEventListener("pointermove", (event) => {
     const deltaY = (y - app.dragging.y) / Math.max(1, scale.bottom - scale.top) * (app.dragging.yRange[1] - app.dragging.yRange[0]);
     app.xView = clampRangeToData([app.dragging.xRange[0] + deltaX, app.dragging.xRange[1] + deltaX], scale.dataMinX, scale.dataMaxX);
     app.yView = clampRangeToData([app.dragging.yRange[0] + deltaY, app.dragging.yRange[1] + deltaY], scale.dataMinY, scale.dataMaxY);
-    el("autoFollow").checked = false;
+    if (el("autoY")) el("autoY").checked = false;
     app.cursor = null;
     scheduleChartRedraw();
     return;
   }
-  const eventMarker = y >= app.chartScale?.top && y <= app.chartScale?.bottom ? nearestEvent(x) : null;
-  if (eventMarker) {
-    app.hoveredEventIndex = eventMarker.index;
-    app.cursor = null;
-    const eventTime = Number(eventMarker.event.elapsed_s);
-    el("pointCursor").textContent = `事件 · t=${timeLabel(eventTime)} · ${formatLocalDateTime(eventMarker.event.timestamp_local)} · ${eventMarker.event.text}`;
-    schedulePointerRedraw();
-    return;
-  }
-  app.hoveredEventIndex = null;
-  app.cursor = nearestPoint(x, y);
-  if (app.cursor?.point) {
-    const point = app.cursor.point;
-    const value = scaledValue(point.y, point.unit || "");
-    el("pointCursor").textContent = `样本 #${point.id} · ${formatLocalDateTime(point.timestamp)} · t=${timeLabel(point.x)} · ${value.value} ${value.unit} · 原始 ${point.raw || numberText(point.y, 14)}`;
-  } else el("pointCursor").textContent = "悬停在曲线上读取读数";
-  schedulePointerRedraw();
+  app.cursor = null;
+
 });
 ui.canvas.addEventListener("pointerdown", (event) => {
   if (!app.chartScale) return;
@@ -3045,7 +3110,7 @@ ui.canvas.addEventListener("wheel", (event) => {
     app.yView = zoomYRange(rebasedRange[0], rebasedRange[1], rebasedAnchor, factor, maximumYAxisZoomSpan(span));
   }
   if (zoomY && !zoomX && el("autoFollow").checked) app.xView = [scale.xMin, scale.xMax];
-  if (zoomX || zoomY) el("autoFollow").checked = false;
+  if (zoomY && el("autoY")) el("autoY").checked = false;
   scheduleChartRedraw();
 }, { passive: false });
 el("applyYAxisSpan").addEventListener("click", applyYAxisSpan);
@@ -3058,7 +3123,13 @@ el("yAxisSpan").addEventListener("keydown", (event) => {
     applyYAxisSpan();
   }
 });
-el("autoFollow").addEventListener("change", () => { if (el("autoFollow").checked) app.xView = null; drawChart(); });
+el("autoFollow").addEventListener("change", () => {
+  if (el("autoFollow").checked && app.chartScale) {
+    const scale = app.chartScale; const span = scale.xMax - scale.xMin;
+    const latest = Math.max(span, scale.dataMaxX); app.xView = [Math.max(0, latest - span), latest];
+  }
+  drawChart();
+});
 el("autoScale").addEventListener("click", () => {
   app.xView = null;
   app.yView = null;
@@ -3582,8 +3653,73 @@ function bindControls() {
     event.preventDefault?.();
     finishDuplicateNameAction("cancel");
   });
-  el("openSettings").addEventListener("click", () => el("settingsDialog").showModal());
-  el("newMeasurement").addEventListener("click", openNewMeasurementSettings);
+  const showSettings = (kind) => {
+    el("settingsDialog").dataset.view = kind;
+    el("settingsTitle").textContent = kind === "connection" ? "连接仪器" : "测量参数";
+    if (!el("settingsDialog").open) el("settingsDialog").showModal();
+  };
+  el("openConnection").addEventListener("click", () => showSettings("connection"));
+  el("openParameters").addEventListener("click", () => showSettings("parameters"));
+  el("openSettings").addEventListener("click", () => showSettings("parameters"));
+  (document.querySelectorAll?.("[data-mode]") || []).forEach(button => button.addEventListener("click", async () => {
+    const oldMode = app.selectedMode;
+    if (app.modeSwitchPending || button.dataset.mode === oldMode) return;
+    app.modeSwitchPending = true;
+    if (app.state) updateStateDisplay(app.state);
+    ui.mode.value = button.dataset.mode;
+    ui.mode.dispatchEvent(new Event("change"));
+    if (app.state?.connected) {
+      const result = await command("switch_mode", { settings: settingsPayload() });
+      const applied = !!result.success;
+      if (applied) app.awaitSettingsReadback = true;
+      if (!applied) { ui.mode.value = oldMode; ui.mode.dispatchEvent(new Event("change")); }
+    }
+    app.modeSwitchPending = false;
+    if (app.state) updateStateDisplay(app.state);
+  }));
+  el("averageWindow").addEventListener("input", () => { app.meanSequence++; app.meanRows = []; app.meanWindow = null; app.meanNextAt = 0; scheduleChartRedraw(); });
+  el("autoY").addEventListener("change", () => { if (el("autoY").checked) app.yView = null; drawChart(); });
+  el("fullView").addEventListener("click", () => { el("autoFollow").checked = false; app.xView = null; drawChart(); });
+  el("saveCurveCsv").addEventListener("click", async () => {
+    const directory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
+    if (app.chartCleared || app.imported || app.generation === null || !directory) { toast("当前曲线暂不可保存", true); return; }
+    const generation = app.generation;
+    const windowSize = currentMeanWindow();
+    try {
+      const params = new URLSearchParams({ window: String(windowSize), generation: String(generation), directory });
+      const response = await fetch(`/api/curve-export.zip?${params}`, { cache: "no-store" });
+      if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.error || `HTTP ${response.status}`); }
+      const blob = await response.blob();
+      const currentDirectory = app.state?.experiment_dir || app.state?.last_experiment_dir || "";
+      if (app.chartCleared || app.imported || generation !== app.generation || directory !== currentDirectory) { toast("曲线已切换，请重新保存", true); return; }
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a"); link.href = url; link.download = "8845A_曲线.zip"; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("已保存简版和详细版曲线 CSV");
+    } catch (error) { toast(`保存曲线失败：${error.message}`, true); }
+  });
+  el("newMeasurement").addEventListener("click", async () => {
+    if (app.remeasurePending || app.startPending) return;
+    app.remeasurePending = true;
+    const generation = app.generation;
+    if (app.state) updateStateDisplay(app.state);
+    try {
+      const status = String(app.state?.status || "");
+      if (/(采集中|测量中|暂停)/.test(status)) {
+        const result = await command("stop");
+        if (!result.success) return;
+        await pollState();
+        if (generation !== app.generation || /(采集中|测量中|暂停)/.test(String(app.state?.status || ""))) {
+          toast("停止状态尚未确认，请检查后重试", true);
+          return;
+        }
+      }
+      if (clearDisplayedPlot()) { el("experimentName").value = localExperimentName(); updateExperimentNameValidation(); }
+    } finally {
+      app.remeasurePending = false;
+      if (app.state) updateStateDisplay(app.state);
+    }
+  });
   el("emptyNewMeasurement").addEventListener("click", openNewMeasurementSettings);
   el("clearPlot").addEventListener("click", clearDisplayedPlot);
   el("singleFromSettings").addEventListener("click", () => startFromSettings("single"));
@@ -3604,8 +3740,8 @@ function bindControls() {
     section.scrollIntoView?.({ behavior: "smooth", block: "start" });
   });
   el("closeSettings").addEventListener("click", () => el("settingsDialog").close());
-  el("emptyOpenSettings").addEventListener("click", () => el("settingsDialog").showModal());
-  el("emptyConnectMock").addEventListener("click", connectMock);
+  el("emptyOpenSettings").addEventListener("click", () => showSettings("connection"));
+
   el("emptyStart").addEventListener("click", startContinuous);
   el("scanPorts").addEventListener("click", scanPorts);
   el("portList").addEventListener("change", () => {
@@ -3615,7 +3751,7 @@ function bindControls() {
   el("port").addEventListener("input", () => updatePortSelectionInfo());
   el("connectReal").addEventListener("click", connectReal);
   el("reconnectReal").addEventListener("click", connectReal);
-  el("connectMock").addEventListener("click", connectMock);
+
   el("disconnect").addEventListener("click", async () => {
     const result = await command("disconnect");
     if (result.success) {
@@ -3735,7 +3871,7 @@ function bindControls() {
     app.chartCleared = false;
     app.imported = null; app.importedStats = null; app.xView = null; app.yView = null; app.yOrigin = null;
     app.importedEvents = null; app.importedExperimentId = null; app.importedFileName = ""; app.selectedEventIndex = null;
-    el("autoFollow").checked = true;
+    el("autoFollow").checked = false;
     el("restoreLive").classList.add("hidden");
     const mode = activeMode();
     el("chartTitle").textContent = mode ? `${mode.label} · 随时间变化` : "测量曲线";
@@ -3822,6 +3958,8 @@ async function initialize() {
     restorePreferences();
     await scanPorts();
     await pollState();
+    el("autoFollow").checked = false;
+    drawChart();
     app.pollTimer = setInterval(pollState, 850);
   } catch (error) {
     setServiceStatus(false, error.message);

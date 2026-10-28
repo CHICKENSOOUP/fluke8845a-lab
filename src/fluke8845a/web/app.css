@@ -469,3 +469,83 @@ input::placeholder { color: #68736e; }
 .duplicate-dialog h2 { margin: 0 0 8px; font-size: 18px; }
 .duplicate-dialog p { margin: 0 0 18px; color: var(--muted); line-height: 1.55; }
 .duplicate-dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+
+/* Desktop-aligned measurement workspace. */
+body { color: #273136; background: #efeee6; }
+.topbar { background: #efeee6; color: #273136; border-color: #c9cec8; }
+.brand-lockup strong { color: #273136; letter-spacing: 0; font-size: 19px; }
+.brand-lockup span { color: #596762; letter-spacing: 0; }
+.topbar-right .button-header { color: #344045; background: #faf9f4; border-color: #b8c2bc; }
+.topbar-right .button-primary { min-height: 38px; padding-inline: 19px; font-size: 14px; }
+.topbar-state, #scenarioBadge, #openFiles, #openSettings, #reconnectReal, #shutdownService,
+#scenarioSummary, #readingRaw, #newMeasurementHint, .action-spacer, #experimentPath,
+.application-shortcut-help, #clearPlot, #pointCursor, #plotHelp, #viewModeStatus,
+#autoScale, #restoreLive, #resetRealtimeView, .plot-footer-tools, .accessible-data-table,
+#emptyDetail,
+#safetyControls, .firmware-grid, .manual-software-row, #idnFirmwareInfo,
+#settingsComparison, .dialog-nav, #sectionAnalysis, #sectionDiagnostics,
+#sectionSerial .field-hint, #sectionSerial .port-selection-info, #resetPreferences,
+#sectionSerial .control-mode-help, #modeFunction, #sectionMeasurement > .field-label-row,
+#sectionMeasurement > .mode-select, #modeParameterHint, #autozeroSpeedHint,
+#sectionMeasurement .field-hint, #settingsApplyHint, #singleFromSettings, #startFromSettings,
+#applySpeed, #diagnose, .section-kicker { display: none !important; }
+.workspace { padding: 12px 16px 16px; }
+.measurement-area, .measurement-area.chart-empty { height: 100%; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); gap: 10px; }
+.measurement-area.chart-empty .chart-panel { height: auto; }
+.mode-buttons { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+.mode-buttons button { min-height: 43px; border: 1px solid #bbc7c0; border-radius: 6px; background: #faf9f4; color: #344045; font-weight: 650; }
+.mode-buttons button.active { color: white; background: #167b80; border-color: #167b80; }
+.mode-buttons button:disabled { opacity: .55; cursor: not-allowed; }
+.readout-panel { min-height: 96px; }
+.action-bar { background: transparent; color: #273136; border: 0; padding: 0; }
+.action-bar .button { min-height: 37px; }
+.main-range .option-row { margin: 0; display: flex; align-items: center; gap: 6px; }
+.main-range .option-row > label { margin: 0; display: flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
+.main-range select { min-height: 36px; max-width: 120px; color: #273136; background: #faf9f4; border: 1px solid #bbc7c0; border-radius: 5px; }
+.main-range select:disabled { color: #536166; opacity: 1; }
+.average-control { display: flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
+.average-control input { width: 67px; min-height: 36px; padding: 4px; border: 1px solid #bbc7c0; border-radius: 5px; color: #273136; background: #faf9f4; }
+.legend-mean { width: 18px; height: 2px; display: inline-block; margin-left: 12px; background: #d99423; }
+#plot { cursor: grab; }
+#plot:active { cursor: grabbing; }
+.settings-dialog { width: min(680px, calc(100vw - 32px)); }
+.settings-grid { display: block; }
+.settings-scroll { padding: 15px; }
+.settings-column { display: contents; }
+.settings-dialog[data-view="connection"] #sectionMeasurement,
+.settings-dialog[data-view="connection"] #sectionExperiment,
+.settings-dialog[data-view="connection"] #applySettings,
+.settings-dialog[data-view="parameters"] #sectionSerial { display: none !important; }
+.settings-dialog[data-view="parameters"] #sectionExperiment { margin-top: 10px; }
+.settings-dialog[data-view="parameters"] #sectionExperiment > :not(.interval-row) { display: none !important; }
+.settings-dialog[data-view="parameters"] #sectionMeasurement > .section-heading { display: none; }
+.settings-dialog[data-view="connection"] #applySettings { display: none; }
+.dialog-footer { justify-content: flex-end; }
+@media (max-width: 850px) {
+  .mode-buttons { grid-template-columns: repeat(3, 1fr); }
+  .readout-panel { grid-template-columns: minmax(0, 1fr) minmax(180px, 1fr); }
+  .readout-state { display: none; }
+  .action-bar { overflow-y: auto; max-height: 110px; }
+}
+@media (max-width: 520px) {
+  .topbar { gap: 4px; padding: 0 6px; }
+  .brand-mark { display: none; }
+  .brand-lockup strong { font-size: 14px; }
+  .brand-lockup span { display: none; }
+  .topbar-right { gap: 4px; }
+  .topbar-right .button-primary { padding-inline: 8px; font-size: 12px; }
+  .connection-badge { display: none; }
+  .workspace { padding-inline: 8px; }
+  .readout-panel { display: block; padding: 8px; }
+  .readout-side { border: 0; padding: 0; }
+  .quick-metrics { gap: 8px; }
+  .quick-metrics > div { min-width: 0; }
+  .quick-metrics strong { white-space: normal; }
+  .settings-dialog { max-height: calc(100dvh - 16px); }
+  .dialog-shell { max-height: calc(100dvh - 16px); }
+}
+
+.action-bar .acquisition-feedback { max-width: 100%; color: #8d3630; }
+@media (max-width: 520px) { .topbar-right .button-primary, .action-bar .button { min-height: 44px; } }
+@media (max-width: 850px) { .mode-buttons button { min-height: 44px; } }
+@media (max-width: 850px) { .topbar-right .button-primary, .action-bar .button { min-height: 44px; } }

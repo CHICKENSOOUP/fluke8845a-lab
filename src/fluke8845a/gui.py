@@ -2726,27 +2726,21 @@ class MainWindow(QMainWindow):
         )
         self.export_snapshot_button.clicked.connect(self._export_running_snapshot)
         exp_form.addRow("运行中导出", self.export_snapshot_button)
-        self.mock_mode_check = QCheckBox("使用明确标记的 MOCK 模拟仪器")
+        self.mock_mode_check = QCheckBox(self)
+        self.mock_mode_check.hide()
         self.mock_mode_check.setObjectName("mockCheck")
         self.mock_mode_check.toggled.connect(self._update_connect_label)
-        exp_form.addRow("验证模式", self.mock_mode_check)
-        self.scenario_combo = QComboBox()
+        self.scenario_combo = QComboBox(self)
+        self.scenario_combo.hide()
         for label in ("阶跃响应与恢复", "长期漂移", "通信超时测试", "断线恢复测试"):
             self.scenario_combo.addItem(label)
         self.scenario_combo.setEnabled(False)
-        self.mock_scenario_status = QLabel("MOCK场景：未连接")
+        self.mock_scenario_status = QLabel(self)
+        self.mock_scenario_status.hide()
         self.mock_scenario_status.setObjectName("secondaryText")
         self.mock_scenario_status.setWordWrap(True)
         self.scenario_combo.currentTextChanged.connect(self._update_mock_scenario_status)
-        exp_form.addRow("Mock场景", self.scenario_combo)
-        exp_form.addRow("当前模拟场景", self.mock_scenario_status)
         experiment_layout.addWidget(experiment)
-
-        # Simulation is a connection choice; keep it next to the COM settings.
-        exp_form.removeWidget(self.mock_mode_check)
-        exp_form.removeWidget(self.scenario_combo)
-        form.addRow("模拟模式", self.mock_mode_check)
-        form.addRow("模拟场景", self.scenario_combo)
 
         self.interval_spin = QDoubleSpinBox()
         self.interval_spin.setRange(0, 86400)
@@ -3258,9 +3252,9 @@ class MainWindow(QMainWindow):
         self.plot_empty_new_measurement_button.clicked.connect(self._open_new_measurement_setup)
         self.plot_empty_new_measurement_button.hide()
         empty_layout.addWidget(self.plot_empty_new_measurement_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        self.plot_empty_connect_button = QPushButton("连接设备或模拟器…")
+        self.plot_empty_connect_button = QPushButton("连接仪器…")
         self.plot_empty_connect_button.setObjectName("plotEmptyConnectButton")
-        self.plot_empty_connect_button.setToolTip("打开通讯设置，选择真实仪器或明确标记的 MOCK 模拟器。")
+        self.plot_empty_connect_button.setToolTip("打开连接设置。")
         self.plot_empty_connect_button.clicked.connect(
             lambda _checked=False: self._navigate_workspace("communications")
         )
@@ -5695,7 +5689,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("仪器命令正在执行，请等待完成后再启动采集。", 5000)
             return
         if not self._connected:
-            self._show_error("请先连接仪器，或勾选MOCK模拟模式并点击“连接真实仪器”。")
+            self._show_error("请先连接仪器。")
             return
         if not self._simulation and not self._instrument_mode_known:
             self._show_error("未识别到仪器当前测量功能。请先逐项核对接线，再点击“应用仪器参数”明确配置一种支持模式。")
@@ -5750,8 +5744,6 @@ class MainWindow(QMainWindow):
                         self.preflight_status.setText("已取消启动；旧实验数据未修改。")
                         return
             interval = None if self.interval_spin.value() == 0 else self.interval_spin.value()
-            if self.mock_mode_check.isChecked() and not self._simulation:
-                raise ValueError("MOCK模式未连接。请先点击“连接真实仪器”以通过MOCK后端连接；UI会明确显示模拟状态。")
             self._persist_current_settings()
             self._locked_interval_s = self.interval_spin.value()
             self._start_pending = True
@@ -5839,12 +5831,12 @@ class MainWindow(QMainWindow):
         self._bridge.connect_mock.emit(settings, self._scenario())
 
     def _update_connect_label(self, mock: bool) -> None:
-        self.connect_button.setText("启动MOCK模拟仪器" if mock else "连接真实仪器")
-        self.connect_button.setProperty("connectionTarget", "mock" if mock else "instrument")
+        self.connect_button.setText("连接真实仪器")
+        self.connect_button.setProperty("connectionTarget", "instrument")
         self.connect_button.style().unpolish(self.connect_button)
         self.connect_button.style().polish(self.connect_button)
         self.scenario_combo.setEnabled(bool(mock) and not self._connected)
-        self.mock_scenario_status.setVisible(bool(mock) or self._simulation)
+        self.mock_scenario_status.hide()
         self._update_mock_scenario_status()
 
     def _update_mock_scenario_status(self, *_args) -> None:
@@ -5869,10 +5861,7 @@ class MainWindow(QMainWindow):
         self.mock_scenario_header.hide()
 
     def _connect_action(self) -> None:
-        if self.mock_mode_check.isChecked():
-            self._connect_mock()
-        else:
-            self._connect_real()
+        self._connect_real()
 
     def _pause_or_resume(self) -> None:
         if self._paused:
@@ -6004,7 +5993,7 @@ class MainWindow(QMainWindow):
             "ZERO正在执行，等待仪器结果。" if self._zero_pending else
             "采集中不能更改此参数。" if self._acquiring or self._start_pending else
             "Local 模式下不发送设置命令；切换到 Computer 后可操作。" if self._connected and not computer_control else
-            "请先连接仪器或模拟器。" if not self._connected else ""
+            "请先连接仪器。" if not self._connected else ""
         )
         if self._connected and not computer_control and (self._acquiring or self._start_pending):
             reason += "\nLocal 模式下不发送设置命令；切换到 Computer 后可操作。"
@@ -6131,7 +6120,7 @@ class MainWindow(QMainWindow):
         )
         mock_selected = bool(self.mock_mode_check.isChecked() or self._simulation)
         self.scenario_combo.setEnabled(mock_selected and not self._connected)
-        self.mock_scenario_status.setVisible(mock_selected)
+        self.mock_scenario_status.hide()
         self._update_mock_scenario_status()
         self.set_control_mode_button.setEnabled(
             self._connected and not self._simulation and command_ready and not self._control_mode_switch_pending
@@ -6139,7 +6128,7 @@ class MainWindow(QMainWindow):
         self.mode_combo.setToolTip(reason)
         self.autorange_check.setToolTip(reason or self.autorange_check.toolTip())
         range_lock_reason = reason
-        if not self._connected and reason == "请先连接仪器或模拟器。":
+        if not self._connected and reason == "请先连接仪器。":
             range_lock_reason = ""
         range_tooltip_parts = [range_lock_reason]
         if self.autorange_check.isChecked():

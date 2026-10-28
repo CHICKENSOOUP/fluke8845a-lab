@@ -1244,8 +1244,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fluke 8845A 科研测量与长期记录")
     backend = parser.add_mutually_exclusive_group()
-    backend.add_argument("--mock", action="store_true", help="启动并连接明确标记的模拟仪器")
-    backend.add_argument("--mock-e2e", action="store_true", help="后台逐模式验证Mock GUI采集及文件保存")
+    backend.add_argument("--mock-e2e", action="store_true", help=argparse.SUPPRESS)
     backend.add_argument("--probe-real", action="store_true", help="真实仪器RES2安全连接及单点诊断；不显示GUI")
     backend.add_argument("--probe-real-gui", action="store_true", help="隐藏GUI验证RES2连续采集和CSV记录")
     backend.add_argument("--probe-real-gui-visible", action="store_true", help="显示GUI验证RES2曲线刷新；保存窗口截图")
@@ -1547,9 +1546,6 @@ def main(argv: list[str] | None = None) -> int:
     if not app_icon.isNull():
         window.setWindowIcon(app_icon)
     window.show()
-    if args.mock:
-        window.mock_mode_check.setChecked(True)
-        window._connect_mock()
     if args.smoke:
         QTimer.singleShot(700, window.close)
     return app.exec()

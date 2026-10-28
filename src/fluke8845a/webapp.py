@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import math
 import mimetypes
+import os
 import re
 import signal
 import sys
 import tempfile
 import threading
 import webbrowser
+import zipfile
+from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,16 +25,18 @@ from urllib.parse import parse_qs, quote, urlsplit
 from PySide6.QtCore import QCoreApplication, QStandardPaths
 
 from . import __version__
+from .curve_export import MAX_AVERAGE_WINDOW, write_curve_csv
 from .filter_policy import DIGITAL_FILTER_INFO
 from .modes import DESCRIPTORS
 from .path_security import resolve_safe_child_file
 from .share_export import export_share_package
 from .storage import (
+    _LimitedBinaryReader,
     complete_csv_prefix_size,
     write_excel_safe_events_csv,
     write_excel_safe_measurements_csv,
 )
-from .webservice import WebRuntime
+from .webservice import WebRuntime, _ChartOverview, _downsample_chart_points
 
 _WEB_ROOT = Path(__file__).with_name("web")
 _MAX_COMMAND_BYTES = 32 * 1024
@@ -54,6 +61,7 @@ class LocalWebServer(ThreadingHTTPServer):
 
     def __init__(self, address, handler, runtime: WebRuntime):
         self.runtime = runtime
+        self.average_history_lock = threading.Lock()
         super().__init__(address, handler)
 
 
@@ -68,6 +76,10 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         stream = getattr(sys, "stderr", None)
         if stream is None:
             return
+        request_line = getattr(self, "requestline", "")
+        if args and args[0] == request_line:
+            safe_line = re.sub(r"\?[^ ]*(?= HTTP/)", "", request_line)
+            args = (safe_line, *args[1:])
         try:
             print(
                 f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
@@ -203,6 +215,9 @@ class LocalWebHandler(BaseHTTPRequestHandler):
             status, payload = self.server.runtime.chart_history.overview(query.get("width", [1200])[0])
             self._send_json(status, payload)
             return
+        if parsed.path == "/api/chart/moving-average":
+            self._send_average_history(parse_qs(parsed.query, keep_blank_values=True))
+            return
         if parsed.path == "/api/chart/range/cancel":
             query = parse_qs(parsed.query)
             status, payload = self.server.runtime.chart_history.cancel_range(query.get("request_id", [""])[0])
@@ -231,6 +246,9 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/latest.csv":
             self._send_latest_csv()
             return
+        if parsed.path == "/api/curve-export.zip":
+            self._send_curve_export(parse_qs(parsed.query, keep_blank_values=True))
+            return
         if parsed.path == "/api/latest-events-safe.csv":
             self._send_latest_events_safe_csv()
             return
@@ -258,6 +276,180 @@ class LocalWebHandler(BaseHTTPRequestHandler):
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         charset = "; charset=utf-8" if mime.startswith(("text/", "application/javascript")) else ""
         self._send_bytes(200, body, mime + charset)
+
+    def _send_average_history(self, query: dict) -> None:
+        def bounded_integer(key: str, default: str, maximum: int) -> int:
+            values = query.get(key, [default])
+            if len(values) != 1 or not re.fullmatch(r"[0-9]{1,6}", values[0]):
+                raise ValueError
+            value = int(values[0])
+            if not 1 <= value <= maximum:
+                raise ValueError
+            return value
+
+        try:
+            window = bounded_integer("window", "1", MAX_AVERAGE_WINDOW)
+            width = bounded_integer("width", "1200", 4096)
+        except ValueError:
+            self._send_json(400, {"error": "平均点数或图表宽度无效"})
+            return
+        generations = query.get("generation", [])
+        directories = query.get("directory", [])
+        seed = query.get("seed", ["0"])
+        if (len(generations) != 1 or not re.fullmatch(r"[0-9]{1,20}", generations[0])
+                or len(directories) != 1 or not directories[0]
+                or len(seed) != 1 or seed[0] not in ("0", "1")):
+            self._send_json(400, {"error": "缺少实验身份或参数无效"})
+            return
+        state = self.server.runtime.store.snapshot()
+        directory = state.get("experiment_dir") or state.get("last_experiment_dir", "")
+        if int(generations[0]) != state.get("generation") or directories[0] != directory:
+            self._send_json(409, {"error": "实验已切换，请刷新后重试"})
+            return
+        path = resolve_safe_child_file(directory, "measurements.csv") if directory else None
+        if path is None:
+            self._send_json(404, {"error": "实验 CSV 不可读取"})
+            return
+        if not self.server.average_history_lock.acquire(blocking=False):
+            self._send_json(429, {"error": "正在计算平均曲线"})
+            return
+        try:
+            initial = path.stat()
+            prefix_size = complete_csv_prefix_size(path)
+            if prefix_size <= 0:
+                raise ValueError("CSV 没有完整表头")
+            overview = _ChartOverview()
+            previous_id = None
+            average_previous_id = None
+            pending_break = False
+            recent = deque()
+            seed_rows = deque(maxlen=window) if seed[0] == "1" else None
+            total = 0.0
+            count = 0
+            with path.open("rb") as raw:
+                opened = os.fstat(raw.fileno())
+                if ((opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino)
+                        or opened.st_size < prefix_size):
+                    raise OSError("原始测量 CSV 在计算时被替换或截断")
+                with io.TextIOWrapper(io.BufferedReader(_LimitedBinaryReader(raw, prefix_size)), encoding="utf-8-sig", newline="") as stream:
+                    reader = csv.DictReader(stream, strict=True)
+                    fields = reader.fieldnames
+                    required = {"sample_index", "elapsed_s", "value_si", "status"}
+                    if not fields or len(set(fields)) != len(fields) or not required.issubset(fields):
+                        raise ValueError("原始测量 CSV 表头无效")
+                    for row in reader:
+                        if None in row or any(value is None for value in row.values()):
+                            raise ValueError("原始测量 CSV 行无效")
+                        try:
+                            seed_id = int(row["sample_index"])
+                        except (TypeError, ValueError, OverflowError):
+                            seed_id = None
+                        try:
+                            sample_id = int(row["sample_index"])
+                            value = float(row["value_si"])
+                            elapsed = float(row["elapsed_s"])
+                            valid = row["status"] == "ok" and math.isfinite(value) and math.isfinite(elapsed)
+                        except (TypeError, ValueError, OverflowError):
+                            sample_id = None
+                            valid = False
+                        if not valid or (average_previous_id is not None and sample_id != average_previous_id + 1):
+                            recent.clear()
+                            total = 0.0
+                        source_value = value if valid else None
+                        source_elapsed = elapsed if valid else None
+                        if valid:
+                            recent.append(value)
+                            total += value
+                            if len(recent) > window:
+                                total -= recent.popleft()
+                            mean = total / len(recent)
+                            if not math.isfinite(mean):
+                                raise ValueError("移动平均超出数值范围")
+                            row["value_si"] = repr(mean)
+                        else:
+                            row["status"] = "error"
+                            row["value_si"] = ""
+                        previous_id, pending_break, point = overview.add_attempt(row, previous_id, pending_break)
+                        if seed_rows is not None:
+                            seed_rows.append({"id": seed_id, "x": source_elapsed, "y": source_value,
+                                              "status": "ok" if valid else "error",
+                                              "break_before": bool(point["break_before"]) if point else True})
+                        average_previous_id = sample_id
+                        count += 1
+                    if os.fstat(raw.fileno()).st_size < prefix_size:
+                        raise OSError("原始测量 CSV 在计算时被截断")
+            rows = _downsample_chart_points(overview.points(), overview.first_x, overview.last_x, width)
+            current = self.server.runtime.store.snapshot()
+            current_directory = current.get("experiment_dir") or current.get("last_experiment_dir", "")
+            if current.get("generation") != int(generations[0]) or current_directory != directory:
+                self._send_json(409, {"error": "实验已切换，请刷新后重试"})
+                return
+            response = {"rows": rows, "window": window, "total_attempts": count}
+            if seed_rows is not None:
+                response["seed_rows"] = list(seed_rows)
+            self._send_json(200, response)
+        except (OSError, ValueError, csv.Error):
+            self._send_json(500, {"error": "平均曲线计算失败"})
+        finally:
+            self.server.average_history_lock.release()
+
+    def _send_curve_export(self, query: dict) -> None:
+        raw_window = query.get("window", ["1"])
+        if len(raw_window) != 1 or not re.fullmatch(r"[0-9]{1,6}", raw_window[0]):
+            self._send_json(400, {"error": "平均点数无效"})
+            return
+        window = int(raw_window[0])
+        if not 1 <= window <= MAX_AVERAGE_WINDOW:
+            self._send_json(400, {"error": "平均点数无效"})
+            return
+        generations = query.get("generation", [])
+        directories = query.get("directory", [])
+        if (len(generations) != 1 or not re.fullmatch(r"[0-9]{1,20}", generations[0])
+                or len(directories) != 1 or not directories[0]):
+            self._send_json(400, {"error": "缺少实验身份"})
+            return
+        state = self.server.runtime.store.snapshot()
+        active = bool(state.get("experiment_dir"))
+        directory = state.get("experiment_dir") or state.get("last_experiment_dir", "")
+        if int(generations[0]) != state.get("generation") or directories[0] != directory:
+            self._send_json(409, {"error": "实验已切换，请刷新后重新保存"})
+            return
+        path = resolve_safe_child_file(directory, "measurements.csv") if directory else None
+        if path is None:
+            self._send_json(404, {"error": "实验 CSV 不可读取"})
+            return
+        headers_sent = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="fluke8845a-curve-") as temporary_directory:
+                root = Path(temporary_directory)
+                simple = root / "curve.csv"
+                write_curve_csv(path, simple, window)
+                archive = root / "curve.zip"
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
+                    zipped.write(simple, "curve.csv")
+                    zipped.write(root / "curve_detailed.csv", "curve_detailed.csv")
+                current = self.server.runtime.store.snapshot()
+                current_directory = current.get("experiment_dir") or current.get("last_experiment_dir", "")
+                if current.get("generation") != int(generations[0]) or current_directory != directory:
+                    self._send_json(409, {"error": "实验已切换，请刷新后重新保存"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(archive.stat().st_size))
+                self.send_header("Content-Disposition", 'attachment; filename="curve.zip"')
+                self.send_header("X-8845A-Export-State", "in-progress-snapshot" if active else "saved")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                headers_sent = True
+                with archive.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        self.wfile.write(chunk)
+        except (OSError, ValueError, csv.Error):
+            if headers_sent:
+                self.close_connection = True
+            else:
+                self._send_json(500, {"error": "曲线导出失败"})
 
     def _send_latest_csv(self) -> None:
         state = self.server.runtime.store.snapshot()
