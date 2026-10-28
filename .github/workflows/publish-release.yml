@@ -3,8 +3,6 @@ name: Publish source packages
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
       - "v*"
 
@@ -146,11 +144,8 @@ jobs:
 
           ---
 
-          Automated source-only package for commit $sha.
-
+          Source commit: $sha.
           Assets: Fluke8845A_Source_Project.zip and SHA256SUMS.txt.
-          Automated software checks run within the workflow job limits. This release does not claim validation on a real Fluke 8845A.
-          A Windows binary is omitted while the documented Qt/PySide licensing review remains open.
           "@
 
           $viewOutput = & gh release view $tag --repo $repo --json tagName,isDraft,isPrerelease,assets 2>&1

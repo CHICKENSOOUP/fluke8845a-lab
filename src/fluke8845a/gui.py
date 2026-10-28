@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import bisect
 import csv
 import heapq
@@ -20,7 +22,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent, QObject, QRunnable, QSignalBlocker, QStandardPaths, Qt, QThread, QThreadPool, QTimer,
-    Signal, Slot, QPointF, QRectF, QUrl,
+    Signal, Slot, QPointF, QRect, QRectF, QUrl, QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QKeySequence, QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (
@@ -47,6 +49,9 @@ from .modes import (
     mode_transition_requires_wiring_confirmation, range_label,
 )
 from .mock import MockScenario
+from .moving_average import MovingAverageTrace
+from .curve_export_task import CurveExportTask
+from .curve_export import detailed_curve_path
 from .plot_history import downsample_plot_data
 from .scpi import (
     FlowControl, InstrumentIdentityError, ModeSettings, SerialSettings,
@@ -219,7 +224,7 @@ def _mode_plot_y_view_limits(
 
 
 def _engineering_axis_scale(span: float, unit_si: str) -> tuple[float, str]:
-    """Choose an engineering unit from the visible span, not the raw baseline."""
+    """Choose an engineering unit for a visible absolute magnitude."""
     base_unit = "Ω" if unit_si == "Ohm" else unit_si
     if not math.isfinite(span) or span <= 0 or unit_si not in {"V", "A", "Ohm"}:
         return 1.0, base_unit
@@ -315,6 +320,7 @@ class _MeasurementViewBox(pg.ViewBox):
     """Wheel zoom: both axes by default, Shift=X, Ctrl=Y; Alt has no special mapping."""
 
     userZoomed = Signal(bool, bool)
+    dragFinished = Signal()
     rebaseRequested = Signal(float, object)
     yZoomLimitReached = Signal(float)
 
@@ -327,6 +333,22 @@ class _MeasurementViewBox(pg.ViewBox):
         self.y_anchor_provider = None
         self._last_zoom_rebase_changed = False
         self._last_zoom_rebase_delta = 0.0
+        self.drag_in_progress = False
+        self._drag_start_y_range = None
+
+    def mouseDragEvent(self, event, axis=None) -> None:
+        if event.isStart():
+            self.drag_in_progress = True
+            self._drag_start_y_range = tuple(self.viewRange()[1])
+        try:
+            super().mouseDragEvent(event, axis=axis)
+        finally:
+            if event.isFinish():
+                self.drag_in_progress = False
+                y_changed = self._drag_start_y_range is not None and tuple(self.viewRange()[1]) != self._drag_start_y_range
+                self._drag_start_y_range = None
+                self._last_drag_y_changed = y_changed
+                self.dragFinished.emit()
 
     def set_pan_x_data_bounds(self, bounds: tuple[float, float] | None) -> None:
         if bounds is None:
@@ -452,7 +474,7 @@ class _MeasurementViewBox(pg.ViewBox):
             # auto-range after scaling can execute that pending update and erase
             # the very zoom this event just requested.
             self.enableAutoRange(y=False)
-        factor = math.exp(-float(delta) / 120.0 * 0.9)
+        factor = math.exp(-float(delta) / 120.0 * 0.18)
         scene_position = event.scenePos()
         center = self.mapSceneToView(scene_position)
         scene_bounds = self.sceneBoundingRect()
@@ -530,8 +552,8 @@ class _MeasurementViewBox(pg.ViewBox):
                 and current_span <= precision_floor * 16
             ):
                 self.yZoomLimitReached.emit(float(current_span))
-        self.sigRangeChangedManually.emit([zoom_x, zoom_y])
         self.userZoomed.emit(zoom_x, zoom_y)
+        self.sigRangeChangedManually.emit([zoom_x, zoom_y])
         event.accept()
 
 
@@ -539,7 +561,9 @@ class _MeasurementPlotWidget(pg.PlotWidget):
     """Plot widget with predictable keyboard focus and chart shortcuts."""
 
     def __init__(self, *, view_box: _MeasurementViewBox, parent=None) -> None:
-        super().__init__(parent=parent, viewBox=view_box, axisItems={"left": _OffsetValueAxis("left")})
+        super().__init__(parent=parent, viewBox=view_box, axisItems={
+            "left": _OffsetValueAxis("left"), "bottom": _OffsetValueAxis("bottom"),
+        })
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.key_handler = None
 
@@ -1259,6 +1283,7 @@ class WorkerBridge(QObject):
     set_control_mode = Signal(str)
     set_firmware_versions = Signal(str, str)
     configure = Signal(object, object)
+    configure_unconfirmed_mode = Signal(object)
     start_experiment = Signal(object, str, str, object, bool, str, str, object)
     set_sampling_interval = Signal(object)
     set_measurement_speed = Signal(object)
@@ -1307,6 +1332,7 @@ class MainWindow(QMainWindow):
         firmware_profiles = self._profiles.get("instrument_firmware_by_serial", {})
         self._firmware_profiles = firmware_profiles if isinstance(firmware_profiles, dict) else {}
         self._current_mode = Mode.DCV
+        self._plot_data_mode: Mode | None = None
         self._connected = False
         self._control_mode = "disconnected"
         self._control_mode_switch_pending = False
@@ -1328,10 +1354,14 @@ class MainWindow(QMainWindow):
         self._configure_pending = False
         self._zero_pending = False
         self._start_pending = False
+        self._locked_interval_s: float | None = None
+        self._finalization_pending = False
+        self._initial_connection_prompt_shown = False
         self._connection_pending = False
         self._connection_stage_status: dict[str, tuple[str, str]] = {}
         self._last_run_single = False
         self._user_stop_pending = False
+        self._reset_plot_after_save = False
         self._new_measurement_after_save = False
         self._new_measurement_stop_finished = False
         self._new_measurement_save_succeeded = False
@@ -1349,6 +1379,18 @@ class MainWindow(QMainWindow):
         self._baseline: float | None = None
         self._plot_x: deque[float] = deque()
         self._plot_y: deque[float] = deque()
+        self._average_trace = MovingAverageTrace(capacity=MAX_PLOT_POINTS)
+        self._average_last_refresh = 0.0
+        self._last_plot_frame_refresh = 0.0
+        self._plot_frame_timer = QTimer(self)
+        self._plot_frame_timer.setSingleShot(True)
+        self._plot_frame_timer.timeout.connect(self._refresh_live_plot_now)
+        self._y_axis_fit_timer = QTimer(self)
+        self._y_axis_fit_timer.setSingleShot(True)
+        self._y_axis_fit_timer.timeout.connect(lambda: self._update_chart_auto_ranges(update_x=False))
+        self._average_refresh_timer = QTimer(self)
+        self._average_refresh_timer.setSingleShot(True)
+        self._average_refresh_timer.timeout.connect(self._refresh_average_now)
         self._plot_y_anchor_x = np.asarray([], dtype=float)
         self._plot_y_anchor_values = np.asarray([], dtype=float)
         self._plot_y_origin: float | None = None
@@ -1371,6 +1413,7 @@ class MainWindow(QMainWindow):
         self._history_load_task: _HistoryLoadTask | None = None
         self._log_entries: deque[tuple[str, str]] = deque(maxlen=6000)
         self._experiment_csv_path: Path | None = None
+        self._curve_export_task: CurveExportTask | None = None
         self._snapshot_pending = False
         self._snapshot_task: _CsvSnapshotTask | None = None
         self._safe_events_export_task: _SafeEventsExportTask | None = None
@@ -1439,6 +1482,7 @@ class MainWindow(QMainWindow):
         self._bridge.set_control_mode.connect(self._worker.set_control_mode)
         self._bridge.set_firmware_versions.connect(self._worker.set_firmware_versions)
         self._bridge.configure.connect(self._worker.configure_mode)
+        self._bridge.configure_unconfirmed_mode.connect(self._worker.configure_mode_without_wiring_confirmation)
         self._bridge.start_experiment.connect(self._worker.start_experiment)
         self._bridge.set_sampling_interval.connect(self._worker.set_target_interval)
         self._bridge.set_measurement_speed.connect(self._worker.set_measurement_speed)
@@ -1525,6 +1569,16 @@ class MainWindow(QMainWindow):
         self.connection_badge.setObjectName("connectionBadge")
         self.connection_badge.setMinimumHeight(32)
         header_layout.addWidget(self.connection_badge)
+        self.connection_action_button = QPushButton("连接仪器")
+        self.connection_action_button.setObjectName("connectionActionButton")
+        self.connection_action_button.setMinimumHeight(38)
+        self.connection_action_button.clicked.connect(self._show_connection_settings)
+        header_layout.addWidget(self.connection_action_button)
+        self.measurement_settings_button = QPushButton("测量参数")
+        self.measurement_settings_button.setObjectName("measurementSettingsButton")
+        self.measurement_settings_button.setMinimumHeight(38)
+        self.measurement_settings_button.clicked.connect(self._show_measurement_settings)
+        header_layout.addWidget(self.measurement_settings_button)
         self.mock_scenario_header = QLabel()
         self.mock_scenario_header.setObjectName("mockScenarioBanner")
         self.mock_scenario_header.setWordWrap(True)
@@ -1539,6 +1593,58 @@ class MainWindow(QMainWindow):
 
         setup_panel = self._build_setup_panel()
         chart_panel = self._build_chart_panel()
+        self.mode_bar = QFrame()
+        self.mode_bar.setObjectName("modeBar")
+        mode_layout = QHBoxLayout(self.mode_bar)
+        mode_layout.setContentsMargins(8, 6, 8, 10)
+        mode_layout.setSpacing(6)
+        self.mode_buttons: dict[Mode, QPushButton] = {}
+        self.mode_button_group = QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+        for mode, text in (
+            (Mode.DCV, "直流电压"), (Mode.ACV, "交流电压"),
+            (Mode.DCI, "直流电流"), (Mode.ACI, "交流电流"),
+            (Mode.RES2, "两线电阻"), (Mode.RES4, "四线电阻"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName("modeButton")
+            button.setCheckable(True)
+            button.setMinimumHeight(42)
+            button.setAccessibleName(f"{text} {mode.value}")
+            button.setToolTip(descriptor(mode).safety)
+            button.clicked.connect(lambda _checked=False, selected=mode: self._select_mode_button(selected))
+            self.mode_button_group.addButton(button)
+            self.mode_buttons[mode] = button
+            mode_layout.addWidget(button, 1)
+        self.mode_indicator = QFrame(self.mode_bar)
+        self.mode_indicator.setObjectName("modeIndicator")
+        self.mode_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.mode_indicator.raise_()
+        self.mode_animation = QPropertyAnimation(self.mode_indicator, b"geometry", self)
+        self.mode_animation.setDuration(180)
+        self.mode_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.mode_bar.installEventFilter(self)
+        self.mode_combo.currentIndexChanged.connect(self._sync_mode_buttons)
+        self._sync_mode_buttons(animate=False)
+        root_layout.addWidget(self.mode_bar)
+        range_label_widget = QLabel("量程")
+        range_label_widget.setStyleSheet("color: #e5f0ed; font-weight: 600;")
+        self.main_range_combo = QComboBox()
+        self.main_range_combo.setMinimumWidth(130)
+        self.main_range_combo.setStyleSheet(
+            "QComboBox { color: #1d2c2a; background: #fffefa; } "
+            "QComboBox:disabled { color: #26352e; background: #e7ebe8; } "
+            "QComboBox QAbstractItemView { color: #1d2c2a; background: #fffefa; }"
+        )
+        self.main_range_combo.currentIndexChanged.connect(self._main_range_changed)
+        self.main_range_combo.activated.connect(self._main_range_activated)
+        average_position = self._action_layout.indexOf(self.average_window_spin) - 1
+        self._action_layout.insertWidget(average_position, range_label_widget)
+        self._action_layout.insertWidget(average_position + 1, self.main_range_combo)
+        self._pending_wiring_target = None
+        self._pending_wiring_retry = None
+        self._approved_wiring_target = None
+        self._confirmed_range_target = None
         root_layout.addWidget(chart_panel, 1)
 
         self.configuration_dialog = QDialog(self)
@@ -1550,7 +1656,8 @@ class MainWindow(QMainWindow):
         dialog_layout.setContentsMargins(16, 12, 16, 14)
         dialog_layout.setSpacing(10)
         dialog_heading = QHBoxLayout()
-        dialog_title = QLabel("仪器与实验设置")
+        dialog_title = QLabel("连接仪器")
+        self.configuration_title = dialog_title
         dialog_title.setObjectName("dialogTitle")
         dialog_heading.addWidget(dialog_title)
         self.configuration_nav_group = QButtonGroup(self)
@@ -1576,6 +1683,7 @@ class MainWindow(QMainWindow):
             )
             self.configuration_nav_buttons[key] = button
             dialog_heading.addWidget(button)
+            button.hide()
         dialog_heading.addStretch(1)
         close_settings = QPushButton("完成")
         close_settings.setObjectName("secondaryButton")
@@ -1745,6 +1853,53 @@ class MainWindow(QMainWindow):
         self._build_log_dock()
         self._build_menus()
         self.log_dock.toggleViewAction().setText("显示通信日志面板")
+        self.navigation_toolbar.hide()
+        self.menuBar().hide()
+        self.measurement_action_bar.hide()
+        self._shortcut_actions["newMeasurementShortcutAction"].setEnabled(False)
+        self._shortcut_actions["eventShortcutAction"].setEnabled(False)
+
+    def _show_connection_settings(self) -> None:
+        if (self._acquiring or self._start_pending or self._experiment_active
+                or self._finalization_pending or self._configure_pending
+                or self._connection_pending or self._shutdown_started):
+            return
+        self.configuration_title.setText("连接仪器")
+        self.configuration_dialog.setWindowTitle("连接仪器")
+        self._select_configuration_section("communications")
+        self._show_configuration()
+
+    def _show_measurement_settings(self) -> None:
+        if (self._acquiring or self._start_pending or self._experiment_active
+                or self._finalization_pending or self._configure_pending):
+            return
+        self.configuration_title.setText("测量参数")
+        self.configuration_dialog.setWindowTitle("测量参数")
+        self._select_configuration_section("measurement")
+        self._show_configuration()
+
+    def _select_mode_button(self, mode: Mode) -> None:
+        if self._pending_wiring_retry is not None:
+            self._cancel_wiring_confirmation()
+        if not self.mode_combo.isEnabled() or self._experiment_active or self._finalization_pending:
+            self._sync_mode_buttons()
+            return
+        self._set_combo_data(self.mode_combo, mode.value)
+        self._sync_mode_buttons()
+
+    def _sync_mode_buttons(self, *_args, animate: bool = True) -> None:
+        if not hasattr(self, "mode_buttons"):
+            return
+        button = self.mode_buttons[self._current_mode]
+        button.setChecked(True)
+        target = QRect(button.x() + 8, self.mode_bar.height() - 6, max(0, button.width() - 16), 3)
+        if animate and self.mode_bar.isVisible() and self.mode_indicator.width() > 0:
+            self.mode_animation.stop()
+            self.mode_animation.setStartValue(self.mode_indicator.geometry())
+            self.mode_animation.setEndValue(target)
+            self.mode_animation.start()
+        else:
+            self.mode_indicator.setGeometry(target)
 
     def _record_file_export_result(self, label: str, destination: str | Path) -> None:
         path_text = str(destination)
@@ -1829,6 +1984,30 @@ class MainWindow(QMainWindow):
                 self.configuration_dialog.show()
                 self.configuration_dialog.raise_()
                 self.configuration_dialog.activateWindow()
+
+    def _reset_measurement(self) -> None:
+        if self._history_load_pending or self._start_pending or self._finalization_pending:
+            self.statusBar().showMessage("请等待当前操作完成。", 5000)
+            return
+        if self._acquiring:
+            self._reset_plot_after_save = True
+            self._stop()
+            self._update_controls()
+            self.statusBar().showMessage("正在停止并保存…")
+            return
+        if self._experiment_active:
+            self.statusBar().showMessage("正在保存，请稍候。", 5000)
+            return
+        self._reset_measurement_plot()
+
+    def _reset_measurement_plot(self) -> None:
+        self._clear_plot()
+        self.plot_empty_title.setText("准备测量")
+        self.plot_empty_hint.hide()
+        self.plot_empty_new_measurement_button.hide()
+        self._update_plot_data_limits()
+        self.statusBar().showMessage("曲线已清空，原始数据已保留。", 5000)
+        self._update_controls()
 
     def _clear_plot_from_ui(self) -> None:
         """Clear only the current in-memory chart; saved experiment files are untouched."""
@@ -2068,6 +2247,9 @@ class MainWindow(QMainWindow):
         self.inguard_sw_edit.editingFinished.connect(self._firmware_version_changed)
         form.addRow("OutG SW（面板核对）", self.outguard_sw_edit)
         form.addRow("InG SW（可选记录）", self.inguard_sw_edit)
+        for field in (self.outguard_sw_edit, self.inguard_sw_edit):
+            form.labelForField(field).hide()
+            field.hide()
         firmware_profile_row = QHBoxLayout()
         self.firmware_profile_status = QLabel("尚无面板版本记录")
         self.firmware_profile_status.setObjectName("secondaryText")
@@ -2080,6 +2262,9 @@ class MainWindow(QMainWindow):
         firmware_profile_row.addWidget(self.firmware_profile_status, 1)
         firmware_profile_row.addWidget(self.clear_firmware_profile_button)
         form.addRow("版本记录", firmware_profile_row)
+        form.labelForField(firmware_profile_row).hide()
+        self.firmware_profile_status.hide()
+        self.clear_firmware_profile_button.hide()
         self.control_mode_combo = QComboBox()
         self.control_mode_combo.addItem("未连接", "disconnected")
         self.control_mode_combo.addItem("Computer · 软件控制", "computer")
@@ -2301,7 +2486,7 @@ class MainWindow(QMainWindow):
 
         self.apply_button = QPushButton("应用仪器参数")
         self.apply_button.setObjectName("primaryButton")
-        self.apply_button.clicked.connect(self._apply_settings)
+        self.apply_button.clicked.connect(self._apply_settings_from_ui)
         self.initialize_parameters_button = QPushButton("恢复默认设置")
         self.initialize_parameters_button.setObjectName("secondaryButton")
         self.initialize_parameters_button.setToolTip(
@@ -2505,6 +2690,7 @@ class MainWindow(QMainWindow):
         self.output_root.textChanged.connect(lambda _text: self._reset_preflight_status())
         self.output_root.editingFinished.connect(self._save_profiles)
         browse = QPushButton("选择")
+        self.output_root_browse_button = browse
         browse.setObjectName("secondaryButton")
         browse.clicked.connect(self._choose_output_root)
         root_row = QHBoxLayout()
@@ -2556,6 +2742,12 @@ class MainWindow(QMainWindow):
         exp_form.addRow("当前模拟场景", self.mock_scenario_status)
         experiment_layout.addWidget(experiment)
 
+        # Simulation is a connection choice; keep it next to the COM settings.
+        exp_form.removeWidget(self.mock_mode_check)
+        exp_form.removeWidget(self.scenario_combo)
+        form.addRow("模拟模式", self.mock_mode_check)
+        form.addRow("模拟场景", self.scenario_combo)
+
         self.interval_spin = QDoubleSpinBox()
         self.interval_spin.setRange(0, 86400)
         self.interval_spin.setDecimals(3)
@@ -2563,8 +2755,8 @@ class MainWindow(QMainWindow):
         self.interval_spin.setSuffix(" s")
         self.interval_spin.setValue(1.0)
         self.interval_spin.setToolTip(
-            "软件等待目标（目标采样间隔），与仪器测量速度独立。采集时可即时修改；0 表示每次读数后不额外等待，"
-            "修改的 PC 时间戳和生效样本号会记入实验事件；实测采样间隔仍受仪器转换时间和串口通信耗时影响。"
+            "软件目标间隔与仪器测量速度独立。0 表示每次读数后不额外等待；"
+            "开始测量后本次实验的间隔固定，实测间隔仍受仪器转换和通信耗时影响。"
         )
         self.interval_spin.valueChanged.connect(self._on_sampling_interval_changed)
         interval_row = QHBoxLayout()
@@ -2580,6 +2772,17 @@ class MainWindow(QMainWindow):
         interval_row.addWidget(self.fastest_interval_label)
         interval_row.addStretch(1)
         self._interval_row = interval_row
+        mode_form.insertRow(2, "", self._interval_row)
+        mode_form.setRowVisible(self.mode_combo, False)
+        mode_form.setRowVisible(range_row, False)
+        mode_form.setRowVisible(self.apply_speed_button, False)
+        mode_form.setRowVisible(self.measurement_speed_help, False)
+        mode_form.setRowVisible(self.autozero_speed_hint, False)
+        mode_form.setRowVisible(self.terminal_diagram, False)
+        mode_form.setRowVisible(self.safety_text, False)
+        form.setRowVisible(self.diagnose_button, False)
+        form.setRowVisible(self.connection_stages_label, False)
+        self.control_mode_explanation_label.hide()
 
         self.start_button = QPushButton("开始连续采集")
         self.start_button.setObjectName("primaryButton")
@@ -2594,8 +2797,8 @@ class MainWindow(QMainWindow):
         self.stop_button.setToolTip("停止并保存当前实验。快捷键：Ctrl+Shift+S")
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
-        self.start_button.clicked.connect(self._start_continuous)
-        self.single_button.clicked.connect(self._start_single)
+        self.start_button.clicked.connect(lambda: self._begin_simple_measurement(one_shot=False))
+        self.single_button.clicked.connect(lambda: self._begin_simple_measurement(one_shot=True))
         self.pause_button.clicked.connect(self._pause_or_resume)
         self.stop_button.clicked.connect(self._stop)
         self.experiment_status = QLabel("就绪")
@@ -2635,6 +2838,7 @@ class MainWindow(QMainWindow):
         self.communication_log_text.setMinimumHeight(180)
         communication_logs_layout.addWidget(self.communication_log_text, 1)
         communication_layout.addWidget(communication_logs, 1)
+        communication_logs.hide()
         measurement_layout.addStretch(1)
         experiment_layout.addStretch(1)
         self.setup_section_stack.addWidget(self.communication_workspace)
@@ -2678,6 +2882,7 @@ class MainWindow(QMainWindow):
         self.latest_value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         reading_text.addWidget(reading_kicker)
         reading_text.addWidget(self.reading_mode_label)
+        self.reading_mode_label.hide()
         reading_text.addWidget(self.latest_value_label)
         self.valid_sample_count_label = QLabel("有效样本 0")
         self.valid_sample_count_label.setObjectName("metricValue")
@@ -2835,7 +3040,6 @@ class MainWindow(QMainWindow):
         action_divider.setObjectName("toolbarDivider")
         action_divider.setFrameShape(QFrame.Shape.VLine)
         action_layout.addWidget(action_divider)
-        action_layout.addLayout(self._interval_row)
         action_layout.addStretch(1)
         layout.addWidget(action_bar)
 
@@ -2848,12 +3052,20 @@ class MainWindow(QMainWindow):
         plot_toolbar_layout.setContentsMargins(2, 0, 2, 0)
         plot_toolbar_layout.setHorizontalSpacing(8)
         plot_toolbar_layout.setVerticalSpacing(4)
-        self.follow_check = QCheckBox("自动跟随")
+        self.follow_check = QCheckBox("滚动跟随")
         self.follow_check.setObjectName("chartFollowCheck")
-        self.follow_check.setChecked(True)
+        self.follow_check.setChecked(False)
         self.follow_check.setToolTip("开启后视图随最新读数滚动；关闭后可以固定查看历史区间")
         self.follow_check.toggled.connect(self._on_follow_toggled)
         plot_toolbar_layout.addWidget(self.follow_check, 0, 0)
+        self.x_auto_check = QCheckBox("Full（全部）")
+        self.x_auto_check.setChecked(True)
+        self.x_auto_check.toggled.connect(self._on_x_auto_toggled)
+        self.y_auto_check = QCheckBox("纵轴自动")
+        self.y_auto_check.setChecked(True)
+        self.y_auto_check.toggled.connect(self._on_y_auto_toggled)
+        for check in (self.x_auto_check, self.y_auto_check, self.follow_check):
+            check.setStyleSheet("QCheckBox { color: #e5f0ed; spacing: 6px; }")
         self.view_mode_label = QLabel("自动跟随最新数据")
         self.view_mode_label.setObjectName("chartViewMode")
         plot_toolbar_layout.addWidget(self.view_mode_label, 0, 1)
@@ -2873,8 +3085,36 @@ class MainWindow(QMainWindow):
         self.autoscale_button = QPushButton("全部数据")
         self.autoscale_button.setObjectName("secondaryButton")
         self.autoscale_button.setToolTip("自动缩放到当前数据集的完整时间与读数范围")
-        self.autoscale_button.clicked.connect(self._autoscale_plot)
+        self.autoscale_button.clicked.connect(self._enable_plot_autoscale)
         plot_toolbar_layout.addWidget(self.autoscale_button, 0, 5)
+        self.quick_autoscale_button = QPushButton("自动缩放")
+        self.quick_autoscale_button.setObjectName("secondaryButton")
+        self.quick_autoscale_button.setToolTip("自动缩放到当前数据范围；也可双击曲线恢复自动缩放。")
+        self.quick_autoscale_button.clicked.connect(self._enable_plot_autoscale)
+        self._action_layout.addWidget(self.quick_autoscale_button)
+        average_label = QLabel("平均点数")
+        self.average_window_spin = QSpinBox()
+        self.average_window_spin.setObjectName("averageWindowSpin")
+        self.average_window_spin.setStyleSheet(
+            "QSpinBox, QSpinBox QLineEdit { color: #1d2c2a; background: #fffefa; }"
+        )
+        self.average_window_spin.setRange(1, MAX_PLOT_POINTS)
+        self.average_window_spin.setValue(self._average_trace.window)
+        self.average_window_spin.setKeyboardTracking(False)
+        self.average_window_spin.setToolTip("滑动平均点数；仅影响图表。长时间采集显示最近的平均结果。")
+        self.average_window_spin.valueChanged.connect(self._on_average_window_changed)
+        self._action_layout.addWidget(average_label)
+        self._action_layout.addWidget(self.average_window_spin)
+        self.reset_measurement_button = QPushButton("重新测量")
+        self.reset_measurement_button.setObjectName("primaryButton")
+        self.reset_measurement_button.setToolTip("停止并保存后清空曲线")
+        self.reset_measurement_button.clicked.connect(self._reset_measurement)
+        self._action_layout.addWidget(self.reset_measurement_button)
+        self.save_curve_button = QPushButton("保存曲线")
+        self.save_curve_button.setObjectName("primaryButton")
+        self.save_curve_button.setToolTip("保存简洁和详细曲线 CSV")
+        self.save_curve_button.clicked.connect(self._save_curve_csv)
+        self._action_layout.addWidget(self.save_curve_button)
         self.return_live_button = QPushButton("回到实时窗口")
         self.return_live_button.setObjectName("primaryButton")
         self.return_live_button.setToolTip("历史视图返回刚才的实时曲线；实时视图跟随最新数据")
@@ -2924,6 +3164,8 @@ class MainWindow(QMainWindow):
         self.y_axis_span_edit.returnPressed.connect(self._apply_plot_y_span)
         self._plot_toolbar_widgets = (
             self.follow_check,
+            self.x_auto_check,
+            self.y_auto_check,
             self.view_mode_label,
             self.acquisition_hint,
             self.chart_gesture_help_button,
@@ -2935,12 +3177,7 @@ class MainWindow(QMainWindow):
         )
 
         self.chart_gesture_help = QLabel(
-            "普通滚轮同时缩放横轴和纵轴；Shift+滚轮只缩放时间轴；Ctrl+滚轮只缩放读数轴；Alt 对滚轮无特殊操作。"
-            "拖动图表可平移，双击图表自动缩放到全部数据，单击曲线可锁定读数点；"
-            "聚焦图表后按方向键选点，Enter将锁定点设为基准；Shift+方向键平移，"
-            "PageUp/PageDown缩放，Ctrl缩放时间轴，Alt缩放读数轴。手动缩放任一坐标轴或平移时间轴会停止自动跟随；"
-            "点击“回到实时窗口”可恢复最新数据跟随；"
-            "Home显示全部数据，End回到实时窗口。"
+            "普通滚轮：缩放横纵轴\nShift + 滚轮：缩放时间轴\nCtrl + 滚轮：缩放纵轴"
         )
         self.chart_gesture_help.setObjectName("secondaryText")
         self.chart_gesture_help.setWordWrap(True)
@@ -2959,14 +3196,7 @@ class MainWindow(QMainWindow):
         self.plot_widget.setObjectName("trendPlot")
         self._plot_viewport = self.plot_widget.viewport()
         self._plot_viewport.installEventFilter(self)
-        wheel_tooltip = (
-            "普通滚轮同时缩放横轴与纵轴；Shift+滚轮只缩放时间轴；Ctrl+滚轮只缩放纵轴；Alt 不改变滚轮行为。"
-            "纵轴缩放优先以鼠标时间位置附近的实测点为锚，无有效曲线时以视区中心为锚。"
-            "电压模式的绝对显示范围为 −1000 至 +1000 V；这只是图表显示边界，不是仪器量程或输入额定值；"
-            "8845A ACV 最大输入为 750 V RMS、1000 V peak 或 8×10^7 V·Hz 乘积，以先达到的限制为准；"
-            "纵轴单位随当前显示跨度采用工程前缀；相对刻度会标明参考读数。"
-            "缩放只改变图表显示，不修改原始读数。"
-        )
+        wheel_tooltip = "普通滚轮：缩放横纵轴\nShift + 滚轮：缩放时间轴\nCtrl + 滚轮：缩放纵轴"
         self.plot_widget.setToolTip(wheel_tooltip)
         self.plot_widget.viewport().setToolTip(wheel_tooltip)
         self.plot_widget.key_handler = self._handle_plot_key
@@ -2978,9 +3208,11 @@ class MainWindow(QMainWindow):
         legend = self.plot_widget.addLegend(offset=(12, 8))
         legend.setLabelTextColor("#526064")
         self.curve = self.plot_widget.plot([], [], pen=pg.mkPen("#138b92", width=2.2), name="原始读数")
+        self.average_curve = self.plot_widget.plot([], [], pen=pg.mkPen("#df8b30", width=2.4), name="滑动平均")
         self.view_box.y_anchor_provider = self._plot_y_zoom_anchor_at_x
         plot_item = self.plot_widget.getPlotItem()
         self.y_axis = plot_item.getAxis("left")
+        self.x_axis = plot_item.getAxis("bottom")
         for axis_name in ("left", "bottom"):
             axis = plot_item.getAxis(axis_name)
             axis.setTextPen(pg.mkPen("#526064"))
@@ -2988,11 +3220,14 @@ class MainWindow(QMainWindow):
             axis.setTickFont(QFont("Microsoft YaHei UI", 10))
         plot_item.vb.sigRangeChanged.connect(self._position_event_labels)
         plot_item.vb.sigRangeChanged.connect(self._sync_plot_y_axis)
+        plot_item.vb.sigRangeChanged.connect(self._sync_plot_x_axis)
         plot_item.vb.sigRangeChanged.connect(self._sync_plot_y_span_control)
+        plot_item.vb.sigXRangeChanged.connect(self._on_plot_x_range_changed)
         self.view_box.userZoomed.connect(self._on_plot_wheel_zoom)
         self.view_box.yZoomLimitReached.connect(self._on_plot_y_zoom_limit_reached)
         self.view_box.rebaseRequested.connect(self._rebase_plot_for_zoom)
         self.view_box.sigRangeChangedManually.connect(self._on_plot_range_changed_manually)
+        self.view_box.dragFinished.connect(self._on_plot_drag_finished)
         plot_item.setMenuEnabled(False)
         plot_item.vb.setMouseEnabled(x=True, y=True)
         plot_item.setClipToView(True)
@@ -3030,10 +3265,12 @@ class MainWindow(QMainWindow):
             lambda _checked=False: self._navigate_workspace("communications")
         )
         empty_layout.addWidget(self.plot_empty_connect_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.plot_empty_connect_button.hide()
         empty_layout.addStretch(3)
         plot_layout.addWidget(empty_overlay)
         self.plot_empty_overlay = empty_overlay
         self.plot_empty_overlay.raise_()
+        layout.addWidget(plot_toolbar)
         layout.addWidget(plot_frame, 1)
 
         self.baseline_line = pg.InfiniteLine(
@@ -3055,7 +3292,6 @@ class MainWindow(QMainWindow):
         self._region_stats_label = QLabel("输入起止时间，或拖动图中的区间手柄")
         self._region_stats_label.setObjectName("secondaryText")
         plot_scene = self.plot_widget.getPlotItem().vb.scene()
-        plot_scene.sigMouseMoved.connect(self._on_mouse_moved)
         plot_scene.sigMouseClicked.connect(self._on_plot_clicked)
         self._locked_cursor_marker = pg.ScatterPlotItem(
             size=12, symbol="o", pen=pg.mkPen("#f7c948", width=2),
@@ -3240,7 +3476,6 @@ class MainWindow(QMainWindow):
         chart_note.setObjectName("secondaryText")
         chart_note.setWordWrap(True)
         chart_layout.addWidget(chart_note)
-        chart_layout.addWidget(self.plot_toolbar)
         chart_layout.addWidget(self.chart_gesture_help)
         chart_layout.addStretch(1)
         self.chart_settings_tab = chart_tab
@@ -3258,12 +3493,14 @@ class MainWindow(QMainWindow):
         self._update_readout_layout()
 
     def eventFilter(self, watched, event) -> bool:
+        if watched is getattr(self, "mode_bar", None) and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, lambda: self._sync_mode_buttons(animate=False))
         if (
             watched is getattr(self, "_plot_viewport", None)
             and event.type() == QEvent.Type.MouseButtonDblClick
             and event.button() == Qt.MouseButton.LeftButton
         ):
-            self._autoscale_plot()
+            self._enable_plot_autoscale()
             return True
         if (
             watched is getattr(self, "files_dialog", None)
@@ -3296,6 +3533,13 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         QTimer.singleShot(0, self._update_readout_layout)
+        if not self._initial_connection_prompt_shown:
+            self._initial_connection_prompt_shown = True
+            QTimer.singleShot(0, self._open_initial_connection)
+
+    def _open_initial_connection(self) -> None:
+        if self.isVisible() and not self._connected and not self._connection_pending:
+            self._show_connection_settings()
 
     def _update_readout_layout(self) -> None:
         if not hasattr(self, "_reading_layout"):
@@ -3379,7 +3623,7 @@ class MainWindow(QMainWindow):
             self.latest_invalid_label.setVisible(bool(self._latest_invalid_log_text))
             self.latest_invalid_log_button.setText("日志")
             self.latest_invalid_log_button.setFixedSize(36, 20)
-            self.latest_invalid_log_button.setVisible(bool(self._latest_invalid_log_text))
+            self.latest_invalid_log_button.hide()
             self.recovery_hint_label.setWordWrap(False)
             self.recovery_hint_label.setMaximumHeight(19)
         elif stacked:
@@ -3399,11 +3643,11 @@ class MainWindow(QMainWindow):
             self._elapsed_tile.setMinimumWidth(112)
             self.latest_invalid_label.setWordWrap(True)
             self.latest_invalid_label.setMaximumHeight(16777215)
-            self.latest_invalid_label.show()
+            self.latest_invalid_label.setVisible(bool(self._latest_invalid_log_text))
             self.latest_invalid_log_button.setText("查看异常日志")
             self.latest_invalid_log_button.setMinimumSize(0, 0)
             self.latest_invalid_log_button.setMaximumSize(16777215, 16777215)
-            self.latest_invalid_log_button.setVisible(bool(self._latest_invalid_log_text))
+            self.latest_invalid_log_button.hide()
             self.recovery_hint_label.setWordWrap(True)
             self.recovery_hint_label.setMaximumHeight(16777215)
         if short_viewport and self.recovery_hint_label.toolTip():
@@ -3516,68 +3760,34 @@ class MainWindow(QMainWindow):
     def _update_plot_toolbar_layout(self) -> None:
         if not hasattr(self, "_plot_toolbar_layout"):
             return
-        width = self.plot_toolbar.width()
-        if width <= 0:
-            return
-        short_viewport = bool(getattr(self, "_short_viewport_layout", False))
-        mode = "short" if short_viewport else "wide" if width >= 1080 else "compact" if width >= 820 else "narrow"
-        if mode == self._plot_toolbar_mode:
-            return
-        self._plot_toolbar_mode = mode
-        toolbar_layout = self._plot_toolbar_layout
-        while toolbar_layout.count():
-            toolbar_layout.takeAt(0)
-        for column in range(9):
-            toolbar_layout.setColumnStretch(column, 0)
-        toolbar_layout.setHorizontalSpacing(3 if mode in {"narrow", "short"} else 8)
-        toolbar_layout.setVerticalSpacing(2 if mode == "short" else 3 if mode == "narrow" else 5)
-        self.plot_toolbar.setProperty("narrow", mode in {"narrow", "short"})
-        self.plot_toolbar.setProperty("short", mode == "short")
-        self.plot_toolbar.style().unpolish(self.plot_toolbar)
-        self.plot_toolbar.style().polish(self.plot_toolbar)
-        widgets = self._plot_toolbar_widgets
-        for widget in self.plot_toolbar.findChildren(QWidget):
-            widget.setProperty("short", mode == "short")
-            widget.style().unpolish(widget)
-            widget.style().polish(widget)
-            widget.updateGeometry()
-        follow, view_mode, hint, gestures, source, autoscale, live, history, screenshot = widgets
-        hint.setVisible(mode != "short")
-        hint.setWordWrap(mode not in {"wide", "short"})
-        if mode == "wide":
-            for column, widget in enumerate(widgets):
-                toolbar_layout.addWidget(widget, 0, column)
-            toolbar_layout.setColumnStretch(2, 1)
-            toolbar_layout.setColumnStretch(4, 1)
-            toolbar_layout.addWidget(
-                self.y_axis_span_control, 1, 0, 1, 9, Qt.AlignmentFlag.AlignLeft
-            )
-        elif mode == "short":
-            for column, widget in enumerate((follow, view_mode, source, autoscale, live, history, screenshot, gestures)):
-                toolbar_layout.addWidget(widget, 0, column)
-            toolbar_layout.addWidget(
-                self.y_axis_span_control, 1, 0, 1, 8, Qt.AlignmentFlag.AlignLeft
-            )
-            toolbar_layout.setColumnStretch(1, 1)
-        else:
-            toolbar_layout.addWidget(follow, 0, 0)
-            toolbar_layout.addWidget(view_mode, 0, 1)
-            toolbar_layout.addWidget(source, 0, 2)
-            for column, widget in enumerate((autoscale, live, history, screenshot), start=3):
-                toolbar_layout.addWidget(widget, 0, column)
-            toolbar_layout.addWidget(hint, 1, 0, 1, 6)
-            toolbar_layout.addWidget(gestures, 1, 6)
-            toolbar_layout.addWidget(
-                self.y_axis_span_control, 2, 0, 1, 7, Qt.AlignmentFlag.AlignLeft
-            )
-            toolbar_layout.setColumnStretch(1, 1)
-        self.plot_toolbar.updateGeometry()
+        if self._plot_toolbar_mode != "simple":
+            toolbar_layout = self._plot_toolbar_layout
+            while toolbar_layout.count():
+                toolbar_layout.takeAt(0)
+            for widget in self._plot_toolbar_widgets:
+                widget.hide()
+            self.y_axis_span_control.hide()
+            self.follow_check.show()
+            self.x_auto_check.show()
+            self.y_auto_check.show()
+            self.quick_autoscale_button.hide()
+            toolbar_layout.addWidget(self.x_auto_check, 0, 0)
+            toolbar_layout.addWidget(self.y_auto_check, 0, 1)
+            toolbar_layout.addWidget(self.follow_check, 0, 2)
+            toolbar_layout.setColumnStretch(3, 1)
+            self._plot_toolbar_mode = "simple"
 
     def _on_plot_wheel_zoom(self, zoom_x: bool, zoom_y: bool) -> None:
-        if zoom_x or zoom_y:
-            self.follow_check.setChecked(False)
+        if zoom_y:
+            self.y_auto_check.setChecked(False)
         if zoom_x:
+            self.x_auto_check.setChecked(False)
             self._schedule_history_detail_reload()
+
+    def _on_plot_drag_finished(self) -> None:
+        if getattr(self.view_box, "_last_drag_y_changed", False):
+            self.y_auto_check.setChecked(False)
+        self._update_chart_auto_ranges()
 
     def _on_plot_y_zoom_limit_reached(self, span: float) -> None:
         now = time.monotonic()
@@ -3592,17 +3802,40 @@ class MainWindow(QMainWindow):
         )
 
     def _on_plot_range_changed_manually(self, axes) -> None:
-        if axes and axes[0]:
-            self.follow_check.setChecked(False)
-            self._schedule_history_detail_reload()
+        if axes and any(axes):
+            if axes[0]:
+                self.x_auto_check.setChecked(False)
+                self._schedule_history_detail_reload()
+            if len(axes) > 1 and axes[1] and not self.view_box.drag_in_progress:
+                self.y_auto_check.setChecked(False)
 
     def _on_follow_toggled(self, enabled: bool) -> None:
+        if enabled and hasattr(self, "x_auto_check"):
+            self.x_auto_check.setChecked(False)
+        if enabled and hasattr(self, "view_box"):
+            self._update_chart_auto_ranges()
         if hasattr(self, "view_mode_label"):
             self.view_mode_label.setText(
                 "自动跟随最新数据" if enabled else "手动视图 · 自动跟随已关闭"
             )
         if hasattr(self, "return_live_button") and hasattr(self, "_plot_x"):
             self._set_return_live_enabled(bool(self._plot_x))
+
+    def _on_x_auto_toggled(self, enabled: bool) -> None:
+        if enabled:
+            self.follow_check.setChecked(False)
+        if hasattr(self, "view_box") and not self.view_box.drag_in_progress:
+            self._update_chart_auto_ranges()
+
+    def _on_y_auto_toggled(self, enabled: bool) -> None:
+        if enabled and hasattr(self, "view_box"):
+            self._update_chart_auto_ranges()
+
+    def _on_plot_x_range_changed(self, *_args) -> None:
+        if (hasattr(self, "y_auto_check") and self.y_auto_check.isChecked()
+                and not getattr(self, "_updating_chart_auto_ranges", False)
+                and not self._y_axis_fit_timer.isActive()):
+            self._y_axis_fit_timer.start(60)
 
     def _move_plot_selection(self, step: int) -> bool:
         if not self._plot_x:
@@ -3627,8 +3860,10 @@ class MainWindow(QMainWindow):
             y=dy_fraction * y_span if dy_fraction else None,
         )
         if dx_fraction:
-            self.follow_check.setChecked(False)
+            self.x_auto_check.setChecked(False)
             self._schedule_history_detail_reload()
+        if dy_fraction:
+            self.y_auto_check.setChecked(False)
 
     def _zoom_plot(self, factor: float, *, zoom_x: bool, zoom_y: bool) -> None:
         if zoom_y:
@@ -3677,18 +3912,11 @@ class MainWindow(QMainWindow):
             )
             return True
         if modifiers == Qt.KeyboardModifier.NoModifier:
-            if key == Qt.Key.Key_Left:
-                return self._move_plot_selection(-1)
-            if key == Qt.Key.Key_Right:
-                return self._move_plot_selection(1)
             if key == Qt.Key.Key_Home:
                 self._autoscale_plot()
                 return True
             if key == Qt.Key.Key_End:
                 self._return_to_live_view()
-                return True
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._selected_plot_point is not None:
-                self._set_selected_point_as_baseline()
                 return True
         return False
 
@@ -3763,11 +3991,11 @@ class MainWindow(QMainWindow):
             "newMeasurementShortcutAction", "新建测量", "Ctrl+N",
             self._open_new_measurement_setup,
         )
-        add_shortcut_action("startShortcutAction", "开始连续采集", "Ctrl+R", self._start_continuous)
-        add_shortcut_action("singleShortcutAction", "单次测量", "", self._start_single)
+        add_shortcut_action("startShortcutAction", "开始连续采集", "Ctrl+R", lambda: self._begin_simple_measurement(one_shot=False))
+        add_shortcut_action("singleShortcutAction", "单次测量", "", lambda: self._begin_simple_measurement(one_shot=True))
         add_shortcut_action("pauseShortcutAction", "暂停 / 继续", "Ctrl+P", self._pause_or_resume)
         add_shortcut_action("stopShortcutAction", "停止并保存", "Ctrl+Shift+S", self._stop)
-        add_shortcut_action("settingsShortcutAction", "打开设置与分析", "Ctrl+,", self._show_configuration)
+        add_shortcut_action("settingsShortcutAction", "测量参数", "Ctrl+,", self._show_measurement_settings)
         add_shortcut_action("eventShortcutAction", "记录实验事件", "Ctrl+Return", self._mark_event)
         chart_menu = self.menuBar().addMenu("曲线")
         self.autoscale_action = QAction("全部数据自动缩放", self)
@@ -3818,11 +4046,22 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self) -> None:
         self.setStyleSheet("""
-            QMainWindow { background: #252d31; }
+            QMainWindow { background: #edf2f1; }
             QWidget { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
             QMainWindow QWidget { color: #e7e8df; }
-            QWidget#appRoot { background: #252d31; }
-            QFrame#appHeader { background: #30383c; border: 1px solid #465156; border-radius: 9px; }
+            QWidget#appRoot { background: #edf2f1; }
+            QFrame#appHeader { background: #0d5055; border: 1px solid #0d5055; border-radius: 8px; }
+            QPushButton#connectionActionButton { background: #efb750; border: 0; color: #1b3f40; font-weight: 700; padding: 7px 18px; }
+            QPushButton#connectionActionButton:hover { background: #ffd078; }
+            QPushButton#measurementSettingsButton { background: #f8fbfa; color: #124e52; border: 1px solid #c4e4df; font-weight: 700; padding: 7px 18px; }
+            QPushButton#measurementSettingsButton:disabled, QPushButton#connectionActionButton:disabled { background: #a4b4b0; color: #e1e9e6; }
+            QFrame#modeBar { background: #ffffff; border: 1px solid #c8d9d6; border-radius: 8px; }
+            QPushButton#modeButton { background: transparent; color: #42615f; border: 0; border-radius: 5px; font-size: 14px; font-weight: 600; padding: 8px 10px; }
+            QPushButton#modeButton:hover { background: #e3f3ef; color: #075e61; }
+            QPushButton#modeButton:checked { background: #d7f0eb; color: #075e61; font-weight: 700; }
+            QPushButton#modeButton:disabled { background: #f1f4f2; color: #a2b0ad; }
+            QPushButton#modeButton:checked:disabled { background: #deebe7; color: #537a74; }
+            QFrame#modeIndicator { background: #0d9997; border: 0; border-radius: 1px; }
             QLabel#brandIcon { background: #f1efe6; border: 1px solid #bdc0b7; border-radius: 6px; color: #176d72; font-weight: 800; }
             QLabel#mainTitle { color: #f1efe6; font-size: 18px; font-weight: 700; letter-spacing: .03em; }
             QMenuBar { background: #252d31; color: #e7e8df; padding: 2px 7px; }
@@ -3830,6 +4069,8 @@ class MainWindow(QMainWindow):
             QMenu { background: #30383c; color: #f1efe6; border: 1px solid #505b5f; padding: 4px; }
             QDialog#configurationDialog { background: #f1efe6; }
             QDialog#configurationDialog QWidget { color: #273136; }
+            QDialog#configurationDialog QPushButton#primaryButton { color: #ffffff; }
+            QDialog#configurationDialog QPushButton#primaryButton:disabled { color: #778c87; }
             QDialog#experimentFilesDialog { background: #f1efe6; }
             QDialog#experimentFilesDialog QWidget { color: #273136; }
             QDialog#wiringConfirmationDialog { background: #f1efe6; }
@@ -3877,6 +4118,7 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { color: #99a09e; background: #e7e8e1; border-color: #d1d4cd; }
             QPushButton#primaryButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; }
             QPushButton#primaryButton:hover { background: #12666b; border-color: #12666b; }
+            QPushButton#primaryButton:disabled { background: #bdcac6; border-color: #bdcac6; color: #778c87; }
             QPushButton#newMeasurementButton { background: #167b80; border-color: #167b80; color: #fffefa; font-weight: 700; padding-left: 12px; padding-right: 12px; }
             QPushButton#newMeasurementButton:hover { background: #12666b; border-color: #12666b; }
             QPushButton#plotEmptyNewMeasurementButton { background: #167b80; border: 1px solid #167b80; color: #fffefa; font-weight: 700; padding: 6px 12px; }
@@ -3892,6 +4134,7 @@ class MainWindow(QMainWindow):
             QPushButton#primaryButton[connectionTarget="mock"]:hover { background: #704b10; border-color: #704b10; }
             QPushButton#primaryButton[connectionTarget="mock"]:disabled { background: #5c4a2e; border-color: #6a5a3f; color: #c1b79d; }
             QPushButton#dangerButton { color: #982f2b; border-color: #d6aaa3; background: #fff8f4; }
+            QPushButton#dangerButton:disabled { color: #a8b0ad; border-color: #d8dedb; background: #edf1ef; }
             QPushButton#secondaryButton { color: #344247; }
             QToolButton[class="secondaryButton"] { background: #faf9f4; color: #344247; border: 1px solid #bfc7c4; border-radius: 5px; padding: 6px 12px; min-height: 25px; }
             QToolButton[class="secondaryButton"]:checked { background: #d8eeeb; color: #176d72; border-color: #29aab0; font-weight: 700; }
@@ -4304,6 +4547,7 @@ class MainWindow(QMainWindow):
                 current = self.port_combo.currentData() or self.port_combo.currentText().split(" ", 1)[0]
                 self._active_port = str(current)
         if not connected:
+            self._cancel_wiring_confirmation()
             self._configure_pending = False
             self._zero_pending = False
             self._instrument_mode_readback = None
@@ -4321,6 +4565,7 @@ class MainWindow(QMainWindow):
         else:
             badge_text = text if text and text != "未读取" else "未连接"
         self.connection_badge.setText(badge_text)
+        self.plot_empty_hint.setText("开始测量后显示曲线" if connected else "连接仪器后开始测量")
         tooltip = text
         if connected and not self._simulation:
             tooltip = self._control_mode_tooltip()
@@ -4354,6 +4599,8 @@ class MainWindow(QMainWindow):
         self._update_readout_context()
         self._update_instrument_readback_status()
         self._update_controls()
+        if connected and self.configuration_dialog.isVisible():
+            self.configuration_dialog.hide()
 
     @Slot(str)
     def _on_connection_progress(self, message: str) -> None:
@@ -4430,14 +4677,16 @@ class MainWindow(QMainWindow):
             return
         if not self._connected:
             text, detail, state = "未连接", "连接仪器后显示配置回读状态。", "disconnected"
+        elif self._configure_pending:
+            text, detail, state = "配置中", "正在等待仪器配置与模式回读。", "pending"
+        elif not self._instrument_mode_known:
+            text, detail, state = "模式待确认", "当前仪器模式尚未确认；请重新应用测量参数并等待回读。", "pending"
         elif self._simulation:
             text, detail, state = "MOCK设置", "当前为模拟仪器配置，不代表真实仪器回读。", "mock"
         elif self._control_mode == "local":
             text = "Local请求 · 无法回读"
             detail = "软件已发送 SYST:LOC；仪表不提供状态回读（没有对应的 SCPI 查询），请核对面板。切回Computer后会重新读取当前配置。"
             state = "local"
-        elif not self._instrument_mode_known:
-            text, detail, state = "模式未识别", "尚未读回仪器当前功能；请在Computer模式下应用设置并确认回读。", "pending"
         elif self._current_mode.value in self._active_settings_by_mode:
             text = "配置已回读"
             detail = f"当前功能 {descriptor(self._current_mode).label} 的仪器设置已回读。"
@@ -4452,7 +4701,7 @@ class MainWindow(QMainWindow):
         label.setProperty("state", state)
         label.style().unpolish(label)
         label.style().polish(label)
-        label.setVisible(bool(self._connected))
+        label.setVisible(bool(self._connected) and state in {"pending", "local"})
 
     @Slot(str)
     def _on_control_mode_changed(self, mode: str) -> None:
@@ -4560,6 +4809,10 @@ class MainWindow(QMainWindow):
         finally:
             self.outguard_sw_edit.blockSignals(outguard_blocked)
             self.inguard_sw_edit.blockSignals(inguard_blocked)
+        if hasattr(self, "firmware_bottom_label"):
+            self.firmware_bottom_label.setText(
+                f"OutG SW：{outguard_version or '未核对'}  ·  InG SW：{inguard_version or '未核对'}"
+            )
 
     def _firmware_version_changed(self) -> None:
         outguard_version = self.outguard_sw_edit.text().strip()
@@ -4629,6 +4882,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{mode} 仪器配置回读完成。")
             self._set_operation_status("配置已回读", state="success", detail=f"{mode} 仪器配置回读完成。")
             self._update_instrument_readback_status()
+            self._update_controls()
 
     def _mode_changed(self, index: int) -> None:
         if index < 0:
@@ -4637,41 +4891,26 @@ class MainWindow(QMainWindow):
         if mode == self._current_mode:
             self._load_mode_controls(mode)
             return
-        if self._acquiring:
+        if self._pending_wiring_retry is not None and self._approved_wiring_target is None:
+            self._cancel_wiring_confirmation()
+        if (self._acquiring or self._start_pending or self._experiment_active
+                or self._finalization_pending or self._configure_pending):
             self._set_combo_data(self.mode_combo, self._current_mode.value)
-            self._show_error("采集中或暂停时不能切换测量模式。请先停止实验并新建数据段。")
+            self.statusBar().showMessage("仪器操作或保存尚未完成，请稍后再切换模式。", 5000)
             return
-        old_spec, new_spec = descriptor(self._current_mode), descriptor(mode)
-        requires_safety_check = (
-            not self._simulation
-            and mode_transition_requires_wiring_confirmation(self._current_mode, mode)
-        )
-        target_settings = self._settings_for_mode(mode)
-        confirmed_settings = None
-        if requires_safety_check:
-            transition_steps = []
-            if old_spec.wiring_group == "current" and new_spec.wiring_group != "current":
-                transition_steps.append("先关闭被测回路，并将测试线从独立的mA/400 mA或10 A电流插孔移回V/Ω插孔，再切换离开电流模式。")
-            transition_steps.append(self._mode_safety_instructions(mode))
-            dialog = WiringConfirmationDialog(
-                mode,
-                f"切换为“{new_spec.label}”前，请逐项确认：\n\n" + "\n\n".join(transition_steps) + "\n\n切换SCPI模式不会移动测试线，也不能检查外部回路。",
-                self,
-                current_range_si=(None if target_settings.autorange else target_settings.range_si),
-                autorange=target_settings.autorange,
-            )
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                self._set_combo_data(self.mode_combo, self._current_mode.value)
-                return
-            confirmed_settings = target_settings
+        if self._plot_y and self._plot_data_mode is None:
+            self._plot_data_mode = self._current_mode
         self._active_settings_by_mode.clear()
         self._current_mode = mode
         self._instrument_mode_known = not self._connected
         self._baseline = self._profiles[mode.value].get("baseline")
+        if self._plot_y:
+            self.baseline_line.hide()
         self._load_mode_controls(mode)
         if self._connected:
-            self._bridge.configure.emit(target_settings, confirmed_settings)
-        self._clear_plot()
+            applied = self._settings_for_mode(mode)
+            self._queue_configuration(applied, mode_switch=not self._simulation)
+        self._sync_plot_y_axis()
 
     def _mode_safety_instructions(self, mode: Mode) -> str:
         spec = descriptor(mode)
@@ -4880,12 +5119,80 @@ class MainWindow(QMainWindow):
         baseline = stored.get("baseline")
         self._baseline = float(baseline) if baseline is not None else None
         self.baseline_edit.setText("" if self._baseline is None else repr(self._baseline))
-        self.plot_widget.setLabel("left", spec.display_quantity, units=spec.unit_si, color="#697470")
+        self._sync_plot_y_axis()
         self.latest_value_label.setText("等待读数")
         self._update_range_enabled()
         self._loading_mode_controls = False
         self._update_readout_context()
         self._update_controls()
+
+    def _sync_main_range(self) -> None:
+        if not hasattr(self, "main_range_combo"):
+            return
+        combo = self.main_range_combo
+        blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            for index in range(self.range_combo.count()):
+                combo.addItem(self.range_combo.itemText(index), self.range_combo.itemData(index))
+                source = self.range_combo.model().item(index)
+                target = combo.model().item(index)
+                if source is not None and target is not None:
+                    target.setEnabled(source.isEnabled())
+            combo.setCurrentIndex(0 if self.autorange_check.isChecked() else self.range_combo.currentIndex())
+        finally:
+            combo.blockSignals(blocked)
+
+    def _cancel_wiring_confirmation(self) -> None:
+        self._pending_wiring_target = None
+        self._pending_wiring_retry = None
+        self._approved_wiring_target = None
+
+    def _confirm_inline_wiring(self, settings: ModeSettings, retry) -> bool:
+        spec = descriptor(settings.mode)
+        selected_range = "自动量程" if settings.autorange else range_label(float(settings.range_si), spec.unit_si)
+        answer = QMessageBox.question(
+            self, "确认接线", f"{spec.label} · {selected_range}\n确认接线正确？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _main_range_activated(self, index: int) -> None:
+        if index == self.main_range_combo.currentIndex() and self._pending_wiring_retry is not None:
+            self._cancel_wiring_confirmation()
+
+    def _main_range_changed(self, index: int) -> None:
+        if index < 0 or self._loading_mode_controls:
+            return
+        if self._pending_wiring_retry is not None and self._approved_wiring_target is None:
+            self._cancel_wiring_confirmation()
+        approved_current_range = False
+        if (self._connected and not self._simulation
+                and descriptor(self._current_mode).quantity == "current"):
+            current = self._settings_for_mode(self._current_mode)
+            requested = replace(current, autorange=index == 0,
+                                range_si=None if index == 0 else float(self.main_range_combo.itemData(index)))
+            if requested != current and not self._confirm_inline_wiring(
+                requested, lambda: self.main_range_combo.setCurrentIndex(
+                    self.main_range_combo.findData(requested.range_si)
+                )
+            ):
+                self._sync_main_range()
+                return
+            approved_current_range = requested != current
+        else:
+            self._cancel_wiring_confirmation()
+        if index == 0:
+            self.autorange_check.setChecked(True)
+        else:
+            self.range_combo.setCurrentIndex(index)
+            self.autorange_check.setChecked(False)
+        if approved_current_range:
+            applied = self._settings_for_mode(self._current_mode)
+            self._confirmed_range_target = (applied.mode, applied.autorange, applied.range_si)
+        if self._connected:
+            self._apply_settings()
 
     def _update_range_enabled(self) -> None:
         self.range_combo.setEnabled(not self._acquiring and not self.autorange_check.isChecked())
@@ -4910,7 +5217,9 @@ class MainWindow(QMainWindow):
             not self._connected or self._simulation or self._control_mode == "computer"
         )
         setting_supported = spec.digital_filter and not reason
-        enabled = setting_supported and command_available
+        enabled = setting_supported and command_available and not (
+            self._acquiring or self._start_pending or self._experiment_active or self._finalization_pending
+        )
         self.digital_filter_check.setEnabled(enabled)
         if spec.digital_filter:
             tooltip_parts = [DIGITAL_FILTER_INFO]
@@ -4951,6 +5260,7 @@ class MainWindow(QMainWindow):
 
     def _settings_changed(self, *_args) -> None:
         if not self._loading_mode_controls:
+            self._cancel_wiring_confirmation()
             self._reset_preflight_status()
             self._persist_current_settings()
             self._refresh_safety_hint()
@@ -5154,12 +5464,20 @@ class MainWindow(QMainWindow):
                 )
         return conflicts
 
+    def _apply_settings_from_ui(self) -> None:
+        if self._pending_wiring_retry is not None:
+            self._cancel_wiring_confirmation()
+        self._apply_settings()
+
     def _apply_settings(self) -> None:
-        if self._configure_pending:
+        if (self._configure_pending or self._acquiring or self._start_pending
+                or self._experiment_active or self._finalization_pending):
             return
         try:
             self._persist_current_settings()
             settings = self._settings_for_mode(self._current_mode)
+            approved_range = self._confirmed_range_target
+            self._confirmed_range_target = None
             conflicts = self._settings_conflicts(settings)
             if conflicts:
                 summary = "应用已取消，未向仪器发送配置命令。请先处理以下冲突项：\n\n• " + "\n• ".join(conflicts)
@@ -5168,23 +5486,20 @@ class MainWindow(QMainWindow):
                 return
             if not self._connected:
                 QMessageBox.information(self, "参数已保存", "本模式参数已保存到本机。连接8845A后按“应用仪器参数”写入仪器。")
-            elif not self._simulation and mode_transition_requires_wiring_confirmation(
-                self._instrument_mode_readback, settings.mode,
-            ):
-                spec = descriptor(settings.mode)
-                dialog = WiringConfirmationDialog(
-                    settings.mode,
-                    f"应用“{spec.label}”设置前，请核对接线和量程：\n\n"
-                    f"{self._mode_safety_instructions(settings.mode)}\n\n"
-                    "SCPI不能检查表笔、保险丝或外部回路；确认接线适用于目标模式后再继续。",
-                    self,
-                    current_range_si=None if settings.autorange else settings.range_si,
-                    autorange=settings.autorange,
+            elif (not self._simulation and self._instrument_mode_readback is not None
+                  and self._instrument_mode_readback != settings.mode):
+                self._queue_configuration(settings, mode_switch=True)
+            elif not self._simulation:
+                active = self._active_settings_by_mode.get(settings.mode.value, {})
+                target = (settings.mode, settings.autorange, settings.range_si)
+                active_range = (settings.mode, bool(active.get("autorange")), active.get("range_si"))
+                needs_confirmation = (
+                    mode_transition_requires_wiring_confirmation(self._instrument_mode_readback, settings.mode)
+                    or (descriptor(settings.mode).quantity == "current" and target != active_range)
                 )
-                if dialog.exec() != QDialog.DialogCode.Accepted:
+                if needs_confirmation and approved_range != target and not self._confirm_inline_wiring(settings, self._apply_settings):
                     return
-                confirmed_settings = settings
-                self._queue_configuration(settings, confirmed_settings=confirmed_settings)
+                self._queue_configuration(settings, confirmed_settings=settings if needs_confirmation else None)
             else:
                 self._queue_configuration(settings)
         except Exception as exc:
@@ -5192,17 +5507,24 @@ class MainWindow(QMainWindow):
 
     def _queue_configuration(
         self, settings: ModeSettings, *, confirmed_settings: ModeSettings | None = None,
+        mode_switch: bool = False,
     ) -> None:
         if self._configure_pending:
             return
+        self._active_settings_by_mode.clear()
+        self._instrument_mode_known = False
         self._configure_pending = True
+        self._update_instrument_readback_status()
         self._update_controls()
         self.statusBar().showMessage("正在发送仪器配置命令，等待仪器回读…")
         self._set_operation_status(
             "正在应用配置",
             detail="进行中：发送仪器配置命令。预期结果：当前模式参数完成写入并收到配置回读。",
         )
-        self._bridge.configure.emit(settings, confirmed_settings)
+        if mode_switch:
+            self._bridge.configure_unconfirmed_mode.emit(settings)
+        else:
+            self._bridge.configure.emit(settings, confirmed_settings)
 
     def _initialize_parameters(self) -> None:
         if self._acquiring:
@@ -5233,24 +5555,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("软件测量参数已初始化；需要时请点击“应用仪器参数”写入仪表。", 10000)
 
     def _apply_acquisition_speed(self) -> None:
-        if not self._connected or not self._acquiring:
-            self._show_error("请先连接仪器并开始连续采集；运行中或暂停时可应用速度")
-            return
-        if self._speed_update_pending:
-            return
-        try:
-            settings = self._settings_for_mode(self._current_mode)
-            settings.validate()
-            spec = descriptor(self._current_mode)
-            if not spec.nplc_values and not spec.ac_bandwidths_hz:
-                raise ValueError(f"{spec.label}没有可调整的测量速度参数")
-            self._persist_current_settings()
-            self._speed_update_pending = True
-            self._update_controls()
-            self.statusBar().showMessage("正在应用并核对仪器测量速度…")
-            self._bridge.set_measurement_speed.emit(settings)
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.statusBar().showMessage("测量参数在本次实验期间锁定；停止并保存后可重新设置。", 5000)
 
     @Slot(bool, str)
     def _on_measurement_speed_result(self, success: bool, message: str) -> None:
@@ -5363,6 +5668,17 @@ class MainWindow(QMainWindow):
     def _start_single(self) -> None:
         self._start(one_shot=True)
 
+    def _begin_simple_measurement(self, *, one_shot: bool) -> None:
+        if self._pending_wiring_retry is not None:
+            self._cancel_wiring_confirmation()
+        if self._acquiring or self._start_pending or self._experiment_active or self._finalization_pending:
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.experiment_name.setText(f"实验_{timestamp}_{self._current_mode.value}")
+        self._start(one_shot=one_shot)
+        if self._start_pending:
+            self.configuration_dialog.hide()
+
     def _start(self, one_shot: bool) -> None:
         if self._history_load_pending:
             self.statusBar().showMessage("历史 CSV 正在后台加载，完成后再开始采集。", 5000)
@@ -5373,7 +5689,9 @@ class MainWindow(QMainWindow):
         if self._start_pending:
             self.statusBar().showMessage("采集启动请求正在处理，请等待仪器响应。", 5000)
             return
-        if self._diagnostic_pending or self._connection_pending:
+        if (self._diagnostic_pending or self._connection_pending or self._configure_pending
+                or self._zero_pending or self._acquiring or self._experiment_active
+                or self._finalization_pending):
             self.statusBar().showMessage("仪器命令正在执行，请等待完成后再启动采集。", 5000)
             return
         if not self._connected:
@@ -5384,22 +5702,9 @@ class MainWindow(QMainWindow):
             return
         confirmed_settings = None
         if not self._simulation:
-            spec = descriptor(self._current_mode)
-            autorange = self.autorange_check.isChecked()
-            selected_range = self.range_combo.currentData()
-            range_si = None if autorange or selected_range is None else float(selected_range)
-            dialog = WiringConfirmationDialog(
-                self._current_mode,
-                f"开始“{spec.label}”前必须核对接线和安全状态：\n\n"
-                f"{self._mode_safety_instructions(self._current_mode)}\n\n"
-                "SCPI不能检测表笔插孔、保险丝或外部回路。确认已关闭被测电路电源，并核对接线和预期量程后再继续。",
-                self,
-                current_range_si=range_si,
-                autorange=autorange,
-            )
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
             confirmed_settings = self._settings_for_mode(self._current_mode)
+            if not self._confirm_inline_wiring(confirmed_settings, lambda: self._start(one_shot)):
+                return
         try:
             settings = self._settings_for_mode(self._current_mode)
             settings.validate()
@@ -5448,6 +5753,7 @@ class MainWindow(QMainWindow):
             if self.mock_mode_check.isChecked() and not self._simulation:
                 raise ValueError("MOCK模式未连接。请先点击“连接真实仪器”以通过MOCK后端连接；UI会明确显示模拟状态。")
             self._persist_current_settings()
+            self._locked_interval_s = self.interval_spin.value()
             self._start_pending = True
             self._last_run_single = bool(one_shot)
             self._user_stop_pending = False
@@ -5507,12 +5813,14 @@ class MainWindow(QMainWindow):
             self.preflight_status.setText("配置或路径已变化；开始采集时会重新检查连接、回读、接线与保存目录。")
 
     def _on_sampling_interval_changed(self, value: float) -> None:
+        if self._acquiring or self._start_pending or self._experiment_active or self._finalization_pending:
+            if self._locked_interval_s is not None and value != self._locked_interval_s:
+                blocked = self.interval_spin.blockSignals(True)
+                self.interval_spin.setValue(self._locked_interval_s)
+                self.interval_spin.blockSignals(blocked)
+            return
         self._profiles["sampling_interval_s"] = float(value)
         self._save_profiles()
-        if not self._acquiring:
-            return
-        interval = None if value == 0 else float(value)
-        self._bridge.set_sampling_interval.emit(interval)
 
     def _connect_mock(self) -> None:
         if self._connected or self._connection_pending:
@@ -5558,7 +5866,7 @@ class MainWindow(QMainWindow):
         self.scenario_combo.setToolTip(scenario_tooltip)
         self.mock_scenario_status.setText(status)
         self.mock_scenario_header.setText(status)
-        self.mock_scenario_header.setVisible(self._simulation or self.mock_mode_check.isChecked())
+        self.mock_scenario_header.hide()
 
     def _connect_action(self) -> None:
         if self.mock_mode_check.isChecked():
@@ -5592,6 +5900,8 @@ class MainWindow(QMainWindow):
         self._single_shot_running = bool(one_shot_running)
         if self._acquiring:
             self._experiment_active = True
+            if self._locked_interval_s is None:
+                self._locked_interval_s = self.interval_spin.value()
         # The recorder remains active while the Worker flushes and finalizes
         # files after transitioning to STOPPED. _on_experiment_finished owns
         # clearing this lock so exports cannot race final CSV writes.
@@ -5679,11 +5989,12 @@ class MainWindow(QMainWindow):
 
 
     def _update_controls(self) -> None:
-        idle = not self._acquiring and not self._start_pending
+        idle = not self._acquiring and not self._start_pending and not self._experiment_active and not self._finalization_pending
         self._update_experiment_directory_controls()
         command_ready = (
             idle and not self._diagnostic_pending and not self._connection_pending
             and not self._configure_pending and not self._zero_pending
+            and not self._control_mode_switch_pending
         )
         computer_control = not self._connected or self._simulation or self._control_mode == "computer"
         reason = (
@@ -5698,23 +6009,34 @@ class MainWindow(QMainWindow):
         if self._connected and not computer_control and (self._acquiring or self._start_pending):
             reason += "\nLocal 模式下不发送设置命令；切换到 Computer 后可操作。"
         self.mode_combo.setEnabled(command_ready and computer_control)
+        if hasattr(self, "mode_buttons"):
+            for button in self.mode_buttons.values():
+                button.setEnabled(command_ready and computer_control)
+            self._sync_mode_buttons()
+            self.connection_action_button.setEnabled(command_ready)
+            self.connection_action_button.setText("连接设置" if self._connected else "连接仪器")
+            self.measurement_settings_button.setEnabled(self._connected and command_ready and computer_control)
         spec = descriptor(self._current_mode)
         autorange_allowed = (
             self._simulation or spec.quantity != "current"
             or current_autorange_block_reason(self._current_mode, self._firmware, self._terminals) is None
         )
         self.autorange_check.setEnabled(command_ready and computer_control and autorange_allowed)
+        if hasattr(self, "main_range_combo"):
+            self._sync_main_range()
+            self.main_range_combo.setEnabled(command_ready and computer_control and self._connected)
+            auto_item = self.main_range_combo.model().item(0)
+            if auto_item is not None:
+                auto_item.setEnabled(autorange_allowed)
         self.range_combo.setEnabled(command_ready and computer_control and not self.autorange_check.isChecked())
-        # Measurement speed remains editable while acquiring; the Apply Speed
-        # action serializes the instrument update in the worker thread.
         settings_command_pending = self._configure_pending or self._zero_pending
         self.nplc_combo.setEnabled(
-            computer_control and not settings_command_pending
-            and bool(spec.nplc_values) and (idle or self._connected)
+            command_ready and computer_control and not settings_command_pending
+            and bool(spec.nplc_values)
         )
         self.bandwidth_combo.setEnabled(
-            computer_control and not settings_command_pending
-            and bool(spec.ac_bandwidths_hz) and (idle or self._connected)
+            command_ready and computer_control and not settings_command_pending
+            and bool(spec.ac_bandwidths_hz)
         )
         self.analog_filter_check.setEnabled(command_ready and computer_control and spec.analog_filter)
         self.input_impedance_auto_check.setEnabled(
@@ -5722,8 +6044,9 @@ class MainWindow(QMainWindow):
         )
         self._update_digital_filter_availability()
         self.autozero_check.setEnabled(command_ready and computer_control)
-        # Interval remains editable during acquisition and is applied by the worker immediately.
-        self.interval_spin.setEnabled(True)
+        self.interval_spin.setEnabled(command_ready and computer_control)
+        self.output_root.setEnabled(command_ready and computer_control)
+        self.output_root_browse_button.setEnabled(command_ready and computer_control)
         self.apply_button.setEnabled(command_ready and self._connected and computer_control)
         self.initialize_parameters_button.setEnabled(command_ready and computer_control)
         initialize_reason = ""
@@ -5735,20 +6058,21 @@ class MainWindow(QMainWindow):
             f"{initialize_reason}\n\n{self._initialize_parameters_tooltip}"
             if initialize_reason else self._initialize_parameters_tooltip
         )
-        self.apply_speed_button.setEnabled(
-            self._acquiring and self._connected and computer_control and not self._speed_update_pending
-            and bool(spec.nplc_values or spec.ac_bandwidths_hz)
-        )
+        self.apply_speed_button.setEnabled(False)
         zero_ready = self._zero_configuration_ready()
         self.zero_button.setEnabled(command_ready and self._connected and computer_control and zero_ready)
         history_load_ready = not self._history_load_pending
+        confirmed_settings_ready = (
+            self._instrument_mode_known
+            and self._current_mode.value in self._active_settings_by_mode
+        )
         self.start_button.setEnabled(
             command_ready and self._connected and computer_control
-            and self._experiment_name_valid and history_load_ready and not self._experiment_active
+            and confirmed_settings_ready and self._experiment_name_valid and history_load_ready and not self._experiment_active
         )
         self.single_button.setEnabled(
             command_ready and self._connected and computer_control
-            and self._experiment_name_valid and history_load_ready and not self._experiment_active
+            and confirmed_settings_ready and self._experiment_name_valid and history_load_ready and not self._experiment_active
         )
         if hasattr(self, "configuration_start_button"):
             self.configuration_start_button.setEnabled(self.start_button.isEnabled())
@@ -5905,6 +6229,17 @@ class MainWindow(QMainWindow):
             if self._experiment_active and not self._acquiring else
             "请先停止并保存当前实验，再清空图表；原始 CSV 会保留。"
         )
+        if hasattr(self, "reset_measurement_button"):
+            self.reset_measurement_button.setEnabled(
+                not self._history_load_pending and not self._start_pending
+                and not self._finalization_pending and not self._reset_plot_after_save
+                and (not self._experiment_active or self._acquiring)
+            )
+            self.save_curve_button.setEnabled(
+                self._experiment_csv_path is not None
+                and self._experiment_csv_path.is_file()
+                and self._curve_export_task is None
+            )
         self.clear_plot_button.setEnabled(can_clear_plot)
         self.clear_plot_button.setToolTip(clear_plot_tooltip)
         clear_plot_action = getattr(self, "clear_plot_action", None)
@@ -5928,12 +6263,12 @@ class MainWindow(QMainWindow):
         self.diagnose_button.setToolTip(reason or "读取仪器身份、配置与错误队列。")
         actions = getattr(self, "_shortcut_actions", {})
         for object_name, enabled in (
-            ("newMeasurementShortcutAction", self.new_measurement_button.isEnabled()),
+            ("newMeasurementShortcutAction", False),
             ("startShortcutAction", self.start_button.isEnabled()),
             ("singleShortcutAction", self.single_button.isEnabled()),
             ("pauseShortcutAction", self.pause_button.isEnabled()),
             ("stopShortcutAction", self.stop_button.isEnabled()),
-            ("eventShortcutAction", self.event_button.isEnabled()),
+            ("eventShortcutAction", False),
         ):
             action = actions.get(object_name)
             if action is not None:
@@ -6022,7 +6357,7 @@ class MainWindow(QMainWindow):
                     self.latest_invalid_label.setText(invalid_detail)
                     self.latest_invalid_log_button.setEnabled(True)
                     self.latest_invalid_label.setVisible(True)
-                    self.latest_invalid_log_button.setVisible(True)
+                    self.latest_invalid_log_button.hide()
                     self._update_latest_invalid_summary()
                     if status in {"timeout", "scpi_timeout"}:
                         self._show_recovery_guidance("普通读超时" if status == "timeout" else "SCPI响应超时")
@@ -6044,6 +6379,7 @@ class MainWindow(QMainWindow):
                         self._last_actual_range_si = None
                 self._plot_x.append(elapsed)
                 self._plot_y.append(value)
+                self._average_trace.append(elapsed, value, self._plot_break_pending)
                 if self._plot_y_origin is None:
                     self._plot_y_origin = value
                 self._plot_break_before.append(self._plot_break_pending)
@@ -6075,8 +6411,11 @@ class MainWindow(QMainWindow):
                 self._plot_metadata = deque(plot_metadata)
             if valid_rows:
                 self.plot_empty_overlay.hide()
-                self._refresh_curve()
-                self._update_plot_data_limits()
+                self.save_curve_button.setEnabled(
+                    self._experiment_csv_path is not None and self._experiment_csv_path.is_file()
+                    and self._curve_export_task is None
+                )
+                self._schedule_live_plot_refresh()
                 value = float(valid_rows[-1]["value_si"])
                 elapsed = float(valid_rows[-1]["elapsed_s"])
                 spec = descriptor(Mode(valid_rows[-1]["mode"]))
@@ -6085,7 +6424,7 @@ class MainWindow(QMainWindow):
                 self._update_readout_context()
                 if self._baseline is not None:
                     self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
-                    self.baseline_line.show()
+                    self.baseline_line.hide()
                     delta = value - self._baseline
                     percent = relative_change_percent(value, self._baseline, self._parse_threshold())
                     d_display, d_unit = engineering_value(delta, spec.unit_si)
@@ -6094,10 +6433,6 @@ class MainWindow(QMainWindow):
                 else:
                     self.baseline_line.hide()
                     self.change_label.setText("未设置基准值")
-                if self.follow_check.isChecked():
-                    right = max(AUTO_FOLLOW_MIN_WINDOW_S, elapsed + 1.0)
-                    left = max(0.0, right - AUTO_FOLLOW_WINDOW_S)
-                    self.plot_widget.setXRange(left, right, padding=0)
                 self._set_return_live_enabled(True)
             if rows:
                 self._update_stats(full_stats)
@@ -6109,7 +6444,7 @@ class MainWindow(QMainWindow):
 
     def _update_stats(self, full_stats: dict | None = None) -> None:
         stats = full_stats if full_stats is not None else summarize(self._plot_y)
-        spec = descriptor(self._current_mode)
+        spec = descriptor(self._display_plot_mode())
         def fmt(value):
             if value is None:
                 return "—"
@@ -6157,8 +6492,8 @@ class MainWindow(QMainWindow):
             self._region_stats_pending_overflow = False
             self._region_stats_values = None
             self._region_stats_last_sample_index = 0
-            self._region_stats_mode = self._current_mode
-            task = _RegionStatisticsTask(request_id, path, left, right, self._current_mode)
+            self._region_stats_mode = self._display_plot_mode()
+            task = _RegionStatisticsTask(request_id, path, left, right, self._display_plot_mode())
             task.signals.completed.connect(self._on_region_stats_finished)
             self._region_stats_tasks[request_id] = task
             self._region_stats_label.setText(
@@ -6209,7 +6544,7 @@ class MainWindow(QMainWindow):
         if request_id != self._region_stats_request_id:
             return
         self._region_stats_scanning = False
-        if self._region_stats_mode != self._current_mode:
+        if self._region_stats_mode != self._display_plot_mode():
             self._region_stats_pending_rows.clear()
             self._region_stats_pending_overflow = False
             self._region_stats_values = None
@@ -6249,7 +6584,7 @@ class MainWindow(QMainWindow):
             if sample_index <= last_sample_index:
                 continue
             last_sample_index = sample_index
-            if row.get("status") != "ok" or row.get("mode") != self._current_mode.value:
+            if row.get("status") != "ok" or row.get("mode") != self._display_plot_mode().value:
                 continue
             try:
                 elapsed, value = _region_successful_row_values(row, sample_index)
@@ -6268,7 +6603,7 @@ class MainWindow(QMainWindow):
         self._show_region_stats(stats, "完整原始 CSV")
 
     def _on_region_samples(self, rows: list[dict]) -> None:
-        if self._region_stats_mode is not None and self._region_stats_mode != self._current_mode:
+        if self._region_stats_mode is not None and self._region_stats_mode != self._display_plot_mode():
             self._update_region_stats()
             return
         if self._region_stats_scanning:
@@ -6297,7 +6632,7 @@ class MainWindow(QMainWindow):
             if sample_index <= self._region_stats_last_sample_index:
                 continue
             self._region_stats_last_sample_index = sample_index
-            if row.get("status") != "ok" or row.get("mode") != self._current_mode.value:
+            if row.get("status") != "ok" or row.get("mode") != self._display_plot_mode().value:
                 continue
             try:
                 elapsed, value = _region_successful_row_values(row, sample_index)
@@ -6316,7 +6651,7 @@ class MainWindow(QMainWindow):
             left, right = sorted(self._region.getRegion())
         else:
             left, right = self._region_stats_bounds
-        spec = descriptor(self._current_mode)
+        spec = descriptor(self._display_plot_mode())
 
         def fmt(value: float | None) -> str:
             if value is None:
@@ -6370,7 +6705,7 @@ class MainWindow(QMainWindow):
 
     def _describe_plot_point(self, x: float, y: float, sample_number: int, metadata: dict | None = None) -> str:
         row = metadata or {}
-        mode = self._current_mode
+        mode = self._display_plot_mode()
         try:
             mode = Mode(str(row.get("mode") or mode.value))
         except ValueError:
@@ -6417,37 +6752,12 @@ class MainWindow(QMainWindow):
         if not vb.sceneBoundingRect().contains(pos):
             return
         if callable(getattr(event, "double", None)) and event.double():
-            self._autoscale_plot()
+            self._enable_plot_autoscale()
             return
-        point = vb.mapSceneToView(pos)
-        self._lock_plot_point_at(point.x())
 
     def _on_mouse_moved(self, pos) -> None:
-        vb = self.plot_widget.getPlotItem().vb
-        if not vb.sceneBoundingRect().contains(pos):
-            return
-        point = vb.mapSceneToView(pos)
-        idx = self._nearest_plot_index(point.x())
-        if idx is None:
-            return
-        xs = list(self._plot_x)
-        y = self._plot_y[idx]
-        if self._crosshair_x is None:
-            self._crosshair_x = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#35485b", style=Qt.PenStyle.DotLine))
-            self._crosshair_y = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#35485b", style=Qt.PenStyle.DotLine))
-            self.plot_widget.addItem(self._crosshair_x, ignoreBounds=True)
-            self.plot_widget.addItem(self._crosshair_y, ignoreBounds=True)
-        self._crosshair_x.setPos(xs[idx])
-        self._crosshair_y.setPos(float(y) - (self._plot_y_origin or 0.0))
-        metadata = self._plot_metadata[idx] if idx < len(self._plot_metadata) else None
-        sample_number = int(metadata.get("sample_index") or idx + 1) if metadata else idx + 1
-        preview = self._describe_plot_point(float(xs[idx]), float(y), sample_number, metadata)
-        if self._selected_plot_point is None:
-            self.cursor_label.setText(f"预览：{preview} · 单击曲线锁定选点")
-        else:
-            locked_x, locked_y, locked_number = self._selected_plot_point
-            locked = self._describe_plot_point(locked_x, locked_y, locked_number, self._selected_plot_metadata)
-            self.cursor_label.setText(f"预览：{preview}  |  已锁定：{locked}")
+        """Keep the plot free of hover guides and selection markers."""
+        return
 
     def _parse_threshold(self) -> float:
         try:
@@ -6509,12 +6819,12 @@ class MainWindow(QMainWindow):
             self.change_label.setText("未设置基准值")
         else:
             self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
-            self.baseline_line.show()
+            self.baseline_line.hide()
         if self._experiment_active:
             if self._baseline is None:
                 event_text = f"{event}: 已清除基准值"
             else:
-                event_text = f"{event}: {self._baseline:.17g} {descriptor(self._current_mode).unit_si}"
+                event_text = f"{event}: {self._baseline:.17g} {descriptor(self._display_plot_mode()).unit_si}"
             self._bridge.mark_event.emit(event_text)
             self._add_event_marker(event_text)
 
@@ -6655,11 +6965,14 @@ class MainWindow(QMainWindow):
             xRange=(elapsed - span / 2, elapsed + span / 2), padding=0
         )
 
+    def _display_plot_mode(self) -> Mode:
+        return self._plot_data_mode if self._plot_y and self._plot_data_mode is not None else self._current_mode
+
     def _sync_plot_y_span_control(self, *_args) -> None:
         edit = getattr(self, "y_axis_span_edit", None)
         if edit is None:
             return
-        unit = descriptor(self._current_mode).unit_si
+        unit = descriptor(self._display_plot_mode()).unit_si
         self.y_axis_span_unit_label.setText("Ω" if unit == "Ohm" else unit)
         if edit.hasFocus():
             return
@@ -6673,10 +6986,16 @@ class MainWindow(QMainWindow):
         if isinstance(axis, _OffsetValueAxis):
             axis.value_offset = self._plot_y_origin or 0.0
             y_min, y_max = self.view_box.viewRange()[1]
+            # Plot coordinates are deltas from the origin; units follow the
+            # absolute reading, not the (often much smaller) noise span.
+            midpoint = axis.value_offset + float(y_min) / 2 + float(y_max) / 2
+            magnitude = abs(midpoint)
+            if not math.isfinite(magnitude) or magnitude == 0:
+                magnitude = abs(float(y_max) - float(y_min))
             axis.display_factor, axis.display_unit = _engineering_axis_scale(
-                float(y_max - y_min), descriptor(self._current_mode).unit_si,
+                magnitude, descriptor(self._display_plot_mode()).unit_si,
             )
-            spec = descriptor(self._current_mode)
+            spec = descriptor(self._display_plot_mode())
             title = spec.display_quantity
             span = float(y_max - y_min)
             if axis.value_offset and math.isfinite(span) and span > 0 and abs(axis.value_offset) > span * 1e6:
@@ -6684,6 +7003,8 @@ class MainWindow(QMainWindow):
                 title = f"{title} · 刻度相对 {origin_value:.6g} {origin_unit}"
             if self._history_mode:
                 title = f"历史数据 · {title}"
+            elif self._plot_y and self._display_plot_mode() != self._current_mode:
+                title = f"上一轮 · {title}"
             if (
                 axis.labelText != title
                 or axis.labelUnits != axis.display_unit
@@ -6692,6 +7013,18 @@ class MainWindow(QMainWindow):
                     "left", title, units=axis.display_unit, color="#697470",
                 )
             axis.update()
+
+    def _sync_plot_x_axis(self, *_args) -> None:
+        axis = getattr(self, "x_axis", None)
+        if not isinstance(axis, _OffsetValueAxis):
+            return
+        x_min, x_max = self.view_box.viewRange()[0]
+        span = abs(float(x_max) - float(x_min))
+        factor, unit = (3600.0, "h") if span >= 3600 else (60.0, "min") if span >= 60 else (1.0, "s")
+        axis.display_factor, axis.display_unit = factor, unit
+        if axis.labelUnits != unit:
+            self.plot_widget.setLabel("bottom", "实验经过时间", units=unit, color="#697470")
+        axis.update()
 
     def _apply_plot_y_span(self, *_args) -> None:
         try:
@@ -6740,7 +7073,7 @@ class MainWindow(QMainWindow):
         self.view_box.updateViewRange(forceY=True)
         actual_y_min, actual_y_max = self.view_box.viewRange()[1]
         actual_span = float(actual_y_max - actual_y_min)
-        unit = "Ω" if descriptor(self._current_mode).unit_si == "Ohm" else descriptor(self._current_mode).unit_si
+        unit = "Ω" if descriptor(self._display_plot_mode()).unit_si == "Ohm" else descriptor(self._display_plot_mode()).unit_si
         self._sync_plot_y_span_control()
         if not math.isfinite(actual_span) or actual_span <= 0:
             if previous_origin is not None:
@@ -6803,8 +7136,9 @@ class MainWindow(QMainWindow):
         self._single_shot_running = False
         self._paused = False
         self._experiment_active = False
+        self._finalization_pending = True
         if self._shutdown_started:
-            self.shutdown_status_label.setText("采集数据已保存，正在关闭仪器连接与后台工作线程…")
+            self.shutdown_status_label.setText("正在确认数据保存结果，并关闭仪器连接与后台工作线程…")
             self.statusBar().showMessage(self.shutdown_status_label.text())
         self._append_log(f"实验文件夹：{directory}")
         self.status_dot.setProperty("state", "idle")
@@ -6817,7 +7151,10 @@ class MainWindow(QMainWindow):
 
     @Slot(str, bool, str)
     def _on_experiment_save_result(self, directory: str, saved_ok: bool, detail: str) -> None:
+        self._finalization_pending = False
+        self._locked_interval_s = None
         if not saved_ok:
+            self._reset_plot_after_save = False
             self._set_operation_status("保存失败", state="error", detail=detail)
             self.statusBar().showMessage(detail, 20000)
             self._user_stop_pending = False
@@ -6860,6 +7197,9 @@ class MainWindow(QMainWindow):
         if self._new_measurement_after_save:
             self._new_measurement_save_succeeded = True
             self._new_measurement_save_directory = directory
+        if self._reset_plot_after_save:
+            self._reset_plot_after_save = False
+            self._reset_measurement_plot()
         self._update_controls()
         self._maybe_open_new_measurement_after_save()
 
@@ -6887,6 +7227,7 @@ class MainWindow(QMainWindow):
         # fails, _show_error clears the pending state while preserving the old
         # plot and its saved CSV reference.
         self._clear_plot()
+        self._plot_data_mode = self._current_mode
         for mode in Mode:
             self._profiles[mode.value]["baseline"] = None
         self._baseline = None
@@ -6898,7 +7239,7 @@ class MainWindow(QMainWindow):
         self.region_end_spin.setValue(60.0)
         self._region.setRegion((0.0, 60.0))
         self._save_profiles()
-        self._return_to_live_view()
+        self._update_plot_data_limits()
         self._start_pending = False
         self._user_stop_pending = False
         self._last_acquisition_issue = ""
@@ -7454,8 +7795,71 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
 
+    def _refresh_live_plot_now(self) -> None:
+        self._last_plot_frame_refresh = time.monotonic()
+        if not self._plot_x:
+            return
+        self._refresh_curve()
+        self._update_plot_data_limits()
+        self._update_chart_auto_ranges(update_x=not self.view_box.drag_in_progress)
+
+    def _schedule_live_plot_refresh(self) -> None:
+        elapsed = time.monotonic() - self._last_plot_frame_refresh
+        if len(self._plot_x) < 1000 or elapsed >= 0.15:
+            self._plot_frame_timer.stop()
+            self._refresh_live_plot_now()
+        elif not self._plot_frame_timer.isActive():
+            self._plot_frame_timer.start(max(1, math.ceil((0.15 - elapsed) * 1000)))
+
+    def _on_average_window_changed(self, count: int) -> None:
+        self._average_trace.set_window(count)
+        if hasattr(self, "average_curve"):
+            self._average_refresh_timer.stop()
+            self._refresh_average_now()
+
+    def _refresh_average_now(self) -> None:
+        self._average_last_refresh = time.monotonic()
+        self.average_curve.setVisible(not self._history_mode)
+        if self._history_mode:
+            return
+        self._refresh_average_curve(
+            self._plot_y_origin or 0.0,
+            descriptor(self._display_plot_mode()).quantity == "voltage",
+        )
+
+    def _schedule_average_refresh(self) -> None:
+        elapsed = time.monotonic() - self._average_last_refresh
+        if len(self._average_trace.samples) < 1000 or elapsed >= 0.2:
+            self._average_refresh_timer.stop()
+            self._refresh_average_now()
+        elif not self._average_refresh_timer.isActive():
+            self._average_refresh_timer.start(max(1, math.ceil((0.2 - elapsed) * 1000)))
+
+    def _refresh_average_curve(self, origin: float, is_voltage: bool) -> None:
+        samples = self._average_trace.samples
+        if not samples:
+            self.average_curve.setData([], [])
+            return
+        xs = [sample[0] for sample in samples]
+        gaps = [sample[2] for sample in samples]
+        ys = list(self._average_trace.values)
+        if len(xs) > MAX_LIVE_RENDER_POINTS:
+            xs, ys, gaps, _ = downsample_plot_data(
+                xs, ys, gaps, [{}] * len(xs), max_points=MAX_LIVE_RENDER_POINTS,
+            )
+        draw_x, draw_y = [], []
+        for index, (x, y, gap) in enumerate(zip(xs, ys, gaps)):
+            if index and gap:
+                draw_x.append((float(xs[index - 1]) + float(x)) / 2)
+                draw_y.append(math.nan)
+            draw_x.append(x)
+            draw_y.append(
+                math.nan if is_voltage and not _voltage_plot_value_is_visible(y) else y - origin
+            )
+        self.average_curve.setData(draw_x, draw_y, connect="finite", clipToView=True)
+
     def _refresh_curve(self) -> None:
-        is_voltage = descriptor(self._current_mode).quantity == "voltage"
+        is_voltage = descriptor(self._display_plot_mode()).quantity == "voltage"
         if is_voltage:
             limit = VOLTAGE_PLOT_ABSOLUTE_LIMIT_V
             current_origin = self._plot_y_origin
@@ -7613,6 +8017,7 @@ class MainWindow(QMainWindow):
             downsampleMethod="peak",
             clipToView=self._plot_x_nondecreasing,
         )
+        self._schedule_average_refresh()
         self._plot_y_anchor_x = x_array
         anchor_values = np.asarray(self._plot_y, dtype=float)
         has_out_of_range_voltage = False
@@ -7631,7 +8036,7 @@ class MainWindow(QMainWindow):
                 self.voltage_range_warning.hide()
         if self._baseline is not None:
             self.baseline_line.setValue(float(self._baseline) - origin)
-            self.baseline_line.show()
+            self.baseline_line.hide()
         if self._selected_plot_point is not None:
             selected_x, selected_y, _sample_number = self._selected_plot_point
             self._locked_cursor_marker.setData([selected_x], [selected_y - origin])
@@ -7657,7 +8062,7 @@ class MainWindow(QMainWindow):
         if not math.isfinite(new_origin):
             return
         if (
-            descriptor(self._current_mode).quantity == "voltage"
+            descriptor(self._display_plot_mode()).quantity == "voltage"
             and abs(new_origin) > VOLTAGE_PLOT_ABSOLUTE_LIMIT_V
         ):
             return
@@ -7803,7 +8208,7 @@ class MainWindow(QMainWindow):
         points = self._history_overview_data if self._history_mode and self._history_overview_data else None
         plot_x = points["x"] if points is not None else self._plot_x
         plot_y = points["y"] if points is not None else self._plot_y
-        if descriptor(self._current_mode).quantity == "voltage":
+        if descriptor(self._display_plot_mode()).quantity == "voltage":
             plot_y = [
                 float(value) for value in plot_y
                 if _voltage_plot_value_is_visible(float(value))
@@ -7812,7 +8217,7 @@ class MainWindow(QMainWindow):
         if not plot_x or not plot_y:
             self.view_box.set_pan_x_data_bounds(None)
             self.view_box.set_pan_y_data_bounds(None)
-            y_view_min, y_view_max = _mode_plot_y_view_limits(self._current_mode, origin, 0.0, 0.0)
+            y_view_min, y_view_max = _mode_plot_y_view_limits(self._display_plot_mode(), origin, 0.0, 0.0)
             self.view_box.setLimits(yMin=y_view_min, yMax=y_view_max)
             return
         first_x = float(plot_x[0])
@@ -7827,23 +8232,72 @@ class MainWindow(QMainWindow):
         self.view_box.set_pan_y_data_bounds((min_y, max_y))
         x_margin = max((max_x - min_x) * 0.05, abs(min_x) * 1e-12, 1e-6)
         y_margin = _plot_y_margin(min_y + origin, max_y + origin)
-        y_view_min, y_view_max = _mode_plot_y_view_limits(self._current_mode, origin, min_y, max_y)
+        y_view_min, y_view_max = _mode_plot_y_view_limits(self._display_plot_mode(), origin, min_y, max_y)
         self.view_box.setLimits(
-            xMin=0.0 if self.follow_check.isChecked() else min_x - x_margin,
+            xMin=0.0 if self.follow_check.isChecked() else min(0.0, min_x - x_margin),
             xMax=max_x + max(x_margin, AUTO_FOLLOW_WINDOW_S) if self.follow_check.isChecked() else max_x + x_margin,
             yMin=y_view_min,
             yMax=y_view_max,
         )
 
+    def _enable_plot_autoscale(self) -> None:
+        self.x_auto_check.setChecked(True)
+        self.y_auto_check.setChecked(True)
+        self._update_chart_auto_ranges()
+
+    def _update_chart_auto_ranges(self, *, update_x: bool = True) -> None:
+        """Fit each enabled axis independently without changing manual spans."""
+        if getattr(self, "_updating_chart_auto_ranges", False):
+            return
+        if not hasattr(self, "view_box") or not self._plot_x:
+            return
+        self._updating_chart_auto_ranges = True
+        try:
+            view = self.view_box
+            view.enableAutoRange(x=False, y=False)
+            latest = float(self._plot_x[-1])
+            if update_x and self.x_auto_check.isChecked():
+                view.setXRange(0.0, max(latest + max(abs(latest) * 0.005, 1e-9), 1e-6), padding=0)
+            elif update_x and self.follow_check.isChecked():
+                x0, x1 = view.viewRange()[0]
+                span = max(float(x1 - x0), 1e-9)
+                right = max(latest, span)
+                view.setXRange(right - span, right, padding=0)
+            if not self.y_auto_check.isChecked():
+                return
+            x0, x1 = view.viewRange()[0]
+            is_voltage = descriptor(self._display_plot_mode()).quantity == "voltage"
+            values = [
+                float(y) for x, y in zip(self._plot_x, self._plot_y)
+                if x0 <= float(x) <= x1 and math.isfinite(float(y))
+                and (not is_voltage or _voltage_plot_value_is_visible(float(y)))
+            ]
+            if not self._history_mode:
+                values.extend(
+                    float(y) for sample, y in zip(self._average_trace.samples, self._average_trace.values)
+                    if x0 <= float(sample[0]) <= x1 and math.isfinite(float(y))
+                    and (not is_voltage or _voltage_plot_value_is_visible(float(y)))
+                )
+            if values:
+                minimum, maximum = min(values), max(values)
+                margin = _plot_y_margin(minimum, maximum)
+                origin = self._plot_y_origin or 0.0
+                view.setYRange(minimum - origin - margin, maximum - origin + margin, padding=0)
+        finally:
+            self._updating_chart_auto_ranges = False
+
     def _autoscale_plot(self) -> None:
         self.follow_check.setChecked(False)
+        self._fit_plot_to_data()
+
+    def _fit_plot_to_data(self) -> None:
         if self._history_mode and self._history_overview_data is not None:
             self._show_history_overview()
         self._update_plot_data_limits()
         points = self._history_overview_data if self._history_mode and self._history_overview_data else None
         plot_x = points["x"] if points is not None else self._plot_x
         plot_y = points["y"] if points is not None else self._plot_y
-        is_voltage = descriptor(self._current_mode).quantity == "voltage"
+        is_voltage = descriptor(self._display_plot_mode()).quantity == "voltage"
         if is_voltage:
             plot_y = [
                 float(value) for value in plot_y
@@ -7861,7 +8315,7 @@ class MainWindow(QMainWindow):
             x_margin = max((last_x - first_x) * 0.05, abs(first_x) * 1e-12, 1e-6)
             y_margin = _plot_y_margin(min_y + origin, max_y + origin)
             self.view_box.setRange(
-                xRange=(first_x - x_margin, last_x + x_margin),
+                xRange=(0.0, max(last_x + x_margin, 1e-6)),
                 yRange=(min_y - y_margin, max_y + y_margin),
                 padding=0,
             )
@@ -7870,10 +8324,10 @@ class MainWindow(QMainWindow):
             first_x = float(plot_x[0])
             last_x = float(plot_x[-1])
             origin = self._plot_y_origin or 0.0
-            y_lower, y_upper = _mode_plot_y_view_limits(self._current_mode, origin, 0.0, 0.0)
+            y_lower, y_upper = _mode_plot_y_view_limits(self._display_plot_mode(), origin, 0.0, 0.0)
             x_margin = max((last_x - first_x) * 0.05, abs(first_x) * 1e-12, 1e-6)
             self.view_box.setRange(
-                xRange=(first_x - x_margin, last_x + x_margin),
+                xRange=(0.0, max(last_x + x_margin, 1e-6)),
                 yRange=(y_lower, y_upper),
                 padding=0,
             )
@@ -7892,15 +8346,7 @@ class MainWindow(QMainWindow):
         self._set_return_live_enabled(bool(self._plot_x))
         self.follow_check.setChecked(True)
         self._update_plot_data_limits()
-        if self._plot_x and self._plot_y:
-            right = max(AUTO_FOLLOW_MIN_WINDOW_S, float(self._plot_x[-1]) + 1.0)
-            left = max(0.0, right - AUTO_FOLLOW_WINDOW_S)
-            self.plot_widget.getPlotItem().enableAutoRange(x=False)
-            self.plot_widget.setXRange(left, right, padding=0)
-            self.plot_widget.getPlotItem().enableAutoRange(y=True)
-        else:
-            self.plot_widget.getPlotItem().enableAutoRange(x=True, y=True)
-            self.plot_widget.autoRange(padding=0.04)
+        self._fit_plot_to_data()
 
     def _save_live_plot_snapshot(self) -> None:
         if self._history_mode or self._live_plot_snapshot is not None:
@@ -7958,7 +8404,7 @@ class MainWindow(QMainWindow):
             self.baseline_line.hide()
         else:
             self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
-            self.baseline_line.show()
+            self.baseline_line.hide()
         self.latest_value_label.setText(snapshot["latest_text"])
         self.actual_rate_label.setText(snapshot["rate_text"])
         self.change_label.setText(snapshot["change_text"])
@@ -7972,7 +8418,7 @@ class MainWindow(QMainWindow):
             not self._short_viewport_layout or bool(self._latest_invalid_log_text)
         )
         self.latest_invalid_log_button.setEnabled(bool(self._latest_invalid_log_text))
-        self.latest_invalid_log_button.setVisible(bool(self._latest_invalid_log_text))
+        self.latest_invalid_log_button.hide()
         self._last_acquisition_issue = snapshot["acquisition_issue"]
         recovery_hint = snapshot.get("recovery_hint_full", snapshot["recovery_hint"])
         self.recovery_hint_label.setToolTip(recovery_hint)
@@ -8018,8 +8464,14 @@ class MainWindow(QMainWindow):
         self._region_stats_last_sample_index = 0
         self._region_stats_bounds = None
         self._experiment_csv_path = None
+        self._plot_data_mode = None
         self._plot_x.clear()
         self._plot_y.clear()
+        self._average_trace.clear()
+        self._plot_frame_timer.stop()
+        self._last_plot_frame_refresh = 0.0
+        self._average_refresh_timer.stop()
+        self._average_last_refresh = 0.0
         self._plot_y_anchor_x = np.asarray([], dtype=float)
         self._plot_y_anchor_values = np.asarray([], dtype=float)
         self._plot_y_origin = None
@@ -8033,7 +8485,7 @@ class MainWindow(QMainWindow):
         self.latest_invalid_label.setToolTip("采集中的无效读数及其原因会显示在这里")
         self.latest_invalid_label.setVisible(not self._short_viewport_layout)
         self.latest_invalid_log_button.setEnabled(False)
-        self.latest_invalid_log_button.setVisible(not self._short_viewport_layout)
+        self.latest_invalid_log_button.hide()
         self.display_loss_warning.clear()
         self.display_loss_warning.hide()
         self._last_acquisition_issue = ""
@@ -8059,6 +8511,7 @@ class MainWindow(QMainWindow):
         self._last_actual_range_si = None
         self.valid_sample_count_label.setText("有效样本 0")
         self.curve.setData([], [])
+        self.average_curve.setData([], [])
         self.plot_empty_overlay.show()
         self.plot_empty_title.setText("等待采样")
         self.plot_empty_hint.setText("连接 Fluke 8845A 后开始单次测量或连续采集")
@@ -8187,7 +8640,7 @@ class MainWindow(QMainWindow):
             self.change_label.setText("未设置基准值")
         else:
             self.baseline_line.setValue(float(self._baseline) - (self._plot_y_origin or 0.0))
-            self.baseline_line.show()
+            self.baseline_line.hide()
             delta = last_value - self._baseline
             percent = relative_change_percent(last_value, self._baseline, self._parse_threshold())
             d_display, d_unit = engineering_value(delta, spec.unit_si)
@@ -8204,7 +8657,7 @@ class MainWindow(QMainWindow):
         )
 
     def _screenshot_context_lines(self) -> tuple[str, str, str]:
-        spec = descriptor(self._current_mode)
+        spec = descriptor(self._display_plot_mode())
         source = self._experiment_csv_path
         if source is None:
             experiment = self.experiment_name.text().strip()
@@ -8227,10 +8680,52 @@ class MainWindow(QMainWindow):
         exported_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         display_unit = "Ω" if spec.unit_si == "Ohm" else spec.unit_si
         return (
-            f"实验：{experiment} · 模式：{spec.display_quantity} ({self._current_mode.value}) · 单位：{display_unit}",
+            f"实验：{experiment} · 模式：{spec.display_quantity} ({self._display_plot_mode().value}) · 单位：{display_unit}",
             f"导出时间：{exported_at} · 时间范围：{time_range}",
             f"基准线：{baseline}",
         )
+
+    def _save_curve_csv(self) -> None:
+        source = self._experiment_csv_path
+        if self._curve_export_task is not None:
+            self.statusBar().showMessage("正在保存曲线，请稍候。", 5000)
+            return
+        if source is None or not source.is_file():
+            self.statusBar().showMessage("暂无可保存的测量数据。", 5000)
+            return
+        suggestion = source.with_name(f"{source.stem}_曲线.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "保存曲线 CSV", str(suggestion), "CSV 文件 (*.csv)")
+        if not path:
+            return
+        destination = Path(path)
+        if destination.suffix.casefold() != ".csv":
+            destination = destination.with_suffix(".csv")
+        if destination.exists() or detailed_curve_path(destination).exists():
+            self.statusBar().showMessage("简洁或详细 CSV 已存在，请选择新文件名。", 8000)
+            return
+        task = CurveExportTask(source, destination, self.average_window_spin.value())
+        task.signals.completed.connect(self._on_curve_csv_saved)
+        self._curve_export_task = task
+        self._update_controls()
+        self.statusBar().showMessage("正在后台保存曲线 CSV…")
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(str, int, object)
+    def _on_curve_csv_saved(self, destination: str, count: int, error: object) -> None:
+        self._curve_export_task = None
+        if self._shutdown_started:
+            self._record_shutdown_file_task_result("曲线 CSV", error)
+            return
+        self._update_controls()
+        if error:
+            message = f"保存曲线失败：{error}"
+            self._append_log(f"! {message}")
+            self.statusBar().showMessage(message, 15000)
+            QMessageBox.warning(self, "保存曲线失败", message)
+            return
+        self.statusBar().showMessage(f"已保存 {count} 条曲线数据：{destination} 和 {detailed_curve_path(destination)}", 15000)
+        self._record_file_export_result("曲线 CSV", destination)
+        self._record_file_export_result("详细曲线 CSV", detailed_curve_path(destination))
 
     def _save_screenshot(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "保存曲线截图", "Fluke8845A_curve.png", "PNG 图像 (*.png)")
@@ -8396,12 +8891,17 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _show_error(self, message: str) -> None:
         operation_was_pending = self._configure_pending or self._zero_pending
+        configuration_failed = self._configure_pending
         self._connection_pending = False
         self._start_pending = False
         self._diagnostic_pending = False
         self._configure_pending = False
         self._zero_pending = False
         self._event_save_pending = False
+        if configuration_failed:
+            self._instrument_mode_known = False
+            self._active_settings_by_mode.clear()
+            self._update_instrument_readback_status()
         if operation_was_pending:
             self._set_operation_status("操作失败", state="failure", detail=message)
         self.statusBar().showMessage(message, 12000)
@@ -8421,6 +8921,7 @@ class MainWindow(QMainWindow):
             ("_safe_measurements_export_task", "测量安全副本"),
             ("_share_export_task", "实验分享包"),
             ("_snapshot_task", "实验快照"),
+            ("_curve_export_task", "曲线 CSV"),
         )
         pending = [label for attribute, label in file_tasks if getattr(self, attribute, None) is not None]
         if self._history_load_task is not None:

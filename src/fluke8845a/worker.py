@@ -613,6 +613,17 @@ class MeasurementWorker(QObject):
     def configure_mode(
         self, settings: ModeSettings, confirmed_settings: ModeSettings | None = None,
     ) -> None:
+        self._configure_mode(settings, confirmed_settings, allow_mode_switch=False)
+
+    @Slot(object)
+    def configure_mode_without_wiring_confirmation(self, settings: ModeSettings) -> None:
+        """Switch function without claiming that external wiring was checked."""
+        self._configure_mode(settings, None, allow_mode_switch=True)
+
+    def _configure_mode(
+        self, settings: ModeSettings, confirmed_settings: ModeSettings | None,
+        *, allow_mode_switch: bool,
+    ) -> None:
         if self.state != AcquisitionState.STOPPED:
             self.error.emit("必须先停止采集，再切换测量模式")
             return
@@ -621,7 +632,13 @@ class MeasurementWorker(QObject):
             return
         if not self._require_computer_control():
             return
-        if not self._require_wiring_confirmation(
+        if allow_mode_switch and settings.mode == self.current_mode:
+            previous = self._settings_by_mode.get(settings.mode)
+            if (previous is None or previous.autorange != settings.autorange
+                    or previous.range_si != settings.range_si):
+                self.error.emit("电流量程或现有配置尚未确认，请重新核对后应用。")
+                return
+        if not allow_mode_switch and not self._require_wiring_confirmation(
             settings, confirmed_settings, starting_experiment=False,
         ):
             return

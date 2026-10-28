@@ -3024,11 +3024,10 @@ ui.canvas.addEventListener("wheel", (event) => {
   const xAnchor = xRange[0] + xFraction * (xRange[1] - xRange[0]);
   const yRange = currentYAxisRange(scale);
   const currentOrigin = Number.isFinite(app.yOrigin) ? app.yOrigin : (scale.yOrigin || 0);
-  const yAnchor = event.altKey ? -currentOrigin : interpolateYAxisValue(yRange[0], yRange[1], yFraction);
-  const zoomSensitivity = event.altKey ? 0.18 : 0.9;
-  const factor = Math.exp(event.deltaY / 120 * zoomSensitivity);
-  const zoomX = !event.altKey && (event.ctrlKey || event.shiftKey);
-  const zoomY = event.altKey || event.ctrlKey || !event.shiftKey;
+  const yAnchor = interpolateYAxisValue(yRange[0], yRange[1], yFraction);
+  const factor = Math.exp(event.deltaY / 120 * 0.18);
+  const zoomX = !event.ctrlKey;
+  const zoomY = event.ctrlKey || !event.shiftKey;
   const zoomRange = (min, max, anchor, minimumSpan, maximumSpan) => {
     const span = Math.max(minimumSpan, Math.min(maximumSpan, (max - min) * factor));
     const relative = (anchor - min) / (max - min || 1);

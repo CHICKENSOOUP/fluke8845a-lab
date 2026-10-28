@@ -1595,7 +1595,7 @@ def test_extracted_source_web_smoke_serves_current_health_and_asset_fingerprints
 
     assert report["health"]["status"] == "ok"
     assert report["health"]["bind"] == "127.0.0.1"
-    assert report["health"]["version"] == "1.1.0"
+    assert report["health"]["version"] == "2.0.0"
     assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
     for route, filename in {
         "/": "index.html",
@@ -1722,7 +1722,7 @@ def test_release_workflow_stages_and_verifies_both_publications():
     workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
     oras_arguments = workflow.split("$orasArguments = @(\n", 1)[1].split("\n          )", 1)[0]
     assert "release-notes-v$($metadata.version).md" in workflow
-    assert "          $releaseNotes\n\n          ---\n\n          Automated source-only package" in workflow
+    assert "          $releaseNotes\n\n          ---\n\n          Source commit:" in workflow
     assert workflow.index("GitHub draft Release creation failed before GHCR publish") < workflow.index('"push",')
     assert '"push",' in oras_arguments
     assert '"--disable-path-validation"' in oras_arguments

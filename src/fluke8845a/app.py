@@ -49,18 +49,16 @@ class _MockE2EReceiver(QObject):
         super().__init__()
         self._callback = callback
 
-    @Slot(str)
-    def experiment_finished(self, directory: str) -> None:
-        self._callback(directory)
+    @Slot(str, bool, str)
+    def experiment_saved(self, directory: str, saved_ok: bool, detail: str) -> None:
+        self._callback(directory, saved_ok, detail)
 
 
 def _application_icon_path() -> Path | None:
     """Find the app icon in source runs and the portable Windows package."""
-    icon_name = Path("assets") / "fluke8845a_app_icon_v3.png"
-    candidates = (
-        Path(sys.argv[0]).resolve().parent / icon_name,
-        Path(__file__).resolve().parents[2] / icon_name,
-    )
+    icon_names = ("fluke8845a_app_icon_v3.ico", "fluke8845a_app_icon_v3.png")
+    roots = (Path(sys.argv[0]).resolve().parent, Path(__file__).resolve().parents[2])
+    candidates = tuple(root / "assets" / name for name in icon_names for root in roots)
     return next((path for path in candidates if path.is_file()), None)
 
 
@@ -652,11 +650,11 @@ def run_real_gui_speed_probe(
             prior_config_count = len(configuration_updates)
             probe_configuration_attempted = True
             with patch.object(
-                WiringConfirmationDialog, "exec", return_value=QDialog.DialogCode.Accepted
+                QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
             ):
                 window._apply_settings()
             pump_until(
-                lambda: len(configuration_updates) > prior_config_count,
+                lambda: len(configuration_updates) > prior_config_count and not window._configure_pending,
                 10.0,
                 "仪表配置与SCPI回读",
             )
@@ -696,32 +694,13 @@ def run_real_gui_speed_probe(
             # This CLI flag stands in for the normal GUI's wiring diagram confirmation,
             # after the instrument identity, function and terminals have been checked.
             with patch.object(
-                WiringConfirmationDialog, "exec", return_value=QDialog.DialogCode.Accepted
+                QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
             ):
                 window._start_continuous()
             run_started = time.monotonic()
-            first_change_sent = False
-            second_change_sent = False
-            first_interval_sent = False
-            second_interval_sent = False
-            first_change_at = min(2.0, duration_s * 0.22)
-            second_change_at = min(6.0, duration_s * 0.55)
-            first_interval_at = min(1.25, duration_s * 0.16)
-            second_interval_at = min(4.5, duration_s * 0.45)
-            ac_source_frequency = (
-                acv_source_frequency_hz if measurement_mode == Mode.ACV
-                else aci_source_frequency_hz if measurement_mode == Mode.ACI
-                else None
-            )
-            speed_first, speed_second = _probe_speed_change_values(
-                measurement_mode, ac_bandwidth_hz, ac_source_frequency,
-            )
-            speed_combo = window.bandwidth_combo if spec.ac_bandwidths_hz else window.nplc_combo
             capture_deadline = min(
                 run_started + duration_s,
-                wall_deadline
-                - HARDWARE_PROBE_CLEANUP_RESERVE_S
-                - HARDWARE_PROBE_GUI_DRAIN_RESERVE_S,
+                wall_deadline - HARDWARE_PROBE_CLEANUP_RESERVE_S - HARDWARE_PROBE_GUI_DRAIN_RESERVE_S,
             )
             while time.monotonic() < capture_deadline:
                 app.processEvents()
@@ -729,43 +708,7 @@ def run_real_gui_speed_probe(
                     raise RuntimeError(errors[-1])
                 if not window._connected:
                     raise RuntimeError("连续采集期间仪器连接中断")
-                elapsed = time.monotonic() - run_started
-                if elapsed >= first_interval_at and not first_interval_sent:
-                    prior_changes = sum("目标采样间隔由" in line for line in communication_log)
-                    window.interval_spin.setValue(0.5)
-                    pump_until(
-                        lambda: sum("目标采样间隔由" in line for line in communication_log) > prior_changes,
-                        5.0,
-                        "目标采样间隔调整为0.5秒",
-                    )
-                    interval_results.append({"displayed_interval_s": 0.5, "logged": True})
-                    first_interval_sent = True
-                if elapsed >= second_interval_at and not second_interval_sent:
-                    prior_changes = sum("目标采样间隔由" in line for line in communication_log)
-                    window.interval_spin.setValue(0.0)
-                    pump_until(
-                        lambda: sum("目标采样间隔由" in line for line in communication_log) > prior_changes,
-                        5.0,
-                        "目标采样间隔调整为最快可用",
-                    )
-                    interval_results.append({"displayed_interval_s": 0.0, "logged": True})
-                    second_interval_sent = True
-                if elapsed >= first_change_at and not first_change_sent:
-                    pump_until(lambda: not window._speed_update_pending, 5.0, "初始速度参数空闲")
-                    speed_combo.setCurrentIndex(speed_combo.findData(speed_first))
-                    window._apply_acquisition_speed()
-                    first_change_sent = True
-                if elapsed >= second_change_at and not second_change_sent:
-                    pump_until(lambda: not window._speed_update_pending, 5.0, "恢复速度参数空闲")
-                    speed_combo.setCurrentIndex(speed_combo.findData(speed_second))
-                    window._apply_acquisition_speed()
-                    second_change_sent = True
                 time.sleep(0.005)
-            pump_until(lambda: not window._speed_update_pending, 5.0, "最后一次速度回读")
-            if not first_change_sent or not second_change_sent or not first_interval_sent or not second_interval_sent:
-                raise RuntimeError("GUI硬件探测没有完成两次速度及两次间隔变更")
-            if len(speed_results) < 2 or not all(item[0] for item in speed_results[-2:]):
-                raise RuntimeError(f"GUI实时调速未全部获仪表回读确认：{speed_results}")
             displayed_actual_interval = window.actual_rate_label.text()
             missing_rate_values = {"—", "等待第二个有效读数", "等待有效读数"}
             if displayed_actual_interval in missing_rate_values:
@@ -928,32 +871,9 @@ def run_real_gui_speed_probe(
                     f"（CSV重建{reconstructed_rate:g} Hz）"
                 )
             report["csv_reconstructed_actual_rate_hz"] = reconstructed_rate
-            speed_key = "ac_bandwidth_hz" if descriptor(measurement_mode).ac_bandwidths_hz else "nplc"
-            expected_speed_values = [speed_first, speed_second]
-            if len(changes) != 2 or [change.get(speed_key) for change in changes] != expected_speed_values:
-                raise RuntimeError(f"配置文件中的实时速度变更记录不符：{changes}")
-            for change in changes:
-                index = int(change["effective_sample_index"]) - 1
-                if index < 0 or index >= len(rows) or not math.isclose(
-                    float(rows[index][speed_key]), float(change[speed_key]), abs_tol=1e-12
-                ):
-                    raise RuntimeError(f"第{index + 1}条CSV记录未反映生效参数{speed_key}={change[speed_key]}")
-            interval_values = [change.get("target_interval_s") for change in interval_changes]
-            if len(interval_changes) != 2 or interval_values != [0.5, None]:
-                raise RuntimeError(f"配置文件中的实时采样间隔变更记录不符：{interval_changes}")
+            if changes or interval_changes:
+                raise RuntimeError("采集期间出现意外的速度或采样间隔变更")
             interval_observations = []
-            for change in interval_changes:
-                index = int(change["effective_sample_index"]) - 1
-                if index < 1 or index >= len(rows):
-                    raise RuntimeError(f"采样间隔变更对应的有效样本序号超出CSV范围：{change}")
-                observed = rows[index].get("actual_interval_s", "")
-                if not observed:
-                    raise RuntimeError(f"第{index + 1}条CSV记录缺少实际间隔：{change}")
-                interval_observations.append({
-                    "target_interval_s": change["target_interval_s"],
-                    "effective_sample_index": change["effective_sample_index"],
-                    "actual_interval_s_at_effective_sample": float(observed),
-                })
             if not any(line.strip().upper() == "> SYST:LOC" for line in communication_log):
                 raise RuntimeError("GUI关闭时未观察到SYST:LOC释放仪器到LOCAL")
             report["sample_count"] = len(rows)
@@ -1080,7 +1000,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 if index < 0:
                     raise RuntimeError(f"GUI缺少测量模式：{mode.value}")
                 if window.mode_combo.currentIndex() != index:
-                    window.mode_combo.setCurrentIndex(index)
+                    window.mode_buttons[mode].click()
                 if window._current_mode != mode:
                     raise RuntimeError(f"GUI未能切换到测量模式：{mode.value}")
                 window.experiment_name.setText(f"冻结包Mock验收 {mode.value}")
@@ -1117,7 +1037,7 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 global_position = viewport.mapToGlobal(position)
                 # Exercise the complete Qt event path through the plotted
                 # precision boundary, not only a comfortable six-order zoom.
-                wheel_event_count = 1400
+                wheel_event_count = 4500
                 wheel_events_accepted = 0
                 for _ in range(wheel_event_count):
                     wheel_event = QWheelEvent(
@@ -1172,11 +1092,14 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                 }
                 save_progress("validated_mock_wheel_zoom")
 
-            def on_experiment_finished(directory: str) -> None:
+            def on_experiment_saved(directory: str, saved_ok: bool, detail: str) -> None:
                 if state["finished"]:
                     return
                 if state["phase"] != "awaiting_finish":
                     finish(f"{modes[state['mode_index']].value}实验意外结束")
+                    return
+                if not saved_ok:
+                    finish(f"实验保存失败：{detail}")
                     return
                 mode = modes[state["mode_index"]]
                 save_progress(f"validating_saved_{mode.value}")
@@ -1244,7 +1167,8 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                         start_current_mode()
                     except Exception as exc:
                         finish(str(exc))
-                elif state["phase"] == "acquiring" and int(window._global_stats.get("count", 0)) >= 3:
+                elif (state["phase"] == "acquiring" and not window._start_pending
+                      and window._experiment_active and int(window._global_stats.get("count", 0)) >= 3):
                     if state["mode_index"] == 0:
                         try:
                             probe_mock_wheel_zoom()
@@ -1260,8 +1184,8 @@ def run_mock_six_mode_gui_probe(report_path: Path) -> int:
                     if window._active_settings_by_mode.get(mode.value) is not None:
                         start_current_mode()
 
-            receiver = _MockE2EReceiver(on_experiment_finished)
-            window._worker.experiment_finished.connect(receiver.experiment_finished)
+            receiver = _MockE2EReceiver(on_experiment_saved)
+            window._worker.experiment_save_result.connect(receiver.experiment_saved)
             window._worker_thread.finished.connect(app.quit)
             timer.timeout.connect(pump)
             try:
@@ -1323,7 +1247,7 @@ def main(argv: list[str] | None = None) -> int:
     backend.add_argument("--mock", action="store_true", help="启动并连接明确标记的模拟仪器")
     backend.add_argument("--mock-e2e", action="store_true", help="后台逐模式验证Mock GUI采集及文件保存")
     backend.add_argument("--probe-real", action="store_true", help="真实仪器RES2安全连接及单点诊断；不显示GUI")
-    backend.add_argument("--probe-real-gui", action="store_true", help="隐藏GUI验证RES2实时采集、速度/间隔变化与CSV记录")
+    backend.add_argument("--probe-real-gui", action="store_true", help="隐藏GUI验证RES2连续采集和CSV记录")
     backend.add_argument("--probe-real-gui-visible", action="store_true", help="显示GUI验证RES2曲线刷新；保存窗口截图")
     backend.add_argument("--probe-real-gui-dcv", action="store_true", help="仅当仪表已处于DCV时，短时验证GUI/CSV")
     backend.add_argument("--probe-real-gui-acv", action="store_true", help="仅当仪表已处于ACV时，短时验证GUI/CSV")
@@ -1605,6 +1529,13 @@ def main(argv: list[str] | None = None) -> int:
         or args.baudrate != 9600
     ):
         parser.error("hardware connection options are only valid with a hardware probe")
+    if sys.platform == "win32":
+        # Give Windows a distinct taskbar identity when running from Python.
+        import ctypes
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Fluke8845A.LabLogger.Desktop")
+        except (AttributeError, OSError):
+            pass
     QApplication.setApplicationName("Fluke8845A Lab Logger")
     QApplication.setOrganizationName("Fluke8845A")
     app = QApplication(sys.argv[:1] + ([] if argv is None else []))

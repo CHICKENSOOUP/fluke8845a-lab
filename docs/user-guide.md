@@ -4,24 +4,24 @@
 
 ## 简体中文
 
-版本 1.1.0 · 中文 Windows 桌面应用
+版本 2.0.0 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v1.1.0 改进桌面和 localhost 图表交互、历史 CSV 加载、测量设置提示与数据导出。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
+v2.0.0 更新桌面测量工作区、曲线显示和 CSV 导出。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时先发送 `SYST:REM`，再查询 `*IDN?`；只接受设备型号字段为 `8845A` 的 Fluke 仪器，不会重置仪器。若身份识别失败，程序会尽力发送 `SYST:LOC` 后关闭串口。先 REMOTE 再进行 RS-232 收发遵循编程手册 PDF 第76页（印刷第66页）的说明。
-- **MOCK**：勾选模拟模式后点击“启动MOCK模拟仪器”。状态栏和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
+- **MOCK**：在连接窗口勾选模拟模式，选择场景后连接。状态和数据目录都会写明 MOCK。模拟结果不是仪器测量，不能用作校准或实验结论。
 
 程序启动时扫描串口，也可在端口框直接输入 COM 号。默认值为 9600 baud、8 data bits、无校验、1 stop bit、无流控、CRLF 结束符、2秒普通命令响应超时。`READ?`会根据当前积分时间或交流滤波设置自动使用更长的主机等待上限；这只是避免过早超时的通信保护，不代表仪器的采样时间保证。手册中 RS-232 出厂参数包含 9600、8位、无校验、1停止位和无流控；EOL需按仪器面板设置。可配置选项包括手册列出的全部波特率、7/8数据位、无/奇/偶校验、1/2停止位、无/XON-XOFF/RTS-CTS流控以及CR/LF/CRLF结束符。真实仪器的读取超时（包括普通串口 `TimeoutError`）或读取过程中的通信异常会立即停止本次实验、保存当前空值失败行并关闭串口；软件不自动重试或续接旧实验。操作者需检查仪器/线缆，手动重新连接，并以新实验目录开始下一段采集，避免迟到响应被误当作后续样本。真实仪器连接在 COMPUTER 模式且停止或暂停采集时，软件每 10 秒查询一次 `*IDN?` 确认连接；连续采集期间不会插入探测查询，LOCAL 和 MOCK 模式也不会探测。探测发现断线、响应超时或仪器身份变化时会关闭连接并更新状态；若实验处于暂停状态，软件会结束并保存为通信异常。
 
-首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。仪表菜单中的 RS-232 `COMPUTER` 协议模式与软件里的 `COMPUTER/LOCAL` 控制权是两项设置：协议模式须在仪表菜单选择；控制权可在仪器设置区切换。`COMPUTER` 使用 `SYST:REM`，除仪表的 `LOCAL` 键外，其他面板按键会被禁用。选择 `LOCAL` 会发送 `SYST:LOC`，将控制权交给面板；软件停用测量、设置、诊断和ZERO，串口保持连接。面板操作完成后，在软件选择 `COMPUTER` 即可切回远程控制；软件会重新读取当前测量模式和参数。采集中不能切换控制权。若直接按仪表 `LOCAL` 导致 `+550,"Command not allowed in local"`，软件会保存异常行且不伪造读数，停止采集并关闭串口；重新连接可恢复远程控制。连接后可在“仪器 → SCPI诊断”检查型号、模式、输入端子及仪器错误队列。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
+首次连接失败时，确认物理RS-232/USB转串口线、COM号、线缆类型、波特率和EOL。仪表菜单中的 RS-232 `COMPUTER` 协议模式与软件里的 `COMPUTER/LOCAL` 控制权是两项设置：协议模式须在仪表菜单选择；控制权可在连接窗口切换。`COMPUTER` 使用 `SYST:REM`，除仪表的 `LOCAL` 键外，其他面板按键会被禁用。选择 `LOCAL` 会发送 `SYST:LOC`，将控制权交给面板；软件停用测量、设置、诊断和ZERO，串口保持连接。面板操作完成后，在软件选择 `COMPUTER` 即可切回远程控制；软件会重新读取当前测量模式和参数。采集中不能切换控制权。若直接按仪表 `LOCAL` 导致 `+550,"Command not allowed in local"`，软件会保存异常行且不伪造读数，停止采集并关闭串口；重新连接可恢复远程控制。正常断开或关闭程序时会尝试发送 `SYST:LOC` 恢复本地控制。
 
 ## 2. 测量模式与安全接线
 
 支持 **DCV、ACV、DCI、ACI、2W电阻、4W电阻**。每个模式单独记住量程、NPLC/交流带宽、适用滤波和自动零点设置；DCV 另可设置自动输入阻抗。设置存于当前 Windows 用户配置目录。无关参数显示“不适用”且不能修改。ACV/ACI显示真 RMS 有效值，不是峰值或波形采样数据。
 
-切换电压、电流或两线/四线电阻接线类别时会显示正确/错误接线示意和确认提示；开始电流或电阻实验前还会再次要求确认。示意图依据官方中文《用户手册》第 4-4、4-9 至 4-11 页的前面板端子图和接线步骤整理。软件不能观察被测电路、测试线、保险丝或插孔，这些检查必须由操作者完成：
+切换测量模式时直接应用配置；开始真实采集或修改电流量程时，会弹出简短的接线确认窗口。接线要求依据官方中文《用户手册》第 4-4、4-9 至 4-11 页。软件不能观察被测电路、测试线、保险丝或插孔，这些检查必须由操作者完成：
 
 - **电压**：电压 HI/LO 端子并联接入被测节点；核对电压等级和测量类别。
 - **两线电阻**：被测电路断电，使用相应 HI/LO 端子。引线电阻会影响结果。
@@ -53,31 +53,36 @@ DCV 的自动输入阻抗默认关闭，表示 10 MΩ。启用后，8845A 只在
 
 自动量程仍保持“自动量程”设置；界面另外显示最近一次仪器 `RANG?` 回读的档位快照，并提示它可能随输入改变。这个快照不是锁定的固定量程。Mock只显示带“模拟”字样的合成档位，不代表真实仪表读数。
 
-8845A 数字滤波仅适用于 DCV、DCI、两线电阻和四线电阻；软件只允许在 NPLC 10 或 100 启用（慢于 1 PLC）。`CONF` 会将数字滤波预设为 ON，因此配置时软件在 `CONF` 后先发送 `SENS:<function>:FILT:DIG OFF`，检查错误队列并回读 `...:FILT:DIG?`；确认 OFF 后才写量程和 NPLC。请求开启时，写 NPLC 后再发送 `SENS:<function>:FILT:DIG ON`，并再次检查错误队列和回读确认。采集中调速也按先 OFF/检查/回读、再写 NPLC、最后按请求 ON/检查/回读执行。已核实 OutG SW <2.0 时拒绝开启；版本未知时尝试命令并以错误队列和回读确认，未确认则配置失败。已核实版本低于 2.0 且请求关闭时，跳过滤波命令并继续配置 NPLC。平均读数数量随 DC 功能和量程变化，手册未给最大 `READ?` 响应时间；软件只有有限的主机端超时保护，不保证仪器时限。超时会保存空值失败记录、停止采集并关闭串口，不伪造读数。依据《Programmers Manual Rev. 3》Table 13（PDF pp. 42–43 / printed pp. 32–33）、数字滤波命令（PDF pp. 58–60 / printed pp. 48–50）、CONF 预设 Table 18（PDF p. 51 / printed p. 41）、READ?（PDF p. 52 / printed p. 42）；《Users Manual Rev. 3》OutG SW <2.0 限制（PDF p. 47 / printed p. 3-3），滤波适用速率及平均数量（PDF p. 75 / printed p. 4-5）。
+8845A 数字滤波仅适用于 DCV、DCI、两线电阻和四线电阻；软件只允许在 NPLC 10 或 100 启用（慢于 1 PLC）。`CONF` 会将数字滤波预设为 ON，因此配置时软件在 `CONF` 后先发送 `SENS:<function>:FILT:DIG OFF`，检查错误队列并回读 `...:FILT:DIG?`；确认 OFF 后才写量程和 NPLC。请求开启时，写 NPLC 后再发送 `SENS:<function>:FILT:DIG ON`，并再次检查错误队列和回读确认。已核实 OutG SW <2.0 时拒绝开启；版本未知时尝试命令并以错误队列和回读确认，未确认则配置失败。已核实版本低于 2.0 且请求关闭时，跳过滤波命令并继续配置 NPLC。平均读数数量随 DC 功能和量程变化，手册未给最大 `READ?` 响应时间；软件只有有限的主机端超时保护，不保证仪器时限。超时会保存空值失败记录、停止采集并关闭串口，不伪造读数。依据《Programmers Manual Rev. 3》Table 13（PDF pp. 42–43 / printed pp. 32–33）、数字滤波命令（PDF pp. 58–60 / printed pp. 48–50）、CONF 预设 Table 18（PDF p. 51 / printed p. 41）、READ?（PDF p. 52 / printed p. 42）；《Users Manual Rev. 3》OutG SW <2.0 限制（PDF p. 47 / printed p. 3-3），滤波适用速率及平均数量（PDF p. 75 / printed p. 4-5）。
 
 **零点校正与校准、去皮不同。**将鼠标悬停在“自动零点校正”或“执行 ZERO 校正”上，可查看各自说明。“自动零点校正”让仪表按自动零点流程测量内部零点并补偿偏移，有助于稳定读数，但额外测量会降低读数速度；它不会把被测输入强制显示为0。“执行 ZERO 校正”发送 `ZERO:AUTO ONCE`，按 Fluke 编程手册的定义立即启动一次零点测量。此操作不是校准调整，也不是对当前被测物去皮。只能在停止采集后执行；若启用模拟滤波，量程、NPLC和触发条件须与 ZERO 测量要求匹配。
 
 ZERO 完成后的桌面和 Web 状态显示命令反馈及配置回读；回读仅确认设置，不能当成零点测量值。自动量程还会显示该时刻的量程回读快照；它可能随输入改变。模拟滤波下须匹配量程、NPLC和触发条件，依据《Programmers Manual Rev. 3》PDF第60页（印刷第50页）的 `ZERO:AUTO ONCE` 定义和《Users Manual Rev. 3》附录D-1（PDF第99页）的 ZERO 条件说明。
 
-**仪器测量速度和软件采样间隔是两项独立设置。** 直流电压/电流及电阻模式通过NPLC控制积分时间：0.02 NPLC通常转换较快，100 NPLC积分时间较长、通常更有利于抑制工频噪声；交流电压/电流模式使用3/20/200 Hz带宽档，200 Hz档响应较快。速度参数会按模式保存。停止采集时点击“应用仪器参数”写入仪器，开始实验时也会自动写入；连续采集或暂停时可修改NPLC/交流带宽，再点“应用采集速度”。仪表回读确认后从下一读数起生效，修改时间及生效样本写入配置和事件文件，CSV每行记录当时生效的NPLC/带宽。采集中的实时调速仅会改NPLC或交流带宽，不改变测量模式、量程、滤波或零点校正。软件目标采样间隔可单独设定，并能在连续采集中即时修改；实际Hz由有效读数时间戳计算。最低NPLC或最快带宽不保证某个固定Hz，实际速度还受量程、自动零点、滤波、仪器转换及串口通信影响。
+**仪器测量速度和软件采样间隔是两项独立设置。** 在主界面选择自动或固定量程，在“测量参数”窗口设置 NPLC 或交流带宽、适用滤波和目标采样间隔；直流电压、直流电流及电阻使用 NPLC，交流电压和电流使用 3/20/200 Hz 带宽。停止采集后可点击“应用仪器参数”写入并等待仪器回读。实验启动、运行、暂停和保存收尾期间参数与目标间隔锁定，保存结束后才可修改。目标间隔为 0 表示读数后不额外等待；实际采样速度仍受量程、自动零点、滤波、仪器转换和串口通信影响。
 
-实时调速时，真实仪器发生 SCPI/串口通信故障会立即停止当前实验、保存数据并关闭连接；需要手动重新连接，再以新实验目录或分段开始。仅参数或量程校验拒绝会报告未应用原因，采集可继续。
+
 
 “恢复默认设置”会将六种测量模式恢复为软件默认设置，并把目标采样间隔设为1秒；会清除各模式保存的基准值，但保留串口通信设置和当前保存目录。它只更改软件配置，不会向仪器发送复位或配置命令；若需把当前模式参数写入已连接的仪器，请随后单独点击“应用仪器参数”。采集时须先停止才能初始化。
 
-采集中调整速度下拉框只修改“所选值”，不会立即改变仪表。读数卡会分别显示仪表已回读生效的参数和“待应用”值；点击“应用采集速度”且仪表回读成功后，新速度才从下一读数起生效。若应用失败，采集会安全停止并保留失败记录，不会把所选值误记为仪表当前值。
 
-桌面主窗口以单张曲线和当前读数/采集状态为主。主图下方的操作栏集中显示目标采样间隔、连续采集、单次测量、暂停/继续和停止；采样间隔可在这里直接修改，连续采集中也即时生效。点击“新建测量”会打开实验设置并建议当前时间和模式组成的名称；可直接修改名称后选择单次或连续采集。采集中点击新建，会先询问是否停止保存；取消则继续原采集，保存失败时不会进入下一轮。新测量开始后曲线自动切换到新数据，通常不用先手动清屏，旧实验 CSV 保留。点击“清空图表”，只清除当前窗口的曲线、统计和事件标记，不删除磁盘文件。“实验文件”打开独立文件窗口，集中列出当前实验目录中的测量 CSV、事件 CSV、配置、运行日志和导出结果；文件窗口也提供打开/复制目录、加载历史 CSV、导出进行中快照及事件和测量 CSV 的表格软件安全副本。桌面列表另保留本次运行最近 10 项导出及完整目标路径；Web 文件区记录最近 10 个交给浏览器的文件名，实际下载位置由浏览器管理，不代表副本已写入实验目录。“通信”“分析”及顶栏“设置与分析…”打开同一个设置窗口。窗口顶部是一行统一导航：通信、测量、实验、分析总览、曲线设置；切换不同区域时不用先进入“仪器设置/数据分析”再选择内层页面。分析总览以可滚动页面集中显示全程统计、区间分析、基准变化和实验事件。顶栏“诊断日志”会打开通信日志面板，完整 SCPI 通信日志也可从“仪器”菜单打开。日志暂存最多5000条SCPI行；如果界面处理落后，会提示丢弃较早日志，测量CSV和全程统计不受影响。NPLC/交流带宽只在适用模式中启用，灰色控件表示当前模式不可用。目标间隔设为0表示每次读数后不额外等待，不代表仪器转换或串口延迟为零。
+
+启动时会弹出连接窗口。桌面主界面显示连接状态、六个模式按钮、测量控制与曲线。点击“连接仪器”打开连接窗口；连接成功后返回主界面。需要调整时可在空闲状态点击“测量参数”；原来的主导航和“设置与分析”入口已移除。NPLC 和交流带宽仅在适用模式中可用。
 
 采集速率会受测量模式、量程、NPLC/交流带宽、自动零点、串口波特率和被测条件共同影响。请以当前实验中实际记录的时间戳和有效读数为准，不要把某一台设备或某次接线的速率当作准确度或通用性能保证。
 
+主界面同时显示原始曲线和滑动平均曲线。“平均点数”可在采集中调整；均值使用最近 N 个连续有效显示点，起始不足 N 点时使用已有点。异常读数或显示丢点会中断并重新开始平均。曲线缓存最多保留最近 100,000 点；原始 CSV 逐点保存，不受平均计算影响。
+
 ## 4. 单次测量与连续采集
 
-主界面波形上方点击“新建测量”（桌面版也可按 Ctrl+N）会打开实验设置，建议新的时间与模式名称并选中文字。采集中点击新建可一次确认停止保存后进入设置；取消时继续原采集。确认接线、仪器配置和保存目录后，点击“开始连续采集”或“单次测量”；新一轮启动时会自动换成新曲线，并创建独立的时间戳实验目录，旧实验 CSV 保留，无需事先清空。只想清掉图表、不开始新实验时，点击“清空图表”；这个操作只清内存中的曲线、统计和事件标记，不删除磁盘文件，之后可点“加载 CSV”恢复。采集运行或正在启动时，清空按钮不可用。
+1. 启动软件，在连接窗口选择串口参数并连接仪器，或选择 MOCK 模拟模式并连接。
+2. 在主界面选择直流电压、交流电压、直流电流、交流电流、两线电阻或四线电阻。切换模式前请自行检查接线；软件不会检测表笔和被测电路。
+3. 在主界面选择量程。需要修改其他参数时，打开“测量参数”，应用参数并等待回读确认。实验自动保存在已有的保存目录；未设置过时默认为 Windows 文档目录下的 Fluke8845A_Experiments。
+4. 点击“单次测量”或“开始连续采集”。连续采集可暂停、继续和停止；停止后等待保存结束，再调整参数或切换模式。
 
-填写实验名称和保存根目录；保存根目录会记入当前Windows用户设置，离开输入框或关闭软件后保留，重启时自动恢复。目标间隔位于主波形下方的采集操作栏，可设0至86400秒，输入精度为0.001秒；填0表示每次读数后不额外等待。默认目标间隔保存在当前Windows用户设置中，重启软件后仍保留。采集过程中也可修改目标间隔，新值立即调整后续调度，并记入`config.json`的变更历史及`events.csv`。软件不承诺超出仪器转换、串口波特率或积分时间能力的速率；请以实测采样间隔显示和CSV时间戳为准。按“单次测量”会创建一份仅含一次尝试的实验；连续模式支持开始、暂停、继续和停止。必须停止当前实验后切换模式，切换后下一次采集创建独立数据目录。
+每次单次或连续测量自动生成带时间和模式的实验名称，并在保存根目录创建独立实验目录。目标采样间隔在“测量参数”窗口设置，范围为 0 至 86400 秒、精度为 0.001 秒；0 表示每次读数后不额外等待。目标间隔保存在当前 Windows 用户设置中，重启后仍保留。实际间隔受仪器转换和通信耗时影响，请以显示的实测间隔和 CSV 时间戳为准。
 
-如果保存根目录中已有同名实验，开始前会让你选择“覆盖最近一次（先备份）”“新建独立目录”“返回改名”或“取消”。同名按每个实验`config.json`中保存的原始名称核对，避免名称经过文件夹清理后发生碰撞。同名采集期间，桌面和Web进程共享名称锁，避免另一实例移动正在写入的实验。选择覆盖时，程序会取得同名锁并再次核对目录；若配置仍显示`running`，只有带有当前同名锁协议标记的记录才会自动标记为`interrupted`，同时记录 CSV 完整记录边界、未完成尾部字节数、元数据计数检查点和恢复前的配置副本，并依据完整 CSV 记录重新核对`sample_count`与`event_count`。若 CSV 结构无法可靠解析，程序保留原计数检查点并在恢复信息中记录原因。旧版或协议未知的`running`目录会保持原样并拒绝自动覆盖；请先确认没有旧版进程正在采集，再手动备份或处理。原始测量 CSV、事件 CSV 不会被截断或重写。正在其他进程中使用、配置损坏或状态无法确认的目录会被保留并拒绝覆盖。确认后如果最新目录发生变化，程序会中止并要求重新预检。程序随后把确认的实验目录移动到保存根目录下的`.8845a-backups`，再为本次实验创建新的时间戳目录；备份中的原始数据仍可查看或加载，程序不会自动清理。Web和桌面版在启动成功或失败时都会显示备份位置；如需恢复旧实验，可在没有同名目录冲突时将备份目录移回保存根目录。异常中断恢复只标记和备份现有记录，不会自动续接采集。
+
 
 真实后端使用 `CONF:<function>` 配置，之后逐次 `READ?` 触发/读取，并在每点读取实际量程。它不会调用 `INIT/FETCh` 批次模式，因此不占用或压缩仪器内部缓存，也不会把缓存批次的主机读取时刻误当作每个样本的采样时刻。
 
@@ -87,9 +92,11 @@ CSV保留原有`timestamp_local`、`timestamp_utc`和`elapsed_s`字段，它们�
 
 ## 5. 分析、事件与历史数据
 
-- Windows 桌面版普通滚轮同时缩放时间轴和读数轴，Shift+滚轮只缩放时间轴，Ctrl+滚轮只缩放读数轴；Alt 不单独分配手势。向上缩小跨度，向下放大。手动缩放或平移后保持视野，点击“自动缩放”或双击图表恢复自动适配。纵轴工程前缀随当前可见跨度变化；高基准值的细缩放会用相对刻度，并在轴标题标明参考读数。DCV/ACV 的绝对图表显示窗口不超出 −1000 至 +1000 V，但仍可继续缩小纵轴跨度；超出该范围的数据点（实时或历史）会从曲线中隐藏并显示提示，原始读数仍保留。该 ±1000 V 边界只限制图表视窗，不代表仪器量程或输入额定值；8845A ACV 最大输入为 750 V RMS、1000 V peak 或 8×10^7 V·Hz 乘积，以先达到的限制为准。最小跨度受计算机浮点精度限制，放大不会提高仪表分辨率。缩放只改变图表显示，不修改 CSV 原始值。拖动曲线可平移视图，“自动缩放”重新适配当前数据；另可启用自动跟随、读取最近点、选择局部统计区间和导出 PNG。统计区间可直接输入相对实验开始的起止秒数，也可拖动图中区间手柄；两种操作会互相同步。自动跟随先逐步扩展视窗至 120 秒，再滚动显示最近 120 秒。
+桌面新版精简了主界面入口；下文中基准、事件、历史加载和安全副本的操作说明适用于保留这些入口的 localhost 页面，桌面功能以当前可见控件为准。
+
+- 桌面版普通滚轮缩放两轴，Shift+滚轮缩放时间轴，Ctrl+滚轮缩放纵轴。`Full（全部）` 显示从 0 到最新数据；`滚动跟随` 保留手动调整的时间窗口宽度并跟随最新数据，两者互斥。`纵轴自动` 根据当前可见时间窗口适配读数。手动纵轴缩放会关闭纵轴自动，横轴拖动不关闭滚动跟随。`保存曲线` 在后台导出两个 CSV：简洁文件包含时间、原始值、滑动平均值和单位，详细文件保留原始测量列、滑动平均值和点数；采集中导出的是当时已完整写入的数据快照。导出按保存时选定的点数对完整快照重新计算；原始实验 CSV 保持不变。导出保留原始文本，如果需要用表格软件打开，请按文本导入文本列。
 - 基准可以手动输入，也可取最新读数、图上锁定点或当前图中缓存均值。Web 端可在 V/mV/µV、A/mA/µA、Ω/kΩ/MΩ/GΩ 间选择输入单位；内部计算和原始数据仍统一使用 SI 值。鼠标悬停只预览读数；在曲线上单击会锁定黄色圆圈标出的数据点，移动鼠标不会改变它。点击“锁定点设为基准”后，软件使用该固定点的读数。电压显示ΔV/V₀，电流显示ΔI/I₀，电阻显示ΔR/R₀。阈值栏使用SI值；基准绝对值小于或等于阈值、阈值无效或基准未设置时不计算相对变化率。
-- “记录实验事件”写入事件CSV并在曲线上画标记。基准设置、更改和清除在活动实验中也会写入事件并画出曲线标记。
+- 暂停和继续等实验事件写入事件 CSV。
 - “加载历史CSV”只读现存测量文件；若同一实验目录中有配套`events.csv`，会一并恢复落在当前时间范围内的事件标记，Web 端的事件文件也由后台 Worker 解析。超过100,000点时，图形显示均匀抽稀视图，原文件不变；拖选区间后，软件在后台扫描完整原始CSV计算统计，图表抽稀不影响统计。实时采集期间，统计完成后会把区间内新到的有效读数增量纳入，后台读取不阻塞采集线程。
 
 ## 6. 实验目录和CSV字段
@@ -127,7 +134,7 @@ MOCK可选阶跃响应/恢复、长期漂移、指定样本通信超时和指定
 
 ## English
 
-Version 1.1.0 improves the desktop and localhost chart interactions, historical CSV loading, measurement-setting guidance, and data export. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
+Version 2.0.0 updates the desktop measurement workspace, chart controls, and CSV export. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
 
 ### 1. Connection and modes
 
@@ -147,15 +154,15 @@ The mA input has a 440 mA fuse and the 10 A input an 11 A fuse. The documented l
 
 DCV ranges are 100 mV–1000 V; ACV ranges are 100 mV–750 V. DCI ranges are 100 µA–10 A and ACI ranges 10 mA–10 A, subject to firmware and terminal conditions. Resistance ranges are 100 Ω–100 MΩ. DC voltage/current and resistance provide NPLC values 0.02, 0.2, 1, 10, and 100. AC voltage/current provide 3, 20, and 200 Hz bandwidth settings; these are filter bandwidths, not sample rates. The high input impedance setting is DCV-only and effective on 100 mV, 1 V, and 10 V ranges.
 
-Digital filtering is supported for DCV, DCI, 2-wire resistance, and 4-wire resistance; the application permits enabling it only at NPLC 10 or 100 (rates slower than 1 PLC). `CONF` presets the filter ON, so configuration sends `SENS:<function>:FILT:DIG OFF`, checks the error queue, and verifies `...:FILT:DIG?` is OFF before writing range/NPLC. When ON is requested, it writes NPLC first, then sends `SENS:<function>:FILT:DIG ON`, checks the error queue, and verifies the ON readback. Live speed changes use the same OFF/check/readback, NPLC, and requested ON/check/readback sequence. A panel-verified OutG SW below 2.0 rejects an ON request; an unknown version is probed and must pass the error-queue and readback checks. If a verified older version is configured with filtering OFF, the unsupported filter command is skipped and NPLC remains configurable. The manuals say the number of averaged readings varies by DC function and range and do not specify a maximum `READ?` response time. The software has only a finite host-side timeout; it does not guarantee a meter response deadline. On timeout it saves a blank failed attempt, stops acquisition, closes the serial connection, and does not fabricate a reading. See the *Programmers Manual*, Rev. 3, Table 13, PDF pp. 42–43 (printed pp. 32–33), filter commands pp. 58–60 (printed pp. 48–50), `CONF` preset Table 18 p. 51 (printed p. 41), `READ?` p. 52 (printed p. 42), and the *Users Manual*, Rev. 3, PDF pp. 47 and 75 (printed pp. 3-3 and 4-5).
+Digital filtering is supported for DCV, DCI, 2-wire resistance, and 4-wire resistance; the application permits enabling it only at NPLC 10 or 100 (rates slower than 1 PLC). `CONF` presets the filter ON, so configuration sends `SENS:<function>:FILT:DIG OFF`, checks the error queue, and verifies `...:FILT:DIG?` is OFF before writing range/NPLC. When ON is requested, it writes NPLC first, then sends `SENS:<function>:FILT:DIG ON`, checks the error queue, and verifies the ON readback. A panel-verified OutG SW below 2.0 rejects an ON request; an unknown version is probed and must pass the error-queue and readback checks. If a verified older version is configured with filtering OFF, the unsupported filter command is skipped and NPLC remains configurable. The manuals say the number of averaged readings varies by DC function and range and do not specify a maximum `READ?` response time. The software has only a finite host-side timeout; it does not guarantee a meter response deadline. On timeout it saves a blank failed attempt, stops acquisition, closes the serial connection, and does not fabricate a reading. See the *Programmers Manual*, Rev. 3, Table 13, PDF pp. 42–43 (printed pp. 32–33), filter commands pp. 58–60 (printed pp. 48–50), `CONF` preset Table 18 p. 51 (printed p. 41), `READ?` p. 52 (printed p. 42), and the *Users Manual*, Rev. 3, PDF pp. 47 and 75 (printed pp. 3-3 and 4-5).
 
-Instrument conversion speed and the application's target interval are independent. Actual rate depends on range, auto-zero, filtering, serial settings, instrument conversion, and communication. During acquisition, a speed change applies only after instrument readback confirms it. A target interval of zero means no additional host delay, not zero instrument or serial latency.
+Instrument conversion speed and the application's target interval are independent. Set both before starting; they remain locked during startup, acquisition, pause, and final save. Actual rate depends on range, auto-zero, filtering, serial settings, instrument conversion, and communication. A target interval of zero means no additional host delay, not zero instrument or serial latency.
 
 **Restore default settings** restores the software defaults for all six measurement modes, clears their saved baselines, and sets the target interval to one second. It preserves serial communication settings and the current output directory. The button changes software preferences only; it does not reset or configure the instrument. Stop acquisition before initializing. To apply the selected mode to a connected meter, click **Apply instrument parameters** separately.
 
 ### 4. Acquisition and data files
 
-Enter an experiment name and output directory, then start a single reading or continuous acquisition. Continuous acquisition can be paused, resumed, or stopped. Stop a run before changing modes; the next run uses a separate timestamped directory.
+Connect the instrument or Mock, select one of the six modes, then configure the instrument and target interval in the measurement settings dialog. Start a single reading or continuous acquisition; continuous acquisition can be paused, resumed, or stopped. Each run receives an automatic time-and-mode name and a separate timestamped directory. Wait for saving to finish before changing mode or settings.
 
 The real backend configures the measurement and performs one `READ?` per point, followed by a range query. It does not use `INIT/FETCh` batches. Existing `timestamp_local`, `timestamp_utc`, and `elapsed_s` retain their host `READ?` request-start meaning. New `host_read_request_start_*` and `host_read_response_end_*` columns record the host wall-clock and monotonic request/response boundaries; they are not instrument sampling timestamps. `read_duration_s` covers only this `READ?` request/response window and excludes the later range query. `actual_interval_s`, desktop telemetry, and Web telemetry use the difference between consecutive valid response-end monotonic timestamps; failed attempts have no interval value. The instrument provides no per-reading hardware timestamp, so the exact sampling instant is unknown. Failed attempts retain a sequence and status with an empty value, never a fabricated zero.
 
@@ -163,7 +170,7 @@ Each experiment folder contains `measurements.csv`, `config.json`, `events.csv`,
 
 ### 5. Analysis, events, and history
 
-The primary desktop window shows the live reading, acquisition status, controls, and one plot. The status-bar **Settings & Analysis** button opens a separate window for serial, instrument, experiment, statistics, baseline, and event settings. Desktop plots support wheel zoom of both axes, Shift+wheel for X only, and Ctrl+wheel for Y only. Alt has no separate gesture. Drag to pan; manual navigation holds the view until **Auto scale** or a double-click restores automatic scaling. A reference can be entered, taken from the current reading, or calculated from the cached plot mean. Relative change is displayed as ΔV/V₀, ΔI/I₀, or ΔR/R₀ when the reference exceeds the configured threshold. Event notes, pause/resume actions, and reference changes are saved to `events.csv` and marked on the plot.
+The desktop window shows connection status, six mode buttons, acquisition controls, and one plot. Use the connection dialog and the separate measurement settings dialog before starting a run. Settings and target interval remain locked during startup, acquisition, pause, and final save. Desktop plots support wheel zoom of both axes, Shift+wheel for X only, and Ctrl+wheel for Y only. Alt has no separate gesture. Drag to pan; manual navigation holds the view until **Auto scale** or a double-click restores automatic scaling.
 
 Historical CSV loading is read-only. Matching event markers are restored where available. The bounded overview preserves endpoints, local peaks and invalid-reading gaps; full-run statistics still scan the complete source. Zooming into an earlier interval loads that visible detail from CSV in a background task, and Auto scale returns to the full overview. The original CSV is unchanged. The browser worker reads history in 256 KiB chunks, supports files up to 2 GiB, and reports progress with cancellation.
 
@@ -178,6 +185,6 @@ Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`.
 Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection. Mock readings remain simulated.
 ### 事件导出
 
-可在桌面“实验文件”窗口或 localhost 页面导出“脱敏分享包” ZIP。分享包只含 config.json、measurements.csv 和可选 events.csv；会隐藏已知设备序列号、COM 口和文本中的本机路径，不收录 run.log 或目录中的其他文件。有效数值保持原样，数值列中的非数值文本会替换为脱敏标记；分享副本会对公式样式的文本添加文本前缀，且不会修改原始实验文件。用表格软件查看分享包内 CSV 时可以使用该副本；若要打开原始 CSV，请单独导出事件/测量 Excel 安全副本。
+可在 localhost 页面导出“脱敏分享包” ZIP。分享包只含 config.json、measurements.csv 和可选 events.csv；会隐藏已知设备序列号、COM 口和文本中的本机路径，不收录 run.log 或目录中的其他文件。有效数值保持原样，数值列中的非数值文本会替换为脱敏标记；分享副本会对公式样式的文本添加文本前缀，且不会修改原始实验文件。用表格软件查看分享包内 CSV 时可以使用该副本；若要打开原始 CSV，请单独导出事件/测量 Excel 安全副本。
 
-`measurements.csv` 与 `events.csv` 始终是原始记录，软件不会为表格软件打开而改写它们。事件文本以及测量 CSV 的 `raw_reading`、`error` 文本可能以 `=`, `+`, `-` 或 `@` 开头，被 Excel 等表格软件解释为公式。若需用表格软件查看数据，请在桌面“实验文件”窗口或 localhost 图表工具栏分别导出 `*_measurements_excel_safe.csv` 和 `*_events_excel_safe.csv` 副本。安全副本会检查允许导出的各列，为公式样式文本添加文本前缀；数值字段中的普通带正负号数值保持不变。安全副本不会修改原始文件，仅支持停止采集后导出。科研分析请优先使用未修改的原始 CSV；用表格软件打开时请使用安全副本。
+`measurements.csv` 与 `events.csv` 始终是原始记录，软件不会为表格软件打开而改写它们。事件文本以及测量 CSV 的 `raw_reading`、`error` 文本可能以 `=`, `+`, `-` 或 `@` 开头，被 Excel 等表格软件解释为公式。若需用表格软件查看数据，请在 localhost 图表工具栏分别导出 `*_measurements_excel_safe.csv` 和 `*_events_excel_safe.csv` 副本。安全副本会检查允许导出的各列，为公式样式文本添加文本前缀；数值字段中的普通带正负号数值保持不变。安全副本不会修改原始文件，仅支持停止采集后导出。科研分析请优先使用未修改的原始 CSV；用表格软件打开时请使用安全副本。

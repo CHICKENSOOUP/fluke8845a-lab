@@ -17,6 +17,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SHARDS = {
     "desktop": (
         "tests/test_gui.py",
+        "tests/test_axis_units_revision.py",
+        "tests/test_chart_autofit_controls.py",
+        "tests/test_curve_export_gui.py",
+        "tests/test_desktop_layout_revision.py",
+        "tests/test_moving_average_plot.py",
+        "tests/test_simple_layout_prompt.py",
+        "tests/test_unconfirmed_mode_switch.py",
     ),
     "runtime": (
         "tests/test_app.py",
@@ -40,6 +47,7 @@ SHARDS = {
     ),
     "core": (
         "tests/test_analysis.py",
+        "tests/test_curve_export.py",
         "tests/test_history_import.py",
         "tests/test_icon_builder.py",
         "tests/test_filter_policy.py",

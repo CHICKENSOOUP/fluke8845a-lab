@@ -3151,6 +3151,8 @@ test("chart gesture help is expandable and the live hint stays concise", () => {
   assert.match(html, /触屏单指平移、双指缩放/);
   assert.match(html, /id="pointCursor"[^>]*>[^<]*悬停读点/);
   assert.match(html, /id="chartGestureHint"[^>]*>[^<]*滚轮/);
+  assert.match(html, /滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴/);
+  assert.match(html, /普通滚轮缩放两轴，Shift\+滚轮缩放时间轴，Ctrl\+滚轮缩放纵轴/);
   assert.match(html, /id="scenarioBadge"/);
   assert.match(html, /id="acquisitionFeedback"/);
   assert.match(html, /class="pause-slot"[\s\S]*id="pause"[\s\S]*id="resume"/);
@@ -3831,7 +3833,7 @@ test("hovering a chart event marker shows its time, local timestamp, and label",
 test("chart points can be selected and locked as baseline with the keyboard", async () => {
   const { api, elements } = createFrontend({ stubChart: false });
   api.app.modes.set("DCV", dcv);
-  element(elements, "chartGestureHint").textContent = "滚轮读数轴 · Shift 时间轴 · Ctrl 双轴 · Alt 零点锚";
+  element(elements, "chartGestureHint").textContent = "滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴";
   api.app.points = [
     { id: 1, x: 0, y: 1, status: "ok", unit: "V", raw: "1.0" },
     { id: 2, x: 1, y: 2, status: "ok", unit: "V", raw: "2.0" },
@@ -3841,7 +3843,7 @@ test("chart points can be selected and locked as baseline with the keyboard", as
 
   await element(elements, "plot").dispatch("keydown", { key: "End", preventDefault() {} });
   assert.match(element(elements, "pointCursor").textContent, /已选样本 #2/);
-  assert.equal(element(elements, "chartGestureHint").textContent, "滚轮读数轴 · Shift 时间轴 · Ctrl 双轴 · Alt 零点锚");
+  assert.equal(element(elements, "chartGestureHint").textContent, "滚轮 双轴 · Shift 时间轴 · Ctrl 纵轴");
   await element(elements, "plot").dispatch("keydown", { key: "Enter", preventDefault() {} });
 
   assert.equal(api.app.baseline, 2);
@@ -3978,7 +3980,7 @@ test("one large Y-axis wheel input can expand beyond the former million-fold spa
   const initialSpan = api.app.chartScale.yMax - api.app.chartScale.yMin;
 
   await element(elements, "plot").dispatch("wheel", {
-    clientX: 400, clientY: 200, deltaY: 2400, preventDefault() {},
+    clientX: 400, clientY: 200, deltaY: 12000, preventDefault() {},
   });
 
   const range = api.app.yView;
@@ -4157,7 +4159,7 @@ test("deep zoom on a high resistance reading keeps its unit, input, and ticks re
   const canvas = element(elements, "plot");
   const sampleY = api.app.chartScale.yToPixel(30e6);
 
-  for (let index = 0; index < 900; index += 1) {
+  for (let index = 0; index < 4500; index += 1) {
     await canvas.dispatch("wheel", { clientX: 400, clientY: sampleY, deltaY: -120, preventDefault() {} });
   }
 
@@ -4520,7 +4522,7 @@ test("rapid wheel events preserve every zoom step and render once per animation 
   animationFrames.shift()();
   assert.equal(plotRenders, 1, "the animation frame renders the chart once");
   const zoomedSpan = api.app.xView[1] - api.app.xView[0];
-  const expectedSpan = initialSpan * Math.exp(4 * 0.9);
+  const expectedSpan = initialSpan * Math.exp(4 * 0.18);
   assert.ok(Math.abs(zoomedSpan / expectedSpan - 1) < 1e-10,
     `all four zoom increments are retained; expected ${expectedSpan}, got ${zoomedSpan}`);
 });
@@ -4559,7 +4561,7 @@ test("manual panning cannot move the viewport completely away from measured data
   assert.ok(overlap >= 25);
 });
 
-test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence", async () => {
+test("web wheel modifiers follow desktop axis mapping", async () => {
   const localPython = path.join(ROOT, ".venv-build", "Scripts", "python.exe");
   const python = process.env.PYTHON || (fs.existsSync(localPython) ? localPython : "python");
   const desktopMapping = spawnSync(python, ["-c", [
@@ -4574,7 +4576,7 @@ test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence"
     env: { ...process.env, PYTHONPATH: path.join(ROOT, "src") },
   });
   assert.equal(desktopMapping.status, 0, desktopMapping.stderr);
-  const expectedMapping = [[false, true], [true, false], [true, true], [false, true], [false, true]];
+  const expectedMapping = [[true, true], [true, false], [false, true], [true, true], [false, true]];
   assert.deepEqual(JSON.parse(desktopMapping.stdout), expectedMapping, "this is the desktop _wheel_zoom_axes mapping");
 
   const { api, elements, animationFrames } = createFrontend({ stubChart: false });
@@ -4596,32 +4598,27 @@ test("web wheel modifiers follow desktop axis mapping and Alt anchor precedence"
   };
 
   const plain = await zoom({});
-  assert.deepEqual(plain.after.x, plain.before.x);
+  assert.ok(plain.after.x[1] - plain.after.x[0] < plain.before.x[1] - plain.before.x[0]);
   assert.ok(plain.after.y[1] - plain.after.y[0] < plain.before.y[1] - plain.before.y[0]);
-  const gui = fs.readFileSync(path.join(ROOT, "src/fluke8845a/gui.py"), "utf8");
-  assert.match(gui, /zoom_sensitivity = 0\.18 if modifiers & Qt\.KeyboardModifier\.AltModifier else 0\.9/);
-  assert.match(gui, /factor = math\.exp\(-float\(delta\) \/ 120\.0 \* zoom_sensitivity\)/);
   const webFactor = (plain.after.y[1] - plain.after.y[0]) / (plain.before.y[1] - plain.before.y[0]);
-  assert.ok(Math.abs(webFactor - Math.exp(-0.9)) < 1e-12, "one upward wheel notch uses the desktop zoom factor");
+  assert.ok(Math.abs(webFactor - Math.exp(-0.18)) < 1e-12);
 
   const shift = await zoom({ shiftKey: true });
   assert.ok(shift.after.x[1] - shift.after.x[0] < shift.before.x[1] - shift.before.x[0]);
   assert.deepEqual(shift.after.y, shift.before.y);
 
-  const alt = await zoom({ altKey: true });
-  const altFactor = (alt.after.y[1] - alt.after.y[0]) / (alt.before.y[1] - alt.before.y[0]);
-  assert.ok(Math.abs(altFactor - Math.exp(-0.18)) < 1e-12, "Alt keeps the finer zero-anchored wheel step");
-
   const ctrl = await zoom({ ctrlKey: true });
-  assert.ok(ctrl.after.x[1] - ctrl.after.x[0] < ctrl.before.x[1] - ctrl.before.x[0]);
+  assert.deepEqual(ctrl.after.x, ctrl.before.x);
   assert.ok(ctrl.after.y[1] - ctrl.after.y[0] < ctrl.before.y[1] - ctrl.before.y[0]);
 
-  const altOverrides = await zoom({ altKey: true, ctrlKey: true, shiftKey: true });
-  assert.deepEqual(altOverrides.after.x, altOverrides.before.x);
-  assert.ok(altOverrides.after.y[1] - altOverrides.after.y[0] < altOverrides.before.y[1] - altOverrides.before.y[0]);
-  const zeroBefore = (-(altOverrides.before.yOrigin || 0) - altOverrides.before.y[0]) / (altOverrides.before.y[1] - altOverrides.before.y[0]);
-  const zeroAfter = (-(altOverrides.after.yOrigin || 0) - altOverrides.after.y[0]) / (altOverrides.after.y[1] - altOverrides.after.y[0]);
-  assert.ok(Math.abs(zeroAfter - zeroBefore) < 1e-12, `Alt keeps zero at the same vertical screen position while zooming (${zeroBefore} → ${zeroAfter}, origins ${altOverrides.before.yOrigin} → ${altOverrides.after.yOrigin})`);
+  const alt = await zoom({ altKey: true });
+  assert.ok(alt.after.x[1] - alt.after.x[0] < alt.before.x[1] - alt.before.x[0]);
+  assert.ok(alt.after.y[1] - alt.after.y[0] < alt.before.y[1] - alt.before.y[0]);
+
+  const ctrlAltShift = await zoom({ altKey: true, ctrlKey: true, shiftKey: true });
+  assert.deepEqual(ctrlAltShift.after.x, ctrlAltShift.before.x);
+  assert.ok(ctrlAltShift.after.y[1] - ctrlAltShift.after.y[0] < ctrlAltShift.before.y[1] - ctrlAltShift.before.y[0]);
+
 });
 
 test("a short run of wheel steps can shrink the Y span by at least six orders of magnitude", async () => {
@@ -4633,14 +4630,14 @@ test("a short run of wheel steps can shrink the Y span by at least six orders of
   const initialSpan = api.app.chartScale.yMax - api.app.chartScale.yMin;
   const canvas = element(elements, "plot");
 
-  for (let index = 0; index < 16; index += 1) {
+  for (let index = 0; index < 80; index += 1) {
     await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, preventDefault() {} });
   }
 
   flushAnimationFrames(animationFrames);
   const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
   assert.ok(span > 0 && Number.isFinite(span), `Y span must stay finite and positive, got ${span} Ω`);
-  assert.ok(span < initialSpan * 1e-6, `16 upward notches should shrink the view at least 1,000,000×; ${initialSpan} → ${span} Ω`);
+  assert.ok(span < initialSpan * 1e-6, `80 upward notches should shrink the view at least 1,000,000×; ${initialSpan} → ${span} Ω`);
 });
 
 test("Y-axis wheel zoom reaches a few floating-point steps without collapsing at large readings", async () => {
@@ -4704,51 +4701,6 @@ test("Y-axis wheel zoom at milliamp readings is not clamped to the one-amp preci
   const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
   assert.ok(Number.isFinite(span) && span > 0, `Y span must remain finite and nonzero, got ${span} A`);
   assert.ok(span < 1e-17, `expected milliamp readings to zoom below the old absolute floor, got ${span} A`);
-});
-
-test("Alt-wheel can zoom near zero despite a distant high-magnitude outlier", async () => {
-  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
-  api.app.modes.set("DCV", dcv);
-  api.app.points = [
-    { id: 1, x: 0, y: 0, status: "ok", unit: "V", mode: "DCV" },
-    { id: 2, x: 1, y: 1e-8, status: "ok", unit: "V", mode: "DCV" },
-    { id: 3, x: 2, y: 1e12, status: "ok", unit: "V", mode: "DCV" },
-  ];
-  element(elements, "autoFollow").checked = false;
-  api.drawChart();
-  const canvas = element(elements, "plot");
-
-  for (let index = 0; index < 240; index += 1) {
-    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, altKey: true, preventDefault() {} });
-  }
-
-  flushAnimationFrames(animationFrames);
-  const span = api.app.chartScale.yMax - api.app.chartScale.yMin;
-  assert.ok(api.app.chartScale.yMin <= 0 && api.app.chartScale.yMax >= 0, "Alt-wheel keeps zero inside the visible Y range");
-  assert.ok(api.app.chartScale.yMin <= 1e-8 && api.app.chartScale.yMax >= 1e-8, "the nearby low reading remains inside the zoomed Y range");
-  assert.ok(Number.isFinite(span) && span > 0, `Y span must remain finite and nonzero, got ${span} V`);
-  assert.ok(span < 1e-5, `expected Alt-wheel to zoom below the outlier-based floor, got ${span} V`);
-});
-
-test("Alt-wheel rebases a 30 MΩ plot before zooming around absolute zero", async () => {
-  const { api, elements, animationFrames } = createFrontend({ stubChart: false });
-  api.app.modes.set("RES2", { value: "RES2", label: "两线电阻", quantity: "resistance", unit: "Ohm", ranges: [], nplc: [], bandwidths: [] });
-  api.app.points = [{ id: 1, x: 0, y: 30e6, status: "ok", unit: "Ohm", mode: "RES2" }];
-  element(elements, "autoFollow").checked = false;
-  api.drawChart();
-  const canvas = element(elements, "plot");
-
-  for (let index = 0; index < 600; index += 1) {
-    await canvas.dispatch("wheel", { clientX: 400, clientY: 200, deltaY: -120, altKey: true, preventDefault() {} });
-  }
-
-  flushAnimationFrames(animationFrames);
-  const scale = api.app.chartScale;
-  const span = scale.yMax - scale.yMin;
-  assert.equal(scale.yOrigin, 0, "Alt-wheel zero is the new coordinate origin");
-  assert.ok(Number.isFinite(span) && span > 0, `Alt-wheel span must remain finite and positive, got ${span} Ω`);
-  assert.ok(span < 1e-30, `expected Alt-wheel to zoom below the previous 1e-24 Ω floor around zero, got ${span} Ω`);
-  assert.equal(api.app.points[0].y, 30e6, "the sample remains in its original absolute units");
 });
 
 test("touch pinch can narrow the Y axis to a few floating-point steps at large readings", async () => {

@@ -162,6 +162,9 @@ def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transp
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert result == 0, report
     assert report["status"] == "ok"
+    assert report["sample_count"] >= 2
+    assert report["measurement_speed_changes"] == []
+    assert report["target_interval_changes"] == []
     assert report["restore_wiring_confirmation"] == "explicitly_confirmed"
     assert float(report["restored_configuration"]["range_response"]) == 100e-3
     assert any(":RANG 0.01" in command for command in transport.commands)
