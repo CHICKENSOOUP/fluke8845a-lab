@@ -43,9 +43,10 @@ jobs:
       - name: Run Python 3.11 tests
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py311" --timeout-seconds 480
+          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py311" --timeout-seconds 240
           if ($LASTEXITCODE -ne 0) { throw "Python 3.11 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
 
@@ -112,9 +113,10 @@ jobs:
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
         run: |
           New-Item -ItemType Directory -Path "build" -Force | Out-Null
-          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py312" --timeout-seconds 480
+          python scripts/run_tests_sharded.py --output-root "build\pytest-shards-py312" --timeout-seconds 240
           if ($LASTEXITCODE -ne 0) { throw "Python 3.12 pytest shard suite failed (exit $LASTEXITCODE)." }
         shell: pwsh
 
