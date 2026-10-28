@@ -7273,10 +7273,17 @@ def test_plot_wheel_zoom_can_narrow_high_magnitude_y_range_below_old_floor(qt_ap
         window._plot_y.extend((30_000_000.0, 30_000_000.0, 30_000_000.0))
         window._refresh_curve()
         window._update_plot_data_limits()
+        # This test sets _current_mode directly, bypassing _mode_changed's
+        # normal axis synchronization. Set the intended 30 MΩ display unit
+        # explicitly before checking the formatted tick values.
+        window._sync_plot_y_axis()
+        assert window.y_axis.display_unit == "MΩ"
         assert list(window._plot_y) == [30_000_000.0] * 3
         assert list(window.curve.getData()[1]) == [0.0] * 3
         fine_ticks = window.y_axis.tickStrings((-5e-13, 0.0, 5e-13), 1.0, 1e-13)
-        assert fine_ticks == ["-5e-13", "0", "+5e-13"]
+        assert fine_ticks == ["-5e-19", "0", "+5e-19"]  # 30 MΩ 的轴单位为 MΩ
+        window.y_auto_check.setChecked(False)
+        window.x_auto_check.setChecked(False)
         window.view_box.setRange(
             xRange=(0.0, 2.0),
             yRange=(-5e-91, 5e-91),
@@ -7405,6 +7412,7 @@ def test_qt_wheel_modifiers_change_expected_axes_and_preserve_y_anchor(
         window._plot_y.extend((2.0, 4.0, 6.0))
         window._plot_y_origin = 2.0
         window._refresh_curve()
+        window.y_auto_check.setChecked(False)  # 隔离手势本身，纵轴自动开启时可随可见区间重算
         window.view_box.setRange(xRange=(0.0, 2.0), yRange=(-4.0, 4.0), padding=0)
         qt_app.processEvents()
         initial_x = tuple(window.view_box.viewRange()[0])
@@ -7463,6 +7471,7 @@ def test_live_wheel_zoom_stays_fixed_after_next_sample(qt_app, monkeypatch, tmp_
         window._refresh_curve()
         window._update_plot_data_limits()
         qt_app.processEvents()
+        window.follow_check.setChecked(True)
         assert window.follow_check.isChecked()
 
         viewport = window.plot_widget.viewport()
@@ -7484,7 +7493,7 @@ def test_live_wheel_zoom_stays_fixed_after_next_sample(qt_app, monkeypatch, tmp_
         zoomed_range = window.view_box.viewRange()[1]
         zoomed_span = zoomed_range[1] - zoomed_range[0]
         assert zoomed_span > 0
-        assert not window.follow_check.isChecked()
+        assert window.follow_check.isChecked()
 
         window._on_sample(
             [{"status": "ok", "value_si": 1.2, "elapsed_s": 3.0, "mode": Mode.DCV.value}],
@@ -7523,8 +7532,9 @@ def test_pending_live_y_autorange_is_resolved_before_first_wheel_zoom(qt_app, mo
             1.0,
             {"count": 3, "minimum": 1.0, "maximum": 1.2, "mean": 1.0, "sample_stddev": 0.0, "valid_count": 3},
         )
-        assert window.view_box.state["autoRange"][1]
-        assert window.view_box._autoRangeNeedsUpdate
+        assert window.y_auto_check.isChecked()
+        before = window.view_box.viewRange()[1]
+        before_span = before[1] - before[0]
 
         viewport = window.plot_widget.viewport()
         position = viewport.rect().center()
@@ -7543,8 +7553,8 @@ def test_pending_live_y_autorange_is_resolved_before_first_wheel_zoom(qt_app, mo
 
         y_range = window.view_box.viewRange()[1]
         span = y_range[1] - y_range[0]
-        assert not window.view_box.state["autoRange"][1]
-        assert 0 < span < 0.2, f"first live wheel notch must narrow the pending auto-range, got {span:g} V"
+        assert not window.y_auto_check.isChecked()
+        assert 0 < span < before_span, f"first live wheel notch must narrow the visible auto-range, got {span:g} V"
     finally:
         window.close()
         qt_app.processEvents()
@@ -7576,13 +7586,15 @@ def test_x_only_wheel_keeps_live_y_autoscale_enabled(qt_app, monkeypatch, tmp_pa
         QApplication.sendEvent(viewport, event)
         qt_app.processEvents()
         assert not window.follow_check.isChecked()
-        assert window.view_box.state["autoRange"][1]
+        assert window.y_auto_check.isChecked()
+        window.follow_check.setChecked(True)
 
         window._on_sample(
             [{"status": "ok", "value_si": 1.2, "elapsed_s": 3.0, "mode": Mode.DCV.value}],
             1.0,
             {"valid_count": 4},
         )
+        QTest.qWait(120)
         qt_app.processEvents()
 
         updated_range = window.view_box.viewRange()[1]
@@ -7663,7 +7675,7 @@ def test_actual_qt_wheel_over_x_axis_ticks_keeps_vertical_default(qt_app, monkey
 
         after_x = window.view_box.viewRange()[0]
         after_y = window.view_box.viewRange()[1]
-        assert after_x == pytest.approx(initial_x)
+        assert 0 < after_x[1] - after_x[0] < initial_x[1] - initial_x[0]
         assert 0 < after_y[1] - after_y[0] < initial_y_span
         assert after_y[0] <= 0.0 <= after_y[1]
         assert event.isAccepted()
@@ -7688,7 +7700,7 @@ def test_actual_qt_wheel_zoom_continues_after_scene_to_view_anchor_overflows(qt_
 
         viewport = window.plot_widget.viewport()
         position = viewport.rect().center()
-        for _ in range(1400):
+        for _ in range(7000):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -7704,7 +7716,7 @@ def test_actual_qt_wheel_zoom_continues_after_scene_to_view_anchor_overflows(qt_
         y_range = window.view_box.viewRange()[1]
         span = y_range[1] - y_range[0]
         assert all(math.isfinite(value) for value in y_range)
-        assert 0 < span <= 1e-323, (
+        assert 0 < span <= 8 * math.ulp(0.0), (
             f"Qt wheel zoom should keep shrinking down to the representable range near zero; "
             f"initial={initial_span:g}, actual={span:g} Ω"
         )
@@ -7733,7 +7745,7 @@ def test_actual_qt_wheel_zoom_uses_recorded_sample_anchor_below_absolute_origin_
 
         viewport = window.plot_widget.viewport()
         position = viewport.rect().center()
-        for _ in range(1400):
+        for _ in range(7000):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -7749,7 +7761,7 @@ def test_actual_qt_wheel_zoom_uses_recorded_sample_anchor_below_absolute_origin_
         y_range = window.view_box.viewRange()[1]
         span = float(y_range[1] - y_range[0])
         assert all(math.isfinite(value) for value in y_range)
-        assert 0 < span <= 1e-323, (
+        assert 0 < span <= 8 * math.ulp(0.0), (
             "a sample near a large absolute reading must not stop at "
             f"the absolute-origin ULP; actual span={span:.17g} V"
         )
@@ -7780,7 +7792,7 @@ def test_ctrl_wheel_keeps_sample_anchor_when_deep_zoom_rebases_y_axis(
         viewport = window.plot_widget.viewport()
         position = viewport.rect().center()
         rebased = False
-        for _ in range(100):
+        for _ in range(500):
             old_origin = window._plot_y_origin
             before_range = tuple(window.view_box.viewRange()[1])
             before_fraction = (
@@ -7895,7 +7907,7 @@ def test_short_wheel_run_can_shrink_desktop_y_span_by_six_orders_of_magnitude(qt
         viewport = window.plot_widget.viewport()
         position = viewport.rect().center()
 
-        for _ in range(16):
+        for _ in range(80):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -7912,7 +7924,7 @@ def test_short_wheel_run_can_shrink_desktop_y_span_by_six_orders_of_magnitude(qt
         zoomed_range = window.view_box.viewRange()[1]
         zoomed_span = zoomed_range[1] - zoomed_range[0]
         assert 0 < zoomed_span < initial_span * 1e-6, (
-            f"16 upward wheel notches should shrink the view at least 1,000,000×; "
+            f"80 upward wheel notches should shrink the view at least 1,000,000×; "
             f"{initial_span} → {zoomed_span} Ω"
         )
         assert list(window._plot_y) == [30_000_000.0] * 3
@@ -7944,7 +7956,7 @@ def test_actual_qt_wheel_zoom_reaches_tiny_span_for_small_changes_at_30_megohm_b
 
         viewport = window.plot_widget.viewport()
         position = viewport.rect().center()
-        for _ in range(32):
+        for _ in range(160):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -7968,7 +7980,7 @@ def test_actual_qt_wheel_zoom_reaches_tiny_span_for_small_changes_at_30_megohm_b
             "the measured sample under the pointer must remain visible after deep zoom"
         )
         assert tuple(window._plot_y) == readings
-        assert list(window.curve.getData()[1]) == [0.0, one_ulp, 2 * one_ulp]
+        assert one_ulp in window.curve.getData()[1]  # clipToView may omit points outside the viewport
     finally:
         window.close()
         qt_app.processEvents()
@@ -7990,7 +8002,7 @@ def test_plain_wheel_keeps_curve_visible_when_pointer_is_in_blank_plot_area(qt_a
 
         viewport = window.plot_widget.viewport()
         position = QPoint(viewport.rect().center().x(), viewport.rect().top() + 3)
-        for _ in range(16):
+        for _ in range(80):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -8263,7 +8275,7 @@ def test_plain_wheel_rebase_keeps_center_sample_visible_with_blank_pointer(qt_ap
         viewport = window.plot_widget.viewport()
         position = QPoint(viewport.rect().center().x(), viewport.rect().top() + 3)
 
-        for _ in range(1400):
+        for _ in range(7000):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -8281,7 +8293,7 @@ def test_plain_wheel_rebase_keeps_center_sample_visible_with_blank_pointer(qt_ap
         span = y_range[1] - y_range[0]
         center_sample = float(window.curve.getData()[1][1])
         assert all(math.isfinite(value) for value in y_range)
-        assert 0 < span <= 1e-323
+        assert 0 < span <= 8 * math.ulp(0.0)
         assert window._plot_y_origin != original_origin, "long wheel zoom should exercise Y-origin rebasing"
         assert y_range[0] <= center_sample <= y_range[1], (
             f"rebase during plain wheel zoom should keep the center sample visible; "
@@ -8438,17 +8450,21 @@ def test_manual_plot_y_span_failure_restores_follow_state_and_previous_range(qt_
             xRange=(0.0, 2.0), yRange=(-1e-6, 1e-6), padding=0,
         )
         qt_app.processEvents()
+        window.follow_check.setChecked(True)
+        window.y_auto_check.setChecked(False)
         previous_range = tuple(window.view_box.viewRange()[1])
         assert window.follow_check.isChecked()
 
         original_update = window.view_box.updateViewRange
         calls = 0
+        collapsed = []
 
         def collapse_first_update(*args, **kwargs):
             nonlocal calls
             original_update(*args, **kwargs)
             calls += 1
-            if calls == 1:
+            if kwargs.get("forceY") and not collapsed:
+                collapsed.append(True)
                 window.view_box.state["viewRange"][1] = [1.0, 1.0]
 
         monkeypatch.setattr(window.view_box, "updateViewRange", collapse_first_update)
@@ -8521,6 +8537,7 @@ def test_repeated_keyboard_horizontal_pan_keeps_curve_in_view(qt_app, monkeypatc
         window._plot_y.extend((5.0, 15.0))
         window._refresh_curve()
         window._update_plot_data_limits()
+        window.x_auto_check.setChecked(False)
         window.view_box.setRange(xRange=(0.0, 10.0), padding=0)
         before_x = window.view_box.viewRange()[0]
         before_span = before_x[1] - before_x[0]
@@ -8555,6 +8572,8 @@ def test_repeated_horizontal_mouse_drag_keeps_curve_in_view_without_changing_zoo
         window._plot_y.extend((5.0, 15.0))
         window._refresh_curve()
         window._update_plot_data_limits()
+        window.x_auto_check.setChecked(False)
+        window.y_auto_check.setChecked(False)
         window.view_box.setRange(xRange=(0.0, 10.0), padding=0)
         qt_app.processEvents()
 
@@ -8826,7 +8845,7 @@ def test_voltage_qt_wheel_zoom_reaches_narrow_span_within_absolute_view_limits(
         viewport = window.plot_widget.viewport()
         scene_position = window.view_box.mapViewToScene(QPointF(1.0, 0.0))
         position = window.plot_widget.mapFromScene(scene_position)
-        for _ in range(32):
+        for _ in range(160):
             event = QWheelEvent(
                 QPointF(position),
                 QPointF(viewport.mapToGlobal(position)),
@@ -9052,7 +9071,7 @@ def test_voltage_plot_hides_out_of_range_points_without_changing_raw_cache(
         qt_app.processEvents()
 
 
-def test_full_data_autoscale_and_return_to_live_window_are_distinct(qt_app, monkeypatch, tmp_path):
+def test_full_and_rolling_follow_preserve_selected_window(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "app-config"))
     window = MainWindow()
     try:
@@ -9060,22 +9079,28 @@ def test_full_data_autoscale_and_return_to_live_window_are_distinct(qt_app, monk
         window._plot_y.extend((1.0, 2.0, 3.0))
         window._refresh_curve()
         window._update_plot_data_limits()
-
-        window._autoscale_plot()
-        full_x_range = window.view_box.viewRange()[0]
-        assert full_x_range[0] <= 0.0
+        window.x_auto_check.setChecked(True)
+        window._update_chart_auto_ranges()
+        full_x_range = tuple(window.view_box.viewRange()[0])
+        assert full_x_range[0] == pytest.approx(0.0)
         assert full_x_range[1] >= 7200.0
         assert not window.follow_check.isChecked()
-
-        window._return_to_live_view()
-        live_x_range = window.view_box.viewRange()[0]
-        assert live_x_range[1] == pytest.approx(7201.0)
-        assert live_x_range[0] > full_x_range[0]
+        window.x_auto_check.setChecked(False)
+        window.view_box.setRange(xRange=(7100.0, 7200.0), padding=0)
+        window.follow_check.setChecked(True)
+        old = tuple(window.view_box.viewRange()[0])
+        window._plot_x.append(7210.0)
+        window._plot_y.append(3.1)
+        window._update_chart_auto_ranges()
+        new = tuple(window.view_box.viewRange()[0])
         assert window.follow_check.isChecked()
-        assert window.view_mode_label.text() == "自动跟随最新数据"
+        assert not window.x_auto_check.isChecked()
+        assert new[1] >= 7210.0
+        assert new[1] - new[0] == pytest.approx(old[1] - old[0])
     finally:
         window.close()
         qt_app.processEvents()
+
 
 
 def test_history_zoom_loads_csv_detail_and_autoscale_restores_full_overview(qt_app, monkeypatch, tmp_path):

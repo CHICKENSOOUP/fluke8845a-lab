@@ -7068,7 +7068,6 @@ class MainWindow(QMainWindow):
                 self.view_box.setRange(yRange=previous_y_range, padding=0)
             self.statusBar().showMessage("这个纵轴跨度小于图表可表示的范围", 8000)
             return
-        self.follow_check.setChecked(False)
         self.view_box.state["targetRange"][1] = [lower, upper]
         self.view_box.updateViewRange(forceY=True)
         actual_y_min, actual_y_max = self.view_box.viewRange()[1]
@@ -7084,12 +7083,16 @@ class MainWindow(QMainWindow):
             self._sync_plot_y_span_control()
             self.statusBar().showMessage("图表边界无法应用该跨度，已恢复之前的纵轴视图", 8000)
         elif boundary_limited:
+            self.y_auto_check.setChecked(False)
             self.statusBar().showMessage(f"受图表边界限制；当前纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
         elif span > requested_span:
+            self.y_auto_check.setChecked(False)
             self.statusBar().showMessage(f"输入范围低于当前浮点精度；当前纵轴跨度为 {actual_span:.8g} {unit}", 8000)
         elif not math.isclose(actual_span, span, rel_tol=1e-6, abs_tol=minimum_span):
+            self.y_auto_check.setChecked(False)
             self.statusBar().showMessage(f"受图表边界限制；当前纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
         else:
+            self.y_auto_check.setChecked(False)
             self.statusBar().showMessage(f"纵轴实际跨度为 {actual_span:.8g} {unit}", 8000)
 
     def _position_event_labels(self, *_args) -> None:
@@ -8230,7 +8233,9 @@ class MainWindow(QMainWindow):
         min_y -= origin
         max_y -= origin
         self.view_box.set_pan_y_data_bounds((min_y, max_y))
-        x_margin = max((max_x - min_x) * 0.05, abs(min_x) * 1e-12, 1e-6)
+        x_view = self.view_box.viewRange()[0]
+        x_view_span = max(0.0, float(x_view[1] - x_view[0]))
+        x_margin = max((max_x - min_x) * 0.05, x_view_span * 0.8, abs(min_x) * 1e-12, 1e-6)
         y_margin = _plot_y_margin(min_y + origin, max_y + origin)
         y_view_min, y_view_max = _mode_plot_y_view_limits(self._display_plot_mode(), origin, min_y, max_y)
         self.view_box.setLimits(
