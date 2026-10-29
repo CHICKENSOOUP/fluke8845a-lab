@@ -8716,9 +8716,13 @@ def test_vertical_zoom_out_can_shrink_curve_beyond_data_margin(qt_app, monkeypat
         window._plot_y.extend((1.0, 1.0, 1.0))
         window._refresh_curve()
         window._update_plot_data_limits()
+        window.y_auto_check.setChecked(False)
         window.plot_widget.getPlotItem().enableAutoRange(x=False, y=False)
         qt_app.processEvents()
         window.view_box.setRange(yRange=(1.0 - 0.5e-6, 1.0 + 0.5e-6), padding=0)
+        # A layout change can queue the application's deferred Y fit. Deliver
+        # that callback here so manual zoom is checked independently of timing.
+        window._y_axis_fit_timer.start(0)
         qt_app.processEvents()
         initial_span = window.view_box.viewRange()[1][1] - window.view_box.viewRange()[1][0]
         assert initial_span == pytest.approx(1e-6, rel=1e-6)
