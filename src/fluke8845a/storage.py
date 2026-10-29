@@ -887,7 +887,7 @@ class _WindowsDirectoryLease:
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
         file_read_attributes = 0x0080
-        delete_access = 0x00010000
+        file_list_directory = 0x0001
         share_read = 0x00000001
         share_write = 0x00000002
         open_existing = 3
@@ -896,7 +896,10 @@ class _WindowsDirectoryLease:
         invalid_handle = ctypes.c_void_p(-1).value
         handle = kernel32.CreateFileW(
             str(directory),
-            file_read_attributes | delete_access,
+            # Listing access makes Windows enforce the no-delete share mode;
+            # attribute-only handles do not pin a directory. Requesting DELETE
+            # also conflicts with child-file renames on Windows Server 2022.
+            file_read_attributes | file_list_directory,
             share_read | share_write,
             None,
             open_existing,

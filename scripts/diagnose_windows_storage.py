@@ -48,6 +48,7 @@ def main() -> int:
             raise
 
     os.replace = traced_replace
+    matrix_errors = 0
     for leased in (False, True):
         for existing in (False, True):
             directory = output / f"lease-{leased}-existing-{existing}"
@@ -72,6 +73,11 @@ def main() -> int:
                 if lease is not None:
                     lease.close()
             print(json.dumps({"leased": leased, "existing": existing, "errors": errors}), flush=True)
+            matrix_errors += len(errors)
+
+    if matrix_errors:
+        print("Rename matrix failed; skipping GUI tests so diagnostics cannot wait on error dialogs.", flush=True)
+        return 1
 
     try:
         recorder = ExperimentRecorder.create(output, "recorder", {"simulation": True}, ModeSettings(Mode.DCV))

@@ -697,6 +697,20 @@ def run_real_gui_speed_probe(
                 QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
             ):
                 window._start_continuous()
+            # Starting queues work on the acquisition thread. Wait for its
+            # recorder/configuration commit before counting measurement time;
+            # slow filesystem startup must not consume the requested duration.
+            # Keep the original wall deadline and cleanup reserve throughout.
+            startup_budget_s = max(
+                0.0,
+                wall_deadline - HARDWARE_PROBE_CLEANUP_RESERVE_S
+                - HARDWARE_PROBE_GUI_DRAIN_RESERVE_S - time.monotonic(),
+            )
+            pump_until(
+                lambda: window._experiment_csv_path is not None and not window._start_pending,
+                min(10.0, startup_budget_s),
+                "实验启动并创建记录文件",
+            )
             run_started = time.monotonic()
             capture_deadline = min(
                 run_started + duration_s,

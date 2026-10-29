@@ -1997,6 +1997,33 @@ def test_recorder_metadata_write_cannot_swap_run_directory_for_junction(
             recorder.finish("test")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory lease rename test")
+@pytest.mark.parametrize("existing", [False, True])
+def test_directory_lease_allows_atomic_child_replace_and_blocks_directory_rename(tmp_path, existing):
+    directory = tmp_path / "recording"
+    directory.mkdir()
+    moved = tmp_path / "renamed"
+    source = directory / "config.tmp"
+    target = directory / "config.json"
+    if existing:
+        target.write_text("old", encoding="utf-8")
+    lease = storage_module._WindowsDirectoryLease(directory)
+    try:
+        with source.open("x", encoding="utf-8") as stream:
+            stream.write("new")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(source, target)
+        assert target.read_text(encoding="utf-8") == "new"
+        assert not source.exists()
+        with pytest.raises(PermissionError):
+            os.rename(directory, moved)
+    finally:
+        lease.close()
+    os.rename(directory, moved)
+    assert (moved / "config.json").read_text(encoding="utf-8") == "new"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows directory lease lifecycle test")
 def test_recorder_directory_lease_is_released_when_recorder_is_collected(tmp_path):
     recorder = ExperimentRecorder.create(

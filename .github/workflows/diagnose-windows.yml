@@ -9,7 +9,7 @@ permissions:
 jobs:
   diagnose:
     runs-on: windows-2022
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -39,6 +39,14 @@ jobs:
         run: |
           python -u scripts/diagnose_windows_storage.py --handle $env:FLUKE_DIAGNOSTIC_HANDLE
           if ($LASTEXITCODE -ne 0) { throw "Diagnostic tests failed; inspect evidence above." }
+      - name: Run full Python 3.11 suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: '1'
+        shell: pwsh
+        run: |
+          python scripts/run_tests_sharded.py --output-root build/test-artifacts/windows-storage-diagnostic/full-suite --timeout-seconds 420
+          if ($LASTEXITCODE -ne 0) { throw "Python 3.11 suite failed." }
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

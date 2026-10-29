@@ -121,8 +121,9 @@ def test_dci_gui_probe_stops_before_configuration_when_restore_range_is_unconfir
     assert not any(":RANG 0.01" in command for command in transport.commands)
 
 
+@pytest.mark.parametrize("recorder_startup_delay_s", [0.0, 3.1])
 def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transport(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, recorder_startup_delay_s,
 ):
     from fluke8845a import worker as worker_module
     from fluke8845a.scpi import Serial8845A
@@ -148,6 +149,19 @@ def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transp
     monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 4.0)
     monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 8.0)
     monkeypatch.setattr(app_module, "HARDWARE_PROBE_CLEANUP_RESERVE_S", 0.5)
+    if recorder_startup_delay_s:
+        from fluke8845a.storage import ExperimentRecorder
+
+        original_create = ExperimentRecorder.create
+
+        def delayed_create(cls, *args, **kwargs):
+            # Exercise the production startup path on a slow filesystem. The
+            # acquisition duration starts after the recorder is ready.
+            time.sleep(recorder_startup_delay_s)
+            return original_create(*args, **kwargs)
+
+        monkeypatch.setattr(ExperimentRecorder, "create", classmethod(delayed_create))
+        monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 12.0)
     report_path = tmp_path / "dci-probe-restore.json"
 
     result = app_module.run_real_gui_speed_probe(
