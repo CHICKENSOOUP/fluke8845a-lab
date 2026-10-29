@@ -1,0 +1,48 @@
+name: Diagnose Windows storage and GUI tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-lock-python311.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-lock-python311.txt
+      - name: Download signed Microsoft handle diagnostic
+        shell: pwsh
+        run: |
+          $toolRoot = Join-Path $env:RUNNER_TEMP "fluke-handle"
+          New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
+          Invoke-WebRequest https://download.sysinternals.com/files/Handle.zip -OutFile (Join-Path $toolRoot "Handle.zip")
+          Expand-Archive (Join-Path $toolRoot "Handle.zip") -DestinationPath $toolRoot
+          $tool = Join-Path $toolRoot "handle64.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $tool
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Microsoft") { throw "Microsoft Handle signature invalid." }
+          "FLUKE_DIAGNOSTIC_HANDLE=$tool" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Capture evidence
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: '1'
+          PYTHONPATH: src
+        shell: pwsh
+        run: |
+          python -u scripts/diagnose_windows_storage.py --handle $env:FLUKE_DIAGNOSTIC_HANDLE
+          if ($LASTEXITCODE -ne 0) { throw "Diagnostic tests failed; inspect evidence above." }
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-storage-evidence
+          path: build/test-artifacts/windows-storage-diagnostic
+          retention-days: 7
