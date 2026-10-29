@@ -308,6 +308,7 @@ def test_acquisition_locks_modes_speed_and_sampling_interval(qt_app, monkeypatch
 
 def test_mode_indicator_animates_to_selected_button(qt_app, monkeypatch, tmp_path):
     monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "mode-animation-config"))
+    monkeypatch.setenv("FLUKE8845A_REDUCE_MOTION", "0")
     window = MainWindow()
     try:
         window.show()
