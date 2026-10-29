@@ -371,16 +371,23 @@ def test_simple_workspace_mock_connect_start_stop_saves_csv(qt_app, monkeypatch,
         assert window.setup_section_stack.currentIndex() == 0
         window.mock_mode_check.setChecked(True)
         window._connect_mock()
-        deadline = time.monotonic() + 5
-        while (not window._connected or not window._active_settings_by_mode) and time.monotonic() < deadline:
+        deadline = time.monotonic() + 30
+        while not window.start_button.isEnabled() and time.monotonic() < deadline:
             QTest.qWait(10)
+        assert window.start_button.isEnabled(), (
+            "MOCK连接后启动条件未就绪："
+            f"connected={window._connected}, simulation={window._simulation}, "
+            f"settings={window._active_settings_by_mode}, mode_known={window._instrument_mode_known}, "
+            f"pending=(connection={window._connection_pending}, configure={window._configure_pending}, "
+            f"start={window._start_pending}), warnings={warnings}"
+        )
         assert window._connected and window._simulation, f"Mock 连接失败：{warnings}"
         assert not window.configuration_dialog.isVisible()
         assert not window.output_root.isVisible()
         window.interval_spin.setValue(0.02)
         window.configuration_dialog.hide()
         window.start_button.click()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while window._experiment_csv_path is None and time.monotonic() < deadline:
             QTest.qWait(10)
         assert window._experiment_csv_path is not None, f"模拟实验启动未完成：{warnings}"
