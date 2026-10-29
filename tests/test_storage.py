@@ -27,6 +27,15 @@ def make_reading(value=1.2345678901234567, raw="+1.2345678901234567E+00"):
     return Reading(raw, value, 10, 1_000_000_000, 1_025_000_000, stamp, now.astimezone().isoformat(timespec="microseconds"))
 
 
+def _create_windows_directory_junction(link: Path, target: Path) -> None:
+    import _winapi
+
+    # Use CPython's native reparse-point creation instead of starting a shell.
+    _winapi.CreateJunction(str(target), str(link))
+    assert link.lstat().st_file_attributes & 0x400
+    assert link.resolve(strict=True) == target.resolve(strict=True)
+
+
 def test_experiment_writes_csv_incrementally_with_full_value_and_time(tmp_path):
     recorder = ExperimentRecorder.create(tmp_path, "long term", {"simulation": True, "device": {"model": "MOCK"}}, ModeSettings(Mode.DCV, input_impedance_auto=True))
     first = make_reading()
@@ -1902,20 +1911,7 @@ def test_recorder_refuses_a_real_windows_reserved_directory_junction(tmp_path):
     outside.mkdir()
     reserved = storage_module.reserve_experiment_directory(root, "junction integration")
     reserved.rmdir()
-    command = (
-        "New-Item -ItemType Junction "
-        f"-Path '{str(reserved).replace(chr(39), chr(39) * 2)}' "
-        f"-Target '{str(outside).replace(chr(39), chr(39) * 2)}' | Out-Null"
-    )
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"could not create a directory junction: {result.stderr or result.stdout}")
+    _create_windows_directory_junction(reserved, outside)
 
     try:
         with pytest.raises(OSError):
@@ -1950,20 +1946,7 @@ def test_recorder_metadata_write_cannot_swap_run_directory_for_junction(
     attack = {"rename_blocked": False, "junction_created": False}
 
     def create_junction() -> None:
-        command = (
-            "New-Item -ItemType Junction "
-            f"-Path '{str(directory).replace(chr(39), chr(39) * 2)}' "
-            f"-Target '{str(outside).replace(chr(39), chr(39) * 2)}' | Out-Null"
-        )
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise OSError(f"could not create race-test junction: {result.stderr or result.stdout}")
+        _create_windows_directory_junction(directory, outside)
         attack["junction_created"] = True
 
     def replace_after_directory_swap(source, target):

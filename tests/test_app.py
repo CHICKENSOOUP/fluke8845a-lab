@@ -101,7 +101,10 @@ def test_dci_gui_probe_stops_before_configuration_when_restore_range_is_unconfir
     monkeypatch.setattr(worker_module, "Serial8845A", serial_factory)
     monkeypatch.setattr(app_module, "MIN_HARDWARE_PROBE_DURATION_S", 0.1)
     monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 1.0)
-    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 3.0)
+    # This checks the refusal before reconfiguration, not GUI startup speed.
+    # Leave enough wall time for cold Qt startup on a loaded Windows runner;
+    # the fake instrument still refuses immediately once connection completes.
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 20.0)
     report_path = tmp_path / "dci-probe.json"
 
     result = app_module.run_real_gui_speed_probe(
@@ -147,7 +150,7 @@ def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transp
     monkeypatch.setattr(worker_module, "Serial8845A", serial_factory)
     monkeypatch.setattr(app_module, "MIN_HARDWARE_PROBE_DURATION_S", 0.1)
     monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 4.0)
-    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 8.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 20.0)
     monkeypatch.setattr(app_module, "HARDWARE_PROBE_CLEANUP_RESERVE_S", 0.5)
     if recorder_startup_delay_s:
         from fluke8845a.storage import ExperimentRecorder
@@ -161,7 +164,6 @@ def test_dci_gui_probe_confirms_target_and_restores_prior_range_with_fake_transp
             return original_create(*args, **kwargs)
 
         monkeypatch.setattr(ExperimentRecorder, "create", classmethod(delayed_create))
-        monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 12.0)
     report_path = tmp_path / "dci-probe-restore.json"
 
     result = app_module.run_real_gui_speed_probe(
@@ -757,7 +759,7 @@ def test_acv_and_res4_gui_probe_complete_with_fake_8845a(
     monkeypatch.setattr(worker_module, "Serial8845A", serial_factory)
     monkeypatch.setattr(app_module, "MIN_HARDWARE_PROBE_DURATION_S", 0.1)
     monkeypatch.setattr(app_module, "MAX_HARDWARE_PROBE_DURATION_S", 4.0)
-    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 8.0)
+    monkeypatch.setattr(app_module, "HARDWARE_PROBE_WALL_LIMIT_S", 20.0)
     monkeypatch.setattr(app_module, "HARDWARE_PROBE_CLEANUP_RESERVE_S", 1.0)
     monkeypatch.setattr(app_module, "HARDWARE_PROBE_GUI_DRAIN_RESERVE_S", 0.1)
     report_path = tmp_path / f"{mode.value.lower()}-fake-probe.json"

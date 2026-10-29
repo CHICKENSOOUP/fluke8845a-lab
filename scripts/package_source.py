@@ -88,6 +88,7 @@ REQUIRED_ARCHIVE_PATHS = (
     "docs/release-notes-v2.0.0.md",
     "docs/release-notes-v2.1.0.md",
     "docs/release-notes-v2.1.1.md",
+    "docs/release-notes-v2.1.2.md",
     "docs/release-notes-v1.1.0.md",
     "docs/release-notes-v1.0.7.md",
     "docs/release-notes-v1.0.6.md",

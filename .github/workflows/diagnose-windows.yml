@@ -30,15 +30,6 @@ jobs:
           $signature = Get-AuthenticodeSignature -LiteralPath $tool
           if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Microsoft") { throw "Microsoft Handle signature invalid." }
           "FLUKE_DIAGNOSTIC_HANDLE=$tool" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Capture evidence
-        env:
-          QT_QPA_PLATFORM: offscreen
-          PYTHONUTF8: '1'
-          PYTHONPATH: src
-        shell: pwsh
-        run: |
-          python -u scripts/diagnose_windows_storage.py --handle $env:FLUKE_DIAGNOSTIC_HANDLE
-          if ($LASTEXITCODE -ne 0) { throw "Diagnostic tests failed; inspect evidence above." }
       - name: Run full Python 3.11 suite
         env:
           QT_QPA_PLATFORM: offscreen
@@ -47,6 +38,16 @@ jobs:
         run: |
           python scripts/run_tests_sharded.py --output-root build/test-artifacts/windows-storage-diagnostic/full-suite --timeout-seconds 420
           if ($LASTEXITCODE -ne 0) { throw "Python 3.11 suite failed." }
+      - name: Capture evidence
+        if: always()
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: '1'
+          PYTHONPATH: src
+        shell: pwsh
+        run: |
+          python -u scripts/diagnose_windows_storage.py --handle $env:FLUKE_DIAGNOSTIC_HANDLE
+          if ($LASTEXITCODE -ne 0) { throw "Diagnostic tests failed; inspect evidence above." }
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
