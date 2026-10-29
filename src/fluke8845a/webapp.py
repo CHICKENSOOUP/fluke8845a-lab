@@ -49,6 +49,40 @@ _SECURITY_HEADERS = {
 }
 
 
+def _console_print(message: str, *, file=None, flush: bool = False) -> None:
+    """Write a console message without letting a legacy Windows code page crash startup."""
+    stream = sys.stdout if file is None else file
+    if stream is None:
+        return
+
+    text = str(message)
+    encoding = getattr(stream, "encoding", None)
+    if isinstance(encoding, str) and encoding:
+        try:
+            # Preserve characters supported by the active code page and visibly escape
+            # only the characters it cannot represent (for example Chinese on cp1252).
+            text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+        except LookupError:
+            text = text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+    try:
+        stream.write(text + "\n")
+        if flush:
+            stream.flush()
+    except UnicodeEncodeError:
+        # A non-standard stream may not expose its encoding accurately. ASCII escapes
+        # are safe for normal Windows console code pages and keep the message useful.
+        try:
+            stream.write(str(message).encode("ascii", errors="backslashreplace").decode("ascii") + "\n")
+            if flush:
+                stream.flush()
+        except (OSError, UnicodeEncodeError, ValueError):
+            return
+    except (OSError, ValueError):
+        # Frozen GUI launchers can have missing or closed console streams.
+        return
+
+
 def _complete_csv_prefix_size(path: Path, chunk_size: int = 64 * 1024) -> int:
     """Return the byte length through the last complete CSV record boundary."""
     return complete_csv_prefix_size(path, chunk_size=chunk_size)
@@ -81,7 +115,7 @@ class LocalWebHandler(BaseHTTPRequestHandler):
             safe_line = re.sub(r"\?[^ ]*(?= HTTP/)", "", request_line)
             args = (safe_line, *args[1:])
         try:
-            print(
+            _console_print(
                 f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
                 f"{self.client_address[0]} {format % args}",
                 file=stream,
@@ -656,8 +690,8 @@ def main(argv: list[str] | None = None) -> int:
         server = create_server(runtime, args.port)
     except OSError as exc:
         while not runtime.stop():
-            print("localhost 服务线程仍在收尾；等待采集线程安全关闭。", file=sys.stderr, flush=True)
-        print(f"无法启动 localhost 服务：{exc}", file=sys.stderr)
+            _console_print("localhost 服务线程仍在收尾；等待采集线程安全关闭。", file=sys.stderr, flush=True)
+        _console_print(f"无法启动 localhost 服务：{exc}", file=sys.stderr)
         return 2
     url = f"http://127.0.0.1:{server.server_port}/"
     serve_thread = threading.Thread(target=server.serve_forever, name="8845A-local-web", daemon=True)
@@ -665,8 +699,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime.router.shutdown_requested.connect(
         lambda: threading.Timer(0.7, app.quit).start()
     )
-    print(f"Fluke 8845A localhost 界面已启动：{url}")
-    print("可按 Ctrl+C 或在页面选择“退出服务”安全关闭；仪器只由此进程中的单个采集线程访问。")
+    _console_print(f"Fluke 8845A localhost 界面已启动：{url}")
+    _console_print("可按 Ctrl+C 或在页面选择“退出服务”安全关闭；仪器只由此进程中的单个采集线程访问。")
 
     previous_sigint = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, lambda *_args: app.quit())
@@ -679,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         server.shutdown()
         server.server_close()
         while not runtime.stop():
-            print("采集线程仍在完成当前操作；等待串口与数据文件安全关闭。", file=sys.stderr, flush=True)
+            _console_print("采集线程仍在完成当前操作；等待串口与数据文件安全关闭。", file=sys.stderr, flush=True)
     return 0
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import socket
 import threading
@@ -26,6 +27,24 @@ from fluke8845a.webservice import WebRuntime, mode_settings_from_payload, serial
 from tests.fakes import FakeTransport
 
 LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
+
+
+def test_console_message_escapes_only_characters_missing_from_windows_code_page():
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", newline="")
+
+    webapp_module._console_print("Fluke café 中文", file=stream, flush=True)
+
+    assert buffer.getvalue().decode("cp1252") == "Fluke café \\u4e2d\\u6587\n"
+
+
+def test_console_message_tolerates_missing_and_closed_streams(monkeypatch):
+    monkeypatch.setattr(webapp_module.sys, "stdout", None)
+    webapp_module._console_print("stdout unavailable")
+
+    closed_stream = io.StringIO()
+    closed_stream.close()
+    webapp_module._console_print("stderr unavailable", file=closed_stream)
 
 
 def test_connection_stage_history_is_ordered_and_keeps_latest_status():
