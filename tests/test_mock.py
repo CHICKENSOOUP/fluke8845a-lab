@@ -133,7 +133,7 @@ def test_demo_generator_writes_explicit_six_mode_experiment_bundles(tmp_path):
             reader = csv.DictReader(stream)
             events = list(reader)
             assert reader.fieldnames == list(EVENT_FIELDS)
-        assert config["software_version"] == "2.1.0"
+        assert config["software_version"] == "2.1.1"
         assert config["sample_count"] == len(measurements) == 30
         assert config["event_count"] == len(events) == 4
         assert all(row["experiment_id"] == config["experiment_id"] for row in measurements + events)

@@ -4,11 +4,11 @@
 
 ## 简体中文
 
-版本 2.1.0 · 中文 Windows 桌面应用
+版本 2.1.1 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v2.1.0 统一桌面与网页测量界面。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
+v2.1.1 统一桌面与网页测量界面。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时先发送 `SYST:REM`，再查询 `*IDN?`；只接受设备型号字段为 `8845A` 的 Fluke 仪器，不会重置仪器。若身份识别失败，程序会尽力发送 `SYST:LOC` 后关闭串口。先 REMOTE 再进行 RS-232 收发遵循编程手册 PDF 第76页（印刷第66页）的说明。
 
@@ -133,7 +133,7 @@ CSV以UTF-8 BOM编码，含样本序号、主机本地和UTC ISO时间、单调�
 
 ## English
 
-Version 2.1.0 brings the desktop and browser measurement interfaces together. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
+Version 2.1.1 brings the desktop and browser measurement interfaces together. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
 
 ### 1. Connection and modes
 

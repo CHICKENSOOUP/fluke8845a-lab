@@ -1595,7 +1595,7 @@ def test_extracted_source_web_smoke_serves_current_health_and_asset_fingerprints
 
     assert report["health"]["status"] == "ok"
     assert report["health"]["bind"] == "127.0.0.1"
-    assert report["health"]["version"] == "2.1.0"
+    assert report["health"]["version"] == "2.1.1"
     assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
     for route, filename in {
         "/": "index.html",
