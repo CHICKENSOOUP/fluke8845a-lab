@@ -4,11 +4,11 @@
 
 ## 简体中文
 
-版本 2.1.2 · 中文 Windows 桌面应用
+版本 2.1.3 · 中文 Windows 桌面应用
 
 ## 1. 启动与工作模式
 
-v2.1.2 统一桌面与网页测量界面。绘图缩放只改变视图，不修改原始读数。正式发布提供源码 ZIP 和 SHA-256 校验文件；预编译 Windows 包暂不上传 GitHub Release，Qt/PySide 许可交付仍待完成。本版本的验证范围见[硬件验证说明](hardware-validation.md)；自动化测试不代表真机验证。
+v2.1.3 更新了桌面与网页模式切换动效，提供带应用图标的 Windows 桌面和 Web 快捷方式，并改用无控制台启动器。源码首次运行会准备 Python 环境；后续启动直接复用。桌面与 Web 保持同一六种测量模式和实时曲线布局。绘图缩放只改变视图，不修改原始读数。本次验证范围见[硬件验证说明](hardware-validation.md)。
 
 - **真实仪器**：将仪器后面板设为 RS-232，并选择 8845A/8846A 指令集的 COMPUTER 协议模式。连接后本程序默认以 COMPUTER/REMOTE 控制仪表；仪器设置区可切换为 LOCAL 面板控制。连接时先发送 `SYST:REM`，再查询 `*IDN?`；只接受设备型号字段为 `8845A` 的 Fluke 仪器，不会重置仪器。若身份识别失败，程序会尽力发送 `SYST:LOC` 后关闭串口。先 REMOTE 再进行 RS-232 收发遵循编程手册 PDF 第76页（印刷第66页）的说明。
 
@@ -127,13 +127,13 @@ CSV以UTF-8 BOM编码，含样本序号、主机本地和UTC ISO时间、单调�
 
 ## 9. localhost 浏览器界面
 
-运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`，打开本机网页界面。主界面提供六种测量模式、仪器连接、测量参数、量程、采集控制和曲线。普通滚轮缩放两轴，Shift + 滚轮缩放时间轴，Ctrl + 滚轮缩放纵轴。可选完整显示、滚动显示和纵轴自动；滑动平均点数可在采集中修改。点击“保存曲线”下载 ZIP，内含简洁 CSV 和详细 CSV。
+双击桌面的“Fluke 8845A Web”快捷方式或运行 `python -m fluke8845a.webapp`，打开本机网页界面。主界面提供六种测量模式、仪器连接、测量参数、量程、采集控制和曲线。普通滚轮缩放两轴，Shift + 滚轮缩放时间轴，Ctrl + 滚轮缩放纵轴。可选完整显示、滚动显示和纵轴自动；滑动平均点数可在采集中修改。点击“保存曲线”下载 ZIP，内含简洁 CSV 和详细 CSV。
 
 启动服务不会自动打开串口。连接前先断开桌面版占用的 COM 端口，因为同一端口不能同时由两个程序打开。电流和电阻测量仍须由操作者确认接线、输入端子、保险丝和被测电路状态。页面的“退出服务”会停止采集、完成待写数据并安全关闭串口。
 
 ## English
 
-Version 2.1.2 brings the desktop and browser measurement interfaces together. Plot zoom changes only the view and does not modify raw readings. The stable release provides the source ZIP and SHA-256 checksum; a prebuilt Windows package is not uploaded to GitHub Releases while Qt/PySide license delivery remains under review. See [hardware validation](hardware-validation.md) for the verified scope; automated tests do not constitute a real instrument validation.
+Version 2.1.3 updates the desktop and Web mode-switch animations, adds Windows desktop and Web shortcuts with the app icon, and replaces console launchers. The source package prepares its Python environment on first start and reuses it afterward. Both interfaces keep the same six measurement modes and live chart layout. Plot zoom changes only the view and does not modify raw readings. See [hardware validation](hardware-validation.md) for the verification scope.
 
 ### 1. Connection and modes
 
@@ -179,6 +179,6 @@ Automated tests use an internal simulator; the application interfaces connect to
 
 ### 7. Local browser interface
 
-Start the browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. The local interface provides six measurement modes, connection and measurement settings, range controls, acquisition, and a live chart. The wheel zooms both axes; Shift and Ctrl restrict zoom to the time or vertical axis. Curve export downloads a ZIP containing the simple and detailed CSV files.
+Start the browser interface with the desktop shortcut “Fluke 8845A Web” or `python -m fluke8845a.webapp`. The local interface provides six measurement modes, connection and measurement settings, range controls, acquisition, and a live chart. The wheel zooms both axes; Shift and Ctrl restrict zoom to the time or vertical axis. Curve export downloads a ZIP containing the simple and detailed CSV files.
 
 Starting the browser server does not open a serial port. Disconnect the desktop app from the meter before connecting the browser interface because Windows cannot open the same COM port from two applications simultaneously. Operators must still verify wiring, terminals, fuses, and circuit state for current and resistance measurements. **Exit service** stops acquisition, finishes pending writes, and closes the serial connection.

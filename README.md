@@ -19,7 +19,7 @@
 
 ### 源码安装
 
-从 GitHub 下载源码 ZIP 后先解压。最简单的启动方法是双击 `run_windows.bat`。需要安装 64 位 Python 3.11 或 3.12；首次启动需要联网，启动器会按 Python 版本使用随包提供的锁定依赖文件，自动创建项目专用的 `.venv`，之后启动会复用环境。启动本机网页界面请双击 `run_web.bat`。源码 ZIP 不含预编译 EXE。
+从 GitHub 下载源码 ZIP 后先解压，双击 `Install-Fluke8845A-Shortcuts.vbs`。它会在桌面创建带应用图标的“Fluke 8845A”和“Fluke 8845A Web”快捷方式，并启动桌面版。需要 64 位 Python 3.11 或 3.12；首次启动需要联网，程序会自动创建项目专用环境并安装锁定依赖。源码 ZIP 不含预编译 EXE。
 
 也可以手动在 PowerShell 中安装：
 
@@ -31,7 +31,7 @@ python -m pip install --no-deps --no-build-isolation -e .
 python -m fluke8845a
 ```
 
-启动本机网页界面：运行 `python -m fluke8845a.webapp` 或双击 `run_web.bat`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
+启动本机网页界面：双击桌面的“Fluke 8845A Web”快捷方式，或运行 `python -m fluke8845a.webapp`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
 开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1`。该入口会并行运行完整 pytest 分片套件，不设 60 秒测试上限；日志保存在系统临时目录。若依赖装在其他 Python 环境，可加 `-PythonPath .\.venv-build\Scripts\python.exe`。Windows 便携构建需要 64 位 Python 3.12 和 Node.js 22 或更新版本；构建会先运行 Python 与 Web 前端测试，通过后才开始编译。
 
@@ -68,6 +68,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 - [使用指南](docs/user-guide.md)
 - [短时真机 GUI 探测](docs/hardware-probes.md)
 - [已知限制](docs/known-limitations.md)
+- [v2.1.3 发布说明](docs/release-notes-v2.1.3.md)
 - [v2.1.2 发布说明](docs/release-notes-v2.1.2.md)
 - [v2.1.0 发布说明](docs/release-notes-v2.1.0.md)
 - [v2.0.0 发布说明](docs/release-notes-v2.0.0.md)
@@ -100,7 +101,7 @@ Qt/PySide6 supplies the graphical interface; pyserial and the project's SCPI dri
 
 ## Source setup
 
-Extract the GitHub source ZIP, then double-click `run_windows.bat`. It requires 64-bit Python 3.11 or 3.12 and an internet connection on first launch. The launcher selects the matching included dependency lock, creates a project-local `.venv`, and reuses that environment on later starts. Double-click `run_web.bat` to start the localhost browser interface. The source ZIP does not contain a prebuilt EXE.
+Extract the GitHub source ZIP, then double-click `Install-Fluke8845A-Shortcuts.vbs`. It creates desktop and localhost Web shortcuts with the app icon, then starts the desktop app. It requires 64-bit Python 3.11 or 3.12 and an internet connection on first launch; the launcher creates a project-local environment and installs the locked dependencies. The source ZIP does not contain a prebuilt EXE.
 
 For a manual PowerShell setup:
 
@@ -112,7 +113,7 @@ python -m pip install --no-deps --no-build-isolation -e .
 python -m fluke8845a
 ```
 
-Start the local browser interface with `python -m fluke8845a.webapp` or `run_web.bat`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
+Start the local browser interface with the desktop shortcut “Fluke 8845A Web” or `python -m fluke8845a.webapp`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
 
 Install developer dependencies with `python -m pip install -e ".[dev]"`. In PowerShell, run the complete pytest suite in parallel shards; no 60-second cap is applied, and per-shard logs are kept outside the checkout in the system temporary directory. If the dependencies are installed in another Python environment, pass `-PythonPath .\.venv-build\Scripts\python.exe`:
 
@@ -137,7 +138,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 .\build_windows.ps1 -SideBySide -BuildName $buildName -PythonPath ".venv-build\Scripts\python.exe"
 ```
 
-After a `-SideBySide` build passes verification, the build updates `dist\Start-Latest-Verified-Fluke8845A.bat`. Use that launcher to open the most recently promoted local Windows build; it keeps older candidate directories intact and starts the exact executable from the new build folder. Standard builds reuse a fixed directory and therefore do not change the launcher. The running window title also shows the version and source-build digest so you can confirm which copy is open.
+After a `-SideBySide` build passes verification, the build updates `dist\Start-Latest-Verified-Fluke8845A.vbs`. Use it to open the most recently promoted local Windows build; it keeps older candidate directories intact and starts the exact executable from the new build folder without opening a console window. Standard builds reuse a fixed directory and therefore do not change the launcher. The running window title also shows the version and source-build digest so you can confirm which copy is open.
 
 Portable ZIP publication is serialized by candidate identity, including the shared `output/mock_validation/<candidate>_portable_validation.json` report. The report records the ZIP SHA-256; treat the ZIP/report pair as verified only when that hash matches the ZIP. A forced process termination or power loss can bypass Python rollback cleanup and leave a hidden `*.rollback.zip` recovery copy beside the ZIP; rerun the same build to regenerate and verify the ZIP/report pair before using either as current validation evidence.
 
@@ -161,6 +162,7 @@ This source release does not bundle Qt libraries. Do not treat the project MIT l
 - [Usage guide](docs/user-guide.md)
 - [Short hardware GUI probes](docs/hardware-probes.md)
 - [Known limitations](docs/known-limitations.md)
+- [v2.1.3 release notes](docs/release-notes-v2.1.3.md)
 - [v2.1.2 release notes](docs/release-notes-v2.1.2.md)
 - [v2.1.0 release notes](docs/release-notes-v2.1.0.md)
 - [v2.0.0 release notes](docs/release-notes-v2.0.0.md)

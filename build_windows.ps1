@@ -312,7 +312,7 @@ try {
             --dist-root $distRoot `
             --executable $exe
         if ($LASTEXITCODE -ne 0) { throw "Latest verified Windows launcher update failed." }
-        Write-Host "Updated latest verified launcher $(Join-Path $distRoot 'Start-Latest-Verified-Fluke8845A.bat')"
+        Write-Host "Updated latest verified launcher $(Join-Path $distRoot 'Start-Latest-Verified-Fluke8845A.vbs')"
     } else {
         Write-Host "Stable launcher unchanged; use -SideBySide to promote an immutable verified build."
     }

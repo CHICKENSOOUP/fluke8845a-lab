@@ -545,6 +545,45 @@ body { color: #273136; background: #efeee6; }
   .dialog-shell { max-height: calc(100dvh - 16px); }
 }
 
+/* One moving panel carries the selected measurement mode. */
+.mode-buttons { position: relative; isolation: isolate; }
+.mode-selection {
+  position: absolute; z-index: 0; top: 0; left: 0; display: block;
+  width: 0; height: 0; opacity: 0; pointer-events: none;
+  transform: translate3d(0, 0, 0); transition: transform 420ms cubic-bezier(.2,.82,.22,1), width 420ms cubic-bezier(.2,.82,.22,1), height 420ms cubic-bezier(.2,.82,.22,1), opacity 150ms ease;
+  will-change: transform, width, height;
+}
+.mode-selection.is-positioned { opacity: 1; }
+.mode-selection-surface {
+  position: absolute; inset: 0; display: block; overflow: hidden;
+  border: 1px solid #167b80; border-radius: 7px; background: #167b80;
+  box-shadow: 0 4px 10px #167b8028; transform: scale(1); transform-origin: center;
+}
+.mode-selection-surface::after {
+  position: absolute; inset: -1px; border: 1px solid #167b8080; border-radius: inherit;
+  content: ""; opacity: 0; transform: scale(.94);
+}
+.mode-selection.is-moving .mode-selection-surface { animation: mode-surface-expand 430ms cubic-bezier(.2,.82,.22,1) both; }
+.mode-selection.is-moving .mode-selection-surface::after { animation: mode-frame-expand 430ms ease-out both; }
+@keyframes mode-surface-expand {
+  0% { transform: scale(.86); }
+  68% { transform: scale(1.055); }
+  100% { transform: scale(1); }
+}
+@keyframes mode-frame-expand {
+  0% { opacity: .55; transform: scale(.94); }
+  100% { opacity: 0; transform: scale(1.22); }
+}
+.mode-buttons button { position: relative; z-index: 1; border-color: transparent; background: transparent; transition: color 180ms ease, border-color 180ms ease; }
+.mode-buttons button:hover:not(:disabled):not(.active) { border-color: #aebdb6; background: #faf9f499; }
+.mode-buttons button.active { border-color: transparent; background: transparent; color: #fff; }
+.mode-buttons button:focus-visible { z-index: 2; outline: 3px solid #e39b32; outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .mode-selection, .mode-buttons button { transition: none; }
+  .mode-selection.is-moving .mode-selection-surface,
+  .mode-selection.is-moving .mode-selection-surface::after { animation: none; }
+}
+
 .action-bar .acquisition-feedback { max-width: 100%; color: #8d3630; }
 @media (max-width: 520px) { .topbar-right .button-primary, .action-bar .button { min-height: 44px; } }
 @media (max-width: 850px) { .mode-buttons button { min-height: 44px; } }

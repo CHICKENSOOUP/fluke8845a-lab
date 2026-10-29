@@ -161,11 +161,39 @@ function serialPayload() {
   };
 }
 
+function updateModeSelection(mode, animate = false) {
+  const buttons = [...(document.querySelectorAll?.("[data-mode]") || [])];
+  const selected = buttons.find((button) => button.dataset.mode === mode);
+  for (const button of buttons) {
+    const active = button === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute?.("aria-pressed", String(active));
+  }
+  const indicator = el("modeSelection");
+  if (!indicator || !selected || !indicator.style) return;
+  indicator.style.transform = `translate3d(${selected.offsetLeft}px, ${selected.offsetTop}px, 0)`;
+  indicator.style.width = `${selected.offsetWidth}px`;
+  indicator.style.height = `${selected.offsetHeight}px`;
+  const wasPositioned = indicator.classList.contains("is-positioned");
+  indicator.classList.add("is-positioned");
+  if (animate && wasPositioned) {
+    indicator.classList.remove("is-moving");
+    void indicator.offsetWidth;
+    indicator.classList.add("is-moving");
+  }
+}
+
+function updateChartTitle() {
+  const title = el("chartTitle");
+  if (title) title.textContent = "实时数据";
+}
+
 function populateModeOptions(spec) {
   if (app.selectedMode === "DCV" && el("inputImpedanceAuto")) {
     app.dcvInputImpedanceAuto = el("inputImpedanceAuto").checked;
   }
   clearPreflightSummary();
+  const modeChanged = app.selectedMode !== spec.value;
   app.selectedMode = spec.value;
   const rangeItems = spec.ranges.map((range) => `<option value="${range}">${htmlText(rangeLabel(range, spec.unit))}</option>`).join("");
   let html = `<div class="option-row"><label class="option-check"><input id="autorange" type="checkbox" checked> 自动量程</label><label>固定量程<select id="range" disabled>${rangeItems}</select></label></div>`;
@@ -194,7 +222,7 @@ function populateModeOptions(spec) {
   ui.options.innerHTML = html;
   const rangeRow = ui.options.querySelector?.(".option-row");
   if (rangeRow && el("mainRange")) el("mainRange").replaceChildren(rangeRow);
-  document.querySelectorAll?.("[data-mode]").forEach(button => { button.classList.toggle("active", button.dataset.mode === spec.value); });
+  updateModeSelection(spec.value, modeChanged);
   el("range").title = fixedRangeTooltip();
   el("autorange").addEventListener("change", () => {
     el("range").disabled = el("autorange").checked;
@@ -236,7 +264,7 @@ function populateModeOptions(spec) {
   updateCurrentRangeGuidance(app.state, spec);
   clearSafetyConfirmation();
   el("readingMode").textContent = spec.label;
-  el("chartTitle").textContent = `${spec.label} · 随时间变化`;
+  updateChartTitle();
   el("legendName").textContent = `${spec.label} 原始读数`;
   drawChart();
 }
@@ -1391,7 +1419,7 @@ function clearDisplayedPlot() {
   el("restoreLive").classList.add("hidden");
   el("autoFollow").checked = false;
   const mode = activeMode();
-  el("chartTitle").textContent = mode ? `${mode.label} · 随时间变化` : "测量曲线";
+  updateChartTitle();
   el("legendName").textContent = mode ? `${mode.label} 原始读数` : "原始读数";
   renderEvents([]);
   updateAccessiblePointTable();
@@ -1856,7 +1884,8 @@ function updateStateDisplay(state) {
   el("disconnect").disabled = acquiring;
   const settingsDisabled = acquiring || !computerControl;
   el("mode").disabled = settingsDisabled;
-  document.querySelectorAll?.("[data-mode]").forEach(button => { button.disabled = settingsDisabled || !state.connected || !!app.modeSwitchPending; button.classList.toggle("active", button.dataset.mode === app.selectedMode); });
+  document.querySelectorAll?.("[data-mode]").forEach(button => { button.disabled = settingsDisabled || !state.connected || !!app.modeSwitchPending; });
+  updateModeSelection(app.selectedMode);
   el("autorange").disabled = settingsDisabled;
   el("range").disabled = settingsDisabled || el("autorange").checked;
   if (el("analogFilter")) el("analogFilter").disabled = settingsDisabled;
@@ -2326,6 +2355,7 @@ function clampRangeToData(range, dataMin, dataMax) {
 }
 
 function updateViewStatus() {
+  updateChartTitle();
   const label = app.imported ? "历史文件视图" : el("autoFollow").checked ? "自动跟随最新数据" : "手动视图 · 自动跟随已关闭";
   if (el("viewModeStatus")) el("viewModeStatus").textContent = label;
   const source = el("dataSourceStatus");
@@ -2333,6 +2363,7 @@ function updateViewStatus() {
     const fileName = String(app.importedFileName || "历史 CSV");
     source.textContent = app.imported ? `历史：${fileName}` : "实时数据";
     source.title = app.imported ? fileName : "当前显示实时测量数据";
+    source.hidden = !app.imported;
   }
 }
 
@@ -3146,7 +3177,10 @@ el("resetRealtimeView").addEventListener("click", () => {
   el("autoFollow").checked = true;
   drawChart();
 });
-window.addEventListener("resize", scheduleChartRedraw);
+window.addEventListener("resize", () => {
+  scheduleChartRedraw();
+  updateModeSelection(app.selectedMode);
+});
 
 async function loadHistory(file) {
   if (!file) return false;
@@ -3216,7 +3250,7 @@ async function loadHistory(file) {
     app.yOrigin = null;
     el("autoFollow").checked = false;
     el("restoreLive").classList.remove("hidden");
-    el("chartTitle").textContent = `${file.name} · 历史曲线`;
+    updateChartTitle();
     el("legendName").textContent = "CSV 历史原始读数";
     el("readingMode").textContent = mode?.label || `历史数据 ${modeValue}`;
     renderEvents([]);
@@ -3874,7 +3908,7 @@ function bindControls() {
     el("autoFollow").checked = false;
     el("restoreLive").classList.add("hidden");
     const mode = activeMode();
-    el("chartTitle").textContent = mode ? `${mode.label} · 随时间变化` : "测量曲线";
+    updateChartTitle();
     el("legendName").textContent = mode ? `${mode.label} 原始读数` : "原始读数";
     renderEvents(app.state?.events || []);
     updateStats(); drawChart();

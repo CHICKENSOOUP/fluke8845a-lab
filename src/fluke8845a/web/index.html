@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Fluke 8845A · 精密测量</title>
+  <title>Fluke 8845A</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='4' y='6' width='56' height='52' rx='10' fill='%23454d50'/%3E%3Crect x='8' y='10' width='48' height='44' rx='7' fill='%23f1efe6'/%3E%3Ccircle cx='17' cy='25' r='5' fill='%23d7494e'/%3E%3Ccircle cx='17' cy='40' r='5' fill='%2330383c'/%3E%3Crect x='27' y='16' width='23' height='29' rx='4' fill='%231d262a'/%3E%3Cpath d='M30 34c4-12 7 7 11-3s6-6 8-3' fill='none' stroke='%2373e2e2' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
@@ -23,7 +24,7 @@
           <rect x="34" y="28" width="5" height="2" rx="1" fill="#e6a23a"/>
         </svg>
       </div>
-      <div><strong>8845A</strong><span>精密测量</span></div>
+      <div><strong>8845A</strong></div>
     </div>
     <div class="topbar-state"><span id="serviceDot" class="live-mark offline"></span><span id="serviceStatus" role="status" aria-live="polite">Web 服务检查中</span><span class="mono">127.0.0.1</span><span id="versionLabel" class="version-label">本地运行</span></div>
     <div class="topbar-right">
@@ -38,7 +39,7 @@
 
   <main class="workspace">
     <section id="measurementArea" class="measurement-area" aria-label="实时测量状态与波形图">
-      <nav id="modeButtons" class="mode-buttons" aria-label="测量模式"><button type="button" data-mode="DCV">直流电压</button><button type="button" data-mode="ACV">交流电压</button><button type="button" data-mode="DCI">直流电流</button><button type="button" data-mode="ACI">交流电流</button><button type="button" data-mode="RES2">两线电阻</button><button type="button" data-mode="RES4">四线电阻</button></nav>
+      <nav id="modeButtons" class="mode-buttons" aria-label="测量模式"><span id="modeSelection" class="mode-selection" aria-hidden="true"><span class="mode-selection-surface"></span></span><button type="button" data-mode="DCV" aria-pressed="true">直流电压</button><button type="button" data-mode="ACV" aria-pressed="false">交流电压</button><button type="button" data-mode="DCI" aria-pressed="false">直流电流</button><button type="button" data-mode="ACI" aria-pressed="false">交流电流</button><button type="button" data-mode="RES2" aria-pressed="false">两线电阻</button><button type="button" data-mode="RES4" aria-pressed="false">四线电阻</button></nav>
       <section class="readout-panel">
         <div class="readout-state">
           <div id="connectionSummary" class="connection-summary">未连接</div>
@@ -80,7 +81,7 @@
 
       <section class="chart-panel">
         <div class="chart-toolbar">
-          <div class="chart-title"><span class="section-kicker">实时趋势</span><h1 id="chartTitle">测量曲线</h1><span id="dataSourceStatus" class="data-source-status" aria-live="polite">实时数据</span></div>
+          <div class="chart-title"><h1 id="chartTitle">实时数据</h1><span id="dataSourceStatus" class="data-source-status" aria-live="polite" hidden>实时数据</span></div>
           <div class="chart-actions">
             <label class="toggle-label"><input id="autoY" type="checkbox" checked><span>纵轴自动</span></label><button id="fullView" class="button button-mini" type="button">完整显示</button><label class="toggle-label"><input id="autoFollow" type="checkbox"><span>滚动显示</span></label><span id="viewModeStatus" class="view-mode-status">自动跟随最新数据</span>
             <button id="autoScale" class="button button-mini" type="button" title="重设时间轴与读数轴，适配当前数据">自动缩放</button>

@@ -11,13 +11,13 @@ import tempfile
 from pathlib import Path
 
 
-LAUNCHER_NAME = "Start-Latest-Verified-Fluke8845A.bat"
+LAUNCHER_NAME = "Start-Latest-Verified-Fluke8845A.vbs"
 BUILD_IDENTITY_NAME = "BUILD-IDENTITY.json"
 _SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
 _SAFE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 
 
-def _validated_relative_executable(dist_root: Path, executable: Path) -> tuple[Path, str, str]:
+def _validated_relative_executable(dist_root: Path, executable: Path) -> tuple[Path, str]:
     root = Path(dist_root).resolve(strict=True)
     exe = Path(executable).resolve(strict=True)
     if not root.is_dir():
@@ -34,7 +34,7 @@ def _validated_relative_executable(dist_root: Path, executable: Path) -> tuple[P
     if len(relative.parts) not in (2, 3):
         raise ValueError("executable must use the standard or one-level side-by-side layout")
     if any(not _SAFE_COMPONENT_PATTERN.fullmatch(part) for part in relative.parts):
-        raise ValueError("executable path contains an unsafe batch-file path component")
+        raise ValueError("executable path contains an unsafe launcher path component")
 
     identity_path = exe.parent / BUILD_IDENTITY_NAME
     try:
@@ -59,24 +59,22 @@ def _validated_relative_executable(dist_root: Path, executable: Path) -> tuple[P
         raise ValueError("desktop executable SHA-256 does not match its build identity")
 
     relative_exe = "\\".join(relative.parts)
-    relative_dir = "\\".join(relative.parts[:-1])
-    return root, relative_exe, relative_dir
+    return root, relative_exe
 
 
-def _launcher_text(relative_exe: str, relative_dir: str) -> bytes:
+def _launcher_text(relative_exe: str) -> bytes:
     lines = (
-        "@echo off",
-        "setlocal DisableDelayedExpansion",
-        f'set "APP_EXE=%~dp0{relative_exe}"',
-        f'set "APP_DIR=%~dp0{relative_dir}"',
-        'if not exist "%APP_EXE%" (',
-        '  echo The latest verified Fluke 8845A build is missing:',
-        '  echo "%APP_EXE%"',
-        "  pause",
-        "  exit /b 2",
-        ")",
-        'start "" /D "%APP_DIR%" "%APP_EXE%"',
-        "exit /b 0",
+        "Option Explicit",
+        "Dim fso, shell, root, appPath",
+        "Set fso = CreateObject(\"Scripting.FileSystemObject\")",
+        "Set shell = CreateObject(\"WScript.Shell\")",
+        "root = fso.GetParentFolderName(WScript.ScriptFullName)",
+        f'appPath = fso.BuildPath(root, "{relative_exe}")',
+        "If fso.FileExists(appPath) Then",
+        "    shell.Run Chr(34) & appPath & Chr(34), 0, False",
+        "Else",
+        '    shell.Popup "The latest verified Fluke 8845A build is missing.", 0, "Fluke 8845A", 48',
+        "End If",
         "",
     )
     return "\r\n".join(lines).encode("ascii")
@@ -84,9 +82,9 @@ def _launcher_text(relative_exe: str, relative_dir: str) -> bytes:
 
 def create_latest_launcher(dist_root: Path, executable: Path) -> Path:
     """Atomically point the stable launcher at a hash-verified packaged EXE."""
-    root, relative_exe, relative_dir = _validated_relative_executable(dist_root, executable)
+    root, relative_exe = _validated_relative_executable(dist_root, executable)
     launcher = root / LAUNCHER_NAME
-    payload = _launcher_text(relative_exe, relative_dir)
+    payload = _launcher_text(relative_exe)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(

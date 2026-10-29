@@ -1163,7 +1163,8 @@ def test_source_archive_includes_runtime_license_collector_and_sources():
 def test_source_and_portable_manifests_include_the_localhost_interface():
     assert {
         "Fluke8845A_Web.py",
-        "run_web.bat",
+        "Install-Fluke8845A-Shortcuts.vbs",
+        "scripts/launch_app.vbs",
         "src/fluke8845a/webapp.py",
         "src/fluke8845a/web/index.html",
     } <= set(REQUIRED_ARCHIVE_PATHS)
@@ -1595,7 +1596,7 @@ def test_extracted_source_web_smoke_serves_current_health_and_asset_fingerprints
 
     assert report["health"]["status"] == "ok"
     assert report["health"]["bind"] == "127.0.0.1"
-    assert report["health"]["version"] == "2.1.2"
+    assert report["health"]["version"] == "2.1.3"
     assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
     for route, filename in {
         "/": "index.html",
@@ -1677,11 +1678,12 @@ def test_release_workflow_runs_web_smoke_from_the_extracted_source_archive():
     assert "Extracted source ZIP Web smoke failed" in smoke_step
 
 
-def test_source_archive_includes_first_run_windows_launchers():
+def test_source_archive_includes_no_console_icon_windows_launchers():
     assert {
-        "run_windows.bat",
-        "run_web.bat",
+        "Install-Fluke8845A-Shortcuts.vbs",
+        "scripts/launch_app.vbs",
         "scripts/launch_windows.py",
+        "assets/fluke8845a_app_icon_v3.ico",
         "scripts/generate_demo.py",
         "docs/release-notes-v1.1.0.md",
         "docs/release-notes-v1.0.7.md",
@@ -1692,6 +1694,7 @@ def test_source_archive_includes_first_run_windows_launchers():
         "docs/release-notes-v1.0.2.md",
         "docs/release-notes-v1.0.1.md",
     } <= set(REQUIRED_ARCHIVE_PATHS)
+    assert not any(path.casefold().endswith((".bat", ".cmd")) for path in REQUIRED_ARCHIVE_PATHS)
 
 
 def test_source_archive_includes_release_notes_for_the_project_version():

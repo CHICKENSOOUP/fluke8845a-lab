@@ -23,6 +23,46 @@ PYTHON_LOCKFILES = {
     "3.11": "requirements-lock-python311.txt",
     "3.12": "requirements-lock.txt",
 }
+WINDOWLESS_LAUNCH = os.name == "nt" and sys.stdout is None
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _subprocess_options(
+    *,
+    hide_console: bool = True,
+    windows: bool | None = None,
+) -> dict[str, int]:
+    """Hide bootstrap consoles on Windows without changing CLI smoke behavior."""
+    is_windows = os.name == "nt" if windows is None else windows
+    if is_windows and hide_console:
+        return {"creationflags": CREATE_NO_WINDOW}
+    return {}
+
+
+def _windowless_child(python: Path) -> Path:
+    """Prefer pythonw.exe for GUI-launched source shortcuts."""
+    windowed_python = python.with_name("pythonw.exe")
+    if WINDOWLESS_LAUNCH and windowed_python.is_file():
+        return windowed_python
+    return python
+
+
+def _configure_windowless_log() -> None:
+    """Give pythonw launches a persistent place for bootstrap diagnostics."""
+    if not WINDOWLESS_LAUNCH:
+        return
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    log_path = local_app_data / "Fluke8845A" / "logs" / "launcher.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stream = log_path.open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        stream = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = stream
+    sys.stderr = stream
+
+
+_configure_windowless_log()
 
 
 def _runtime_environment() -> dict[str, str]:
@@ -35,7 +75,15 @@ def _runtime_environment() -> dict[str, str]:
 
 
 def _run(command: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess:
-    return subprocess.run(command, cwd=ROOT, env=environment, check=False)
+    output_handles = {"stdout": sys.stdout, "stderr": sys.stderr} if WINDOWLESS_LAUNCH else {}
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        **_subprocess_options(),
+        **output_handles,
+    )
 
 
 def _python_lockfile(python: Path, environment: dict[str, str]) -> Path | None:
@@ -52,6 +100,7 @@ def _python_lockfile(python: Path, environment: dict[str, str]) -> Path | None:
         capture_output=True,
         text=True,
         check=False,
+        **_subprocess_options(),
     )
     if result.returncode != 0:
         return None
@@ -94,6 +143,7 @@ def prepare_runtime() -> tuple[Path, dict[str, str]] | None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
+        **_subprocess_options(),
     )
     if check.returncode != 0:
         print("Installing the app's Python dependencies. Internet access is needed on first launch...")
@@ -114,6 +164,7 @@ def prepare_runtime() -> tuple[Path, dict[str, str]] | None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            **_subprocess_options(),
         )
         if check.returncode != 0:
             print("The runtime dependencies are still unavailable after installation.")
@@ -132,8 +183,17 @@ def main(argv: list[str] | None = None) -> int:
     if runtime is None:
         return 1
     python, environment = runtime
+    python = _windowless_child(python)
     command = [str(python), "-m", APP_MODULES[args.app], *args.app_args]
-    return subprocess.run(command, cwd=ROOT, env=environment, check=False).returncode
+    output_handles = {"stdout": sys.stdout, "stderr": sys.stderr} if WINDOWLESS_LAUNCH else {}
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        **_subprocess_options(hide_console=WINDOWLESS_LAUNCH),
+        **output_handles,
+    ).returncode
 
 
 if __name__ == "__main__":

@@ -321,9 +321,28 @@ def test_mode_indicator_animates_to_selected_button(qt_app, monkeypatch, tmp_pat
             QTest.qWait(10)
         assert window.mode_animation.state() == gui_module.QPropertyAnimation.State.Stopped
         button = window.mode_buttons[Mode.ACV]
-        assert window.mode_indicator.geometry() == QRect(
-            button.x() + 8, window.mode_bar.height() - 6, max(0, button.width() - 16), 3
-        )
+        target = button.geometry().adjusted(1, 1, -1, -1)
+        assert window.mode_indicator.geometry() == target
+        assert window.mode_indicator.height() > 20
+        assert window.mode_animation.keyValueAt(0.72) == target.adjusted(-4, -4, 4, 4)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_mode_indicator_skips_animation_when_reduced_motion_is_enabled(qt_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("FLUKE8845A_CONFIG_DIR", str(tmp_path / "mode-animation-reduced-config"))
+    monkeypatch.setenv("FLUKE8845A_REDUCE_MOTION", "1")
+    window = MainWindow()
+    try:
+        window.show()
+        QTest.qWait(30)
+        window._simulation = True
+        window.mode_buttons[Mode.ACV].click()
+        assert window.mode_animation.state() == gui_module.QPropertyAnimation.State.Stopped
+        button = window.mode_buttons[Mode.ACV]
+        assert window.mode_indicator.geometry() == button.geometry().adjusted(1, 1, -1, -1)
+        assert window._reading_kicker.text() == "实时数据"
     finally:
         window.close()
         qt_app.processEvents()

@@ -103,3 +103,46 @@ def test_launcher_selects_desktop_or_web_and_forwards_arguments(monkeypatch, tmp
         str(python), "-m", "fluke8845a.webapp", "--port", "0", "--no-browser"
     ]
     assert all(kwargs["cwd"] == launch_windows.ROOT for _, kwargs in calls)
+
+
+def test_windowless_launch_prefers_pythonw_for_the_gui_process(tmp_path, monkeypatch):
+    python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    windowed_python = python.with_name("pythonw.exe")
+    windowed_python.write_bytes(b"stub")
+    monkeypatch.setattr(launch_windows, "WINDOWLESS_LAUNCH", True)
+
+    assert launch_windows._windowless_child(python) == windowed_python
+
+
+def test_regular_cli_launch_keeps_the_console_python(tmp_path, monkeypatch):
+    python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.with_name("pythonw.exe").write_bytes(b"stub")
+    monkeypatch.setattr(launch_windows, "WINDOWLESS_LAUNCH", False)
+
+    assert launch_windows._windowless_child(python) == python
+
+
+def test_bootstrap_subprocesses_disable_windows_console_creation():
+    assert launch_windows._subprocess_options(windows=True) == {
+        "creationflags": launch_windows.CREATE_NO_WINDOW
+    }
+    assert launch_windows._subprocess_options(windows=True, hide_console=False) == {}
+    assert launch_windows._subprocess_options(windows=False) == {}
+
+
+def test_windows_shortcut_scripts_use_hidden_hosts_and_the_app_icon():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "Install-Fluke8845A-Shortcuts.vbs").read_text(encoding="ascii")
+    launcher = (root / "scripts" / "launch_app.vbs").read_text(encoding="ascii")
+
+    assert "shortcut.TargetPath = windowlessHost" in installer
+    assert 'shortcut.IconLocation = iconPath & ",0"' in installer
+    assert '"Fluke 8845A Web"' in installer
+    assert 'shell.Run Quote(windowlessHost)' in installer
+    assert 'shell.Run(command, 0, True)' in launcher
+    assert 'pyw.exe -' in launcher
+    assert 'appName <> "desktop" And appName <> "web"' in launcher
+    assert "cmd.exe" not in installer.casefold() + launcher.casefold()
+    assert ".bat" not in installer.casefold() + launcher.casefold()

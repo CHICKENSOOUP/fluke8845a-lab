@@ -1081,6 +1081,7 @@ class FakeElement {
     listeners.push(listener);
     this.listeners.set(type, listeners);
   }
+  setAttribute(name, value) { this.attributes ||= new Map(); this.attributes.set(name, String(value)); }
   dispatch(type, event = {}) {
     return Promise.all((this.listeners.get(type) || []).map((listener) => listener({ target: this, ...event })));
   }
@@ -1172,7 +1173,7 @@ function createFrontend({ preferences = null, stubChart = true, storage: provide
   });
   const source = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8")
     .replace(/\ninitialize\(\);\s*$/, "");
-  vm.runInContext(`${source}\n;globalThis.__frontend = { app, ui, command, handleCommandRecoveryStorage, acknowledgeUncertainCommands, restoreUnresolvedCommands, updateStateDisplay, pollState, scanPorts, startPayload, startContinuous, startSingle, populateModeOptions, bindControls, chooseDuplicateNameAction, connectReal, drawChart, buildPixelPointIndex, nearestPoint, appendSampleRows, saveManualSoftware, clearManualSoftware, renderSettingsComparison, refreshChartOverview, clearChartOverview, chartPointsForPlot, chartMeanRows, refreshMovingAverage, refreshExperimentFiles: typeof refreshExperimentFiles === "function" ? refreshExperimentFiles : null, downloadLatestCsv: typeof downloadLatestCsv === "function" ? downloadLatestCsv : null, scheduleChartRedraw: typeof scheduleChartRedraw === "function" ? scheduleChartRedraw : null, downsampleForRender: typeof downsampleForRender === "function" ? downsampleForRender : null, classifyLog: typeof classifyLog === "function" ? classifyLog : null, filterLogRows: typeof filterLogRows === "function" ? filterLogRows : null, formatLogsText: typeof formatLogsText === "function" ? formatLogsText : null, loadHistory, requestChartRange, loadHistoryEvents: typeof loadHistoryEvents === "function" ? loadHistoryEvents : null, restorePreferences, updateStats, renderEvents, focusEvent, updateAccessiblePointTable: typeof updateAccessiblePointTable === "function" ? updateAccessiblePointTable : null, clearPreferences: typeof clearPreferences === "function" ? clearPreferences : null, localExperimentName: typeof localExperimentName === "function" ? localExperimentName : null, copyAccessiblePointTable: typeof copyAccessiblePointTable === "function" ? copyAccessiblePointTable : null, updateEmptyPlotState: typeof updateEmptyPlotState === "function" ? updateEmptyPlotState : null, createPlotExportCanvas: typeof createPlotExportCanvas === "function" ? createPlotExportCanvas : null, copyExperimentPath: typeof copyExperimentPath === "function" ? copyExperimentPath : null, experimentNameError: typeof experimentNameError === "function" ? experimentNameError : null };`, context);
+  vm.runInContext(`${source}\n;globalThis.__frontend = { app, ui, command, handleCommandRecoveryStorage, acknowledgeUncertainCommands, restoreUnresolvedCommands, updateStateDisplay, updateModeSelection, updateChartTitle, pollState, scanPorts, startPayload, startContinuous, startSingle, populateModeOptions, bindControls, chooseDuplicateNameAction, connectReal, drawChart, buildPixelPointIndex, nearestPoint, appendSampleRows, saveManualSoftware, clearManualSoftware, renderSettingsComparison, refreshChartOverview, clearChartOverview, chartPointsForPlot, chartMeanRows, refreshMovingAverage, refreshExperimentFiles: typeof refreshExperimentFiles === "function" ? refreshExperimentFiles : null, downloadLatestCsv: typeof downloadLatestCsv === "function" ? downloadLatestCsv : null, scheduleChartRedraw: typeof scheduleChartRedraw === "function" ? scheduleChartRedraw : null, downsampleForRender: typeof downsampleForRender === "function" ? downsampleForRender : null, classifyLog: typeof classifyLog === "function" ? classifyLog : null, filterLogRows: typeof filterLogRows === "function" ? filterLogRows : null, formatLogsText: typeof formatLogsText === "function" ? formatLogsText : null, loadHistory, requestChartRange, loadHistoryEvents: typeof loadHistoryEvents === "function" ? loadHistoryEvents : null, restorePreferences, updateStats, renderEvents, focusEvent, updateAccessiblePointTable: typeof updateAccessiblePointTable === "function" ? updateAccessiblePointTable : null, clearPreferences: typeof clearPreferences === "function" ? clearPreferences : null, localExperimentName: typeof localExperimentName === "function" ? localExperimentName : null, copyAccessiblePointTable: typeof copyAccessiblePointTable === "function" ? copyAccessiblePointTable : null, updateEmptyPlotState: typeof updateEmptyPlotState === "function" ? updateEmptyPlotState : null, createPlotExportCanvas: typeof createPlotExportCanvas === "function" ? createPlotExportCanvas : null, copyExperimentPath: typeof copyExperimentPath === "function" ? copyExperimentPath : null, experimentNameError: typeof experimentNameError === "function" ? experimentNameError : null };`, context);
   if (stubChart) vm.runInContext("drawChart = () => {}; updateStats = () => {};", context);
   return { api: context.__frontend, elements, context, storage, clipboard, animationFrames };
 }
@@ -4848,6 +4849,54 @@ test("v2.1 main page has six modes, average controls and no visible simulator en
   for (const id of ["openConnection", "openParameters", "averageWindow", "saveCurveCsv", "autoY", "fullView", "autoFollow"]) assert.ok(html.includes(`id="${id}"`));
   assert.doesNotMatch(html, /id="(?:emptyConnectMock|connectMock|mockScenario)"/);
   assert.doesNotMatch(fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8"), /command\("connect_mock"/);
+});
+
+test("Web mode selection animates the full tile and chart heading avoids repeated live labels", () => {
+  const html = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/index.html"), "utf8");
+  const css = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.css"), "utf8");
+  const app = fs.readFileSync(path.join(ROOT, "src/fluke8845a/web/app.js"), "utf8");
+
+  assert.match(html, /<title>Fluke 8845A<\/title>/);
+  assert.match(html, /<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml,/);
+  assert.match(html, /<div><strong>8845A<\/strong><\/div>/);
+  assert.doesNotMatch(html, /实时趋势/);
+  assert.match(html, /id="chartTitle">实时数据<\/h1>/);
+  assert.match(html, /id="dataSourceStatus"[^>]*hidden/);
+  assert.match(html, /id="modeSelection" class="mode-selection" aria-hidden="true"/);
+  assert.match(app, /indicator\.style\.transform\s*=\s*`translate3d\(/);
+  assert.match(app, /indicator\.style\.width\s*=\s*`\$\{selected\.offsetWidth\}px`/);
+  assert.match(app, /indicator\.classList\.add\("is-moving"\)/);
+  assert.match(css, /\.mode-selection\s*\{[^}]*transition:[^}]*transform[^}]*width[^}]*height/s);
+  assert.match(css, /@keyframes\s+mode-surface-expand/);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+  assert.match(css, /\.mode-buttons button:focus-visible/);
+  assert.match(app, /title\.textContent\s*=\s*"实时数据"/);
+
+  const { api, elements, context } = createFrontend();
+  const modes = ["DCV", "ACV", "DCI", "ACI"].map((mode, index) => {
+    const button = new FakeElement(mode);
+    button.dataset.mode = mode;
+    button.offsetLeft = index * 110;
+    button.offsetTop = 0;
+    button.offsetWidth = 102;
+    button.offsetHeight = 43;
+    return button;
+  });
+  context.document.querySelectorAll = () => modes;
+  const indicator = element(elements, "modeSelection");
+  indicator.style = {};
+  api.updateModeSelection("DCV");
+  api.updateModeSelection("ACI", true);
+  assert.equal(indicator.style.transform, "translate3d(330px, 0px, 0)");
+  assert.equal(indicator.style.width, "102px");
+  assert.equal(indicator.classList.contains("is-moving"), true);
+  assert.equal(modes[3].attributes.get("aria-pressed"), "true");
+  assert.equal(modes[0].attributes.get("aria-pressed"), "false");
+  api.updateChartTitle();
+  assert.equal(element(elements, "chartTitle").textContent, "实时数据");
+  api.app.imported = [{ id: 1, x: 0, y: 1, status: "ok" }];
+  api.updateChartTitle();
+  assert.equal(element(elements, "chartTitle").textContent, "实时数据");
 });
 
 test("v2.1 curve export is disabled after clearing or opening history", () => {

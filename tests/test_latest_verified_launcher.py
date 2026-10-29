@@ -25,7 +25,7 @@ def _write_build_identity(exe: Path, *, expected_hash: str | None = None) -> Non
     )
 
 
-def test_latest_launcher_targets_the_verified_exe_relative_to_dist(tmp_path):
+def test_latest_launcher_targets_the_verified_exe_relative_to_dist_without_console(tmp_path):
     launcher_name, create_latest_launcher = _launcher_api()
     dist_root = tmp_path / "release files"
     exe = dist_root / "Fluke8845A_v1.1.0_9365716" / "Fluke8845A.dist" / "Fluke8845A.exe"
@@ -37,9 +37,10 @@ def test_latest_launcher_targets_the_verified_exe_relative_to_dist(tmp_path):
 
     assert launcher == dist_root / launcher_name
     text = launcher.read_text(encoding="ascii")
-    assert 'set "APP_EXE=%~dp0Fluke8845A_v1.1.0_9365716\\Fluke8845A.dist\\Fluke8845A.exe"' in text
-    assert 'start "" /D "%APP_DIR%" "%APP_EXE%"' in text
-    assert "%*" not in text
+    assert 'root = fso.GetParentFolderName(WScript.ScriptFullName)' in text
+    assert 'appPath = fso.BuildPath(root, "Fluke8845A_v1.1.0_9365716\\Fluke8845A.dist\\Fluke8845A.exe")' in text
+    assert 'shell.Run Chr(34) & appPath & Chr(34), 0, False' in text
+    assert "cmd.exe" not in text.casefold()
     assert str(dist_root) not in text
 
 
@@ -55,8 +56,8 @@ def test_latest_launcher_supports_the_standard_distribution_layout(tmp_path):
 
     text = launcher.read_text(encoding="ascii")
     assert launcher == dist_root / launcher_name
-    assert 'set "APP_EXE=%~dp0Fluke8845A.dist\\Fluke8845A.exe"' in text
-    assert 'set "APP_DIR=%~dp0Fluke8845A.dist"' in text
+    assert 'appPath = fso.BuildPath(root, "Fluke8845A.dist\\Fluke8845A.exe")' in text
+    assert 'shell.Run Chr(34) & appPath & Chr(34), 0, False' in text
 
 
 def test_latest_launcher_refuses_targets_outside_dist_without_replacing_previous(tmp_path):

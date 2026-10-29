@@ -96,6 +96,29 @@ def _classify_log_message(message: str) -> str:
     return "acquisition"
 
 
+def _prefers_reduced_motion() -> bool:
+    """Honor an app override and Windows' client-area animation setting."""
+    override = os.environ.get("FLUKE8845A_REDUCE_MOTION", "").strip().casefold()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            enabled = ctypes.c_int()
+            # SPI_GETCLIENTAREAANIMATION (0x1042) is the Windows accessibility
+            # option that disables unnecessary animations.
+            if ctypes.windll.user32.SystemParametersInfoW(
+                0x1042, 0, ctypes.byref(enabled), 0
+            ):
+                return not bool(enabled.value)
+        except (AttributeError, OSError):
+            pass
+    return False
+
+
 def _window_dimensions_for_available_screen(
     available_width: int, available_height: int
 ) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -1621,7 +1644,7 @@ class MainWindow(QMainWindow):
         self.mode_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.mode_indicator.raise_()
         self.mode_animation = QPropertyAnimation(self.mode_indicator, b"geometry", self)
-        self.mode_animation.setDuration(180)
+        self.mode_animation.setDuration(250)
         self.mode_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.mode_bar.installEventFilter(self)
         self.mode_combo.currentIndexChanged.connect(self._sync_mode_buttons)
@@ -1892,13 +1915,21 @@ class MainWindow(QMainWindow):
             return
         button = self.mode_buttons[self._current_mode]
         button.setChecked(True)
-        target = QRect(button.x() + 8, self.mode_bar.height() - 6, max(0, button.width() - 16), 3)
-        if animate and self.mode_bar.isVisible() and self.mode_indicator.width() > 0:
+        # Move and expand a full rounded outline with the selected tile. The
+        # checked fill changes immediately; this traveling frame makes the
+        # mode transition clear without animating only a decorative line.
+        target = button.geometry().adjusted(1, 1, -1, -1)
+        if (
+            animate and not _prefers_reduced_motion()
+            and self.mode_bar.isVisible() and self.mode_indicator.width() > 0
+        ):
             self.mode_animation.stop()
             self.mode_animation.setStartValue(self.mode_indicator.geometry())
+            self.mode_animation.setKeyValueAt(0.72, target.adjusted(-4, -4, 4, 4))
             self.mode_animation.setEndValue(target)
             self.mode_animation.start()
         else:
+            self.mode_animation.stop()
             self.mode_indicator.setGeometry(target)
 
     def _record_file_export_result(self, label: str, destination: str | Path) -> None:
@@ -2866,7 +2897,7 @@ class MainWindow(QMainWindow):
         reading_text = QVBoxLayout(reading_content)
         self._reading_text_layout = reading_text
         reading_text.setSpacing(3)
-        reading_kicker = QLabel("实时读数")
+        reading_kicker = QLabel("实时数据")
         self._reading_kicker = reading_kicker
         reading_kicker.setObjectName("eyebrow")
         self.reading_mode_label = QLabel("直流电压 DCV · 自动量程 · 1 NPLC")
@@ -4055,7 +4086,7 @@ class MainWindow(QMainWindow):
             QPushButton#modeButton:checked { background: #d7f0eb; color: #075e61; font-weight: 700; }
             QPushButton#modeButton:disabled { background: #f1f4f2; color: #a2b0ad; }
             QPushButton#modeButton:checked:disabled { background: #deebe7; color: #537a74; }
-            QFrame#modeIndicator { background: #0d9997; border: 0; border-radius: 1px; }
+            QFrame#modeIndicator { background: transparent; border: 2px solid #0d9997; border-radius: 9px; }
             QLabel#brandIcon { background: #f1efe6; border: 1px solid #bdc0b7; border-radius: 6px; color: #176d72; font-weight: 800; }
             QLabel#mainTitle { color: #f1efe6; font-size: 18px; font-weight: 700; letter-spacing: .03em; }
             QMenuBar { background: #252d31; color: #e7e8df; padding: 2px 7px; }
