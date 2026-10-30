@@ -15,6 +15,7 @@ def validate_github_release(
     expected_tag: str,
     expected_prerelease: bool,
     expected_assets: dict[str, int],
+    expected_digests: dict[str, str] | None = None,
 ) -> None:
     if not isinstance(release, dict):
         raise ValueError("GitHub Release response is not a JSON object")
@@ -43,6 +44,14 @@ def validate_github_release(
         raise ValueError(
             f"GitHub Release assets differ: expected {expected_assets!r}, got {actual!r}"
         )
+    if expected_digests is not None:
+        if set(expected_digests) != set(expected_assets):
+            raise ValueError("Expected release asset digests do not match the asset names")
+        for asset in assets:
+            name = asset["name"]
+            digest = asset.get("digest")
+            if not isinstance(digest, str) or digest.lower() != expected_digests[name].lower():
+                raise ValueError(f"GitHub Release asset {name!r} has a missing or mismatched digest")
 
 
 def validate_oci_manifest(manifest: Any, *, expected_layers: dict[str, str]) -> None:
@@ -81,6 +90,11 @@ def _asset_sizes(*paths: Path) -> dict[str, int]:
     return {path.name: path.stat().st_size for path in paths}
 
 
+def _sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -103,13 +117,14 @@ def main(argv: list[str] | None = None) -> int:
                 expected_tag=args.tag,
                 expected_prerelease=args.prerelease == "true",
                 expected_assets=_asset_sizes(args.archive, args.checksums),
+                expected_digests={path.name: _sha256(path) for path in (args.archive, args.checksums)},
             )
         else:
             validate_oci_manifest(
                 payload,
                 expected_layers={
-                    "application/zip": f"sha256:{hashlib.sha256(args.archive.read_bytes()).hexdigest()}",
-                    "text/plain": f"sha256:{hashlib.sha256(args.checksums.read_bytes()).hexdigest()}",
+                    "application/zip": _sha256(args.archive),
+                    "text/plain": _sha256(args.checksums),
                 },
             )
     except (OSError, ValueError, json.JSONDecodeError) as exc:

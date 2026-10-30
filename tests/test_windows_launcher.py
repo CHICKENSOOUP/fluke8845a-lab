@@ -2,11 +2,92 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import os
+import re
+import shutil
 import subprocess
+import sys
 
 import pytest
 
 from scripts import launch_windows
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Script Host is required")
+def test_shortcut_runs_existing_environment_without_system_python_launcher(tmp_path):
+    root = tmp_path / "project"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.is_file():
+        pytest.skip("Python windowless executable is unavailable")
+    venv_scripts = root / ".venv" / "Scripts"
+    venv_scripts.mkdir(parents=True)
+    shutil.copy2(pythonw, venv_scripts / "pythonw.exe")
+    (root / ".venv" / "pyvenv.cfg").write_text(
+        f"home = {sys.base_prefix}\ninclude-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    marker = root / "started.txt"
+    (scripts / "launch_windows.py").write_text(
+        "import pathlib, sys\n"
+        "pathlib.Path(__file__).resolve().parent.parent.joinpath('started.txt').write_text(sys.argv[1])\n",
+        encoding="utf-8",
+    )
+    original = (Path(__file__).resolve().parents[1] / "scripts" / "launch_app.vbs").read_text(encoding="ascii")
+    # Model a machine without the optional system Python Launcher.
+    instrumented = re.sub(
+        r"Function HasPython\(pythonVersion\).*?End Function",
+        "Function HasPython(pythonVersion)\n    HasPython = False\nEnd Function",
+        original,
+        flags=re.DOTALL,
+    )
+    instrumented = re.sub(r'^\s*shell\.Popup .*$', '    WScript.Echo "startup error"', instrumented, flags=re.MULTILINE)
+    (scripts / "launch_app.vbs").write_text(instrumented, encoding="ascii")
+    result = subprocess.run(
+        ["cscript.exe", "//nologo", str(scripts / "launch_app.vbs"), "desktop"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_text(encoding="utf-8") == "desktop"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Script Host is required")
+@pytest.mark.parametrize("local_pythonw", ["missing", "broken"])
+def test_shortcut_falls_back_to_system_launcher_when_local_pythonw_unusable(tmp_path, local_pythonw):
+    root = tmp_path / "project"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.is_file():
+        pytest.skip("Python windowless executable is unavailable")
+    venv_scripts = root / ".venv" / "Scripts"
+    venv_scripts.mkdir(parents=True)
+    (venv_scripts / "python.exe").write_bytes(b"stub")
+    if local_pythonw == "broken":
+        (venv_scripts / "pythonw.exe").write_bytes(b"not an executable")
+    marker = root / "started.txt"
+    (scripts / "launch_windows.py").write_text(
+        "import pathlib, sys\n"
+        "pathlib.Path(__file__).resolve().parent.parent.joinpath('started.txt').write_text(sys.argv[1])\n",
+        encoding="utf-8",
+    )
+    original = (Path(__file__).resolve().parents[1] / "scripts" / "launch_app.vbs").read_text(encoding="ascii")
+    instrumented = re.sub(
+        r"Function HasPython\(pythonVersion\).*?End Function",
+        "Function HasPython(pythonVersion)\n    HasPython = True\nEnd Function",
+        original,
+        flags=re.DOTALL,
+    )
+    instrumented = instrumented.replace('"pyw.exe -" & pythonVersion & " "', f'Quote("{pythonw}") & " "')
+    instrumented = re.sub(r'^\s*shell\.Popup .*$', '    WScript.Echo "startup error"', instrumented, flags=re.MULTILINE)
+    (scripts / "launch_app.vbs").write_text(instrumented, encoding="utf-8")
+    result = subprocess.run(
+        ["cscript.exe", "//nologo", str(scripts / "launch_app.vbs"), "web"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_text(encoding="utf-8") == "web"
 
 
 def test_runtime_environment_uses_project_source_and_isolates_external_qt(tmp_path, monkeypatch):

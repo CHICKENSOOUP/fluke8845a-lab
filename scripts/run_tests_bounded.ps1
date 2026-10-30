@@ -25,16 +25,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "pytest is missing from $PythonPath; install the project developer dependencies first."
 }
 
-$runId = [guid]::NewGuid().ToString("N")
-$testArtifactsDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "Fluke8845A_Test_Artifacts"
-$runDirectory = Join-Path $testArtifactsDirectory ("pytest-local-" + $runId)
 $runnerPath = Join-Path $repositoryRoot "scripts\run_tests_sharded.py"
-$shardLogRoot = Join-Path $runDirectory "pytest-shards"
-New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 
 Push-Location $repositoryRoot
 try {
-    & $PythonPath $runnerPath --python $PythonPath --output-root $shardLogRoot
+    & $PythonPath $runnerPath --python $PythonPath
     if ($LASTEXITCODE -ne 0) {
         Write-Output "pytest failed with exit code $LASTEXITCODE."
         exit $LASTEXITCODE

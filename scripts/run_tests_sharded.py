@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -120,9 +119,9 @@ def runner_environment(root: Path = ROOT, base: dict[str, str] | None = None) ->
     return env
 
 
-def default_output_root() -> Path:
-    """Keep pytest logs and temporary files out of the source checkout."""
-    return Path(tempfile.gettempdir()) / "Fluke8845A_Test_Artifacts" / "pytest-shards"
+def default_output_root(root: Path = ROOT) -> Path:
+    """Keep pytest logs and temporary files in the project's build directory."""
+    return Path(root) / "build" / "test-artifacts" / "pytest-shards"
 
 
 def write_console_text(value: str, stream=None) -> None:
@@ -143,11 +142,12 @@ def run_shards(
         raise ValueError("timeout-seconds must be positive when specified")
     root = Path(root).resolve()
     validate_shard_coverage(root)
-    output_root = Path(output_root) if output_root is not None else default_output_root()
+    output_root = Path(output_root) if output_root is not None else default_output_root(root)
     run_directory = output_root / uuid.uuid4().hex
     run_directory.mkdir(parents=True, exist_ok=False)
 
     running: dict[str, tuple[subprocess.Popen, object, object, float]] = {}
+    finished_at: dict[str, float] = {}
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     try:
         for name, modules in SHARDS.items():
@@ -176,7 +176,12 @@ def run_shards(
                 raise
             running[name] = (process, stdout_stream, stderr_stream, time.monotonic())
 
-        while any(process.poll() is None for process, *_rest in running.values()):
+        while len(finished_at) < len(running):
+            for name, (process, *_rest) in running.items():
+                if name not in finished_at and process.poll() is not None:
+                    finished_at[name] = time.monotonic()
+            if len(finished_at) == len(running):
+                break
             if deadline is not None and time.monotonic() >= deadline:
                 processes = [process for process, *_rest in running.values()]
                 with ThreadPoolExecutor(max_workers=len(processes)) as executor:
@@ -189,7 +194,7 @@ def run_shards(
 
         failed = False
         for name, (process, stdout_stream, stderr_stream, started) in running.items():
-            elapsed = time.monotonic() - started
+            elapsed = finished_at[name] - started
             stdout_stream.close()
             stderr_stream.close()
             code = int(process.returncode or 0)

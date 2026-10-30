@@ -1107,8 +1107,10 @@ def test_release_publication_cli_checks_release_tag_status_and_asset_sizes(tmp_p
         "isDraft": False,
         "isPrerelease": True,
         "assets": [
-            {"name": archive.name, "size": archive.stat().st_size},
-            {"name": checksums.name, "size": checksums.stat().st_size},
+            {"name": archive.name, "size": archive.stat().st_size,
+             "digest": "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest()},
+            {"name": checksums.name, "size": checksums.stat().st_size,
+             "digest": "sha256:" + hashlib.sha256(checksums.read_bytes()).hexdigest()},
         ],
     }
     release_path = tmp_path / "release.json"
@@ -1118,6 +1120,30 @@ def test_release_publication_cli_checks_release_tag_status_and_asset_sizes(tmp_p
         "release", "--json", str(release_path), "--tag", release["tagName"], "--prerelease", "true",
         "--archive", str(archive), "--checksums", str(checksums),
     ]) == 0
+
+
+@pytest.mark.parametrize("digest", [None, "sha256:" + "0" * 64])
+def test_release_publication_rejects_missing_or_wrong_asset_digest(tmp_path, digest):
+    archive = tmp_path / "Fluke8845A_Source_Project.zip"
+    checksums = tmp_path / "SHA256SUMS.txt"
+    archive.write_bytes(b"source archive")
+    checksums.write_bytes(b"source hash\n")
+    release = {
+        "tagName": "v2.1.3", "isDraft": False, "isPrerelease": False,
+        "assets": [
+            {"name": archive.name, "size": archive.stat().st_size, "digest": digest},
+            {"name": checksums.name, "size": checksums.stat().st_size,
+             "digest": "sha256:" + hashlib.sha256(checksums.read_bytes()).hexdigest()},
+        ],
+    }
+    release_path = tmp_path / "release.json"
+    release_path.write_text(json.dumps(release), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        release_publication_main([
+            "release", "--json", str(release_path), "--tag", "v2.1.3", "--prerelease", "false",
+            "--archive", str(archive), "--checksums", str(checksums),
+        ])
 
 
 def test_source_and_portable_manifests_require_qt_license_text_and_notice():
@@ -1596,7 +1622,7 @@ def test_extracted_source_web_smoke_serves_current_health_and_asset_fingerprints
 
     assert report["health"]["status"] == "ok"
     assert report["health"]["bind"] == "127.0.0.1"
-    assert report["health"]["version"] == "2.1.3"
+    assert report["health"]["version"] == "2.2.0"
     assert set(report["assets"]) == {"/", "/app.css", "/app.js", "/history_worker.js"}
     for route, filename in {
         "/": "index.html",

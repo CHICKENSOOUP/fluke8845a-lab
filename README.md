@@ -33,7 +33,7 @@ python -m fluke8845a
 
 启动本机网页界面：双击桌面的“Fluke 8845A Web”快捷方式，或运行 `python -m fluke8845a.webapp`。服务只绑定 `127.0.0.1:8765`。连接仪器前先断开桌面版占用的串口；同一 COM 端口不能同时由两个程序使用。
 
-开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1`。该入口会并行运行完整 pytest 分片套件，不设 60 秒测试上限；日志保存在系统临时目录。若依赖装在其他 Python 环境，可加 `-PythonPath .\.venv-build\Scripts\python.exe`。Windows 便携构建需要 64 位 Python 3.12 和 Node.js 22 或更新版本；构建会先运行 Python 与 Web 前端测试，通过后才开始编译。
+开发测试依赖可用 `python -m pip install -e ".[dev]"` 安装；在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1`。该入口会并行运行完整 pytest 分片套件，不设 60 秒测试上限；日志和临时文件保存在 `build/test-artifacts/pytest-shards/`。若依赖装在其他 Python 环境，可加 `-PythonPath .\.venv-build\Scripts\python.exe`。Windows 便携构建需要 64 位 Python 3.12 和 Node.js 22 或更新版本；构建会先运行 Python 与 Web 前端测试，通过后才开始编译。
 
 Web 前端测试需要 Node.js 22 或更新版本（窄屏布局测试通过全局 WebSocket 检查隔离 Chromium）。可在仓库根目录单独运行：
 
@@ -68,6 +68,7 @@ $buildName = "Fluke8845A_LocalBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 - [使用指南](docs/user-guide.md)
 - [短时真机 GUI 探测](docs/hardware-probes.md)
 - [已知限制](docs/known-limitations.md)
+- [v2.2.0 发布说明](docs/release-notes-v2.2.0.md)
 - [v2.1.3 发布说明](docs/release-notes-v2.1.3.md)
 - [v2.1.2 发布说明](docs/release-notes-v2.1.2.md)
 - [v2.1.0 发布说明](docs/release-notes-v2.1.0.md)
@@ -115,7 +116,7 @@ python -m fluke8845a
 
 Start the local browser interface with the desktop shortcut “Fluke 8845A Web” or `python -m fluke8845a.webapp`. It binds only to `127.0.0.1:8765`. Disconnect the desktop app from the instrument before connecting the browser app; one COM port cannot be opened by both programs at once.
 
-Install developer dependencies with `python -m pip install -e ".[dev]"`. In PowerShell, run the complete pytest suite in parallel shards; no 60-second cap is applied, and per-shard logs are kept outside the checkout in the system temporary directory. If the dependencies are installed in another Python environment, pass `-PythonPath .\.venv-build\Scripts\python.exe`:
+Install developer dependencies with `python -m pip install -e ".[dev]"`. In PowerShell, run the complete pytest suite in parallel shards; no 60-second cap is applied, and per-shard logs and temporary files are kept in `build/test-artifacts/pytest-shards/`. If the dependencies are installed in another Python environment, pass `-PythonPath .\.venv-build\Scripts\python.exe`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_bounded.ps1
@@ -162,6 +163,7 @@ This source release does not bundle Qt libraries. Do not treat the project MIT l
 - [Usage guide](docs/user-guide.md)
 - [Short hardware GUI probes](docs/hardware-probes.md)
 - [Known limitations](docs/known-limitations.md)
+- [v2.2.0 release notes](docs/release-notes-v2.2.0.md)
 - [v2.1.3 release notes](docs/release-notes-v2.1.3.md)
 - [v2.1.2 release notes](docs/release-notes-v2.1.2.md)
 - [v2.1.0 release notes](docs/release-notes-v2.1.0.md)

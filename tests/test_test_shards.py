@@ -57,12 +57,38 @@ def test_runner_environment_includes_project_src_and_preserves_existing_path(tmp
     assert env["KEEP"] == "yes"
 
 
-def test_default_pytest_artifacts_are_outside_the_checkout(tmp_path, monkeypatch):
+def test_default_pytest_artifacts_are_in_the_repository_build_directory():
     import scripts.run_tests_sharded as test_runner
 
-    monkeypatch.setattr(test_runner.tempfile, "gettempdir", lambda: str(tmp_path))
+    assert test_runner.default_output_root() == ROOT / "build" / "test-artifacts" / "pytest-shards"
 
-    assert test_runner.default_output_root() == tmp_path / "Fluke8845A_Test_Artifacts" / "pytest-shards"
+
+def test_shard_elapsed_time_stops_when_each_process_finishes(tmp_path, monkeypatch, capsys):
+    import scripts.run_tests_sharded as runner
+
+    clock = [0.0]
+    class FakeProcess:
+        def __init__(self, finish):
+            self.finish = finish
+            self.pid = 1
+            self.returncode = None
+
+        def poll(self):
+            if clock[0] >= self.finish:
+                self.returncode = 0
+            return self.returncode
+
+    finishes = iter((0.05, 0.20))
+    monkeypatch.setattr(runner, "SHARDS", {"quick": (), "slow": ()})
+    monkeypatch.setattr(runner, "validate_shard_coverage", lambda _root: None)
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(next(finishes)))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runner.time, "sleep", lambda duration: clock.__setitem__(0, clock[0] + duration))
+
+    assert runner.run_shards(output_root=tmp_path) == 0
+    output = capsys.readouterr().out
+    assert "quick: exit=0, elapsed=0.05s" in output
+    assert "slow: exit=0, elapsed=0.20s" in output
 
 
 def test_pytest_cache_is_configured_under_ignored_build_artifacts():
